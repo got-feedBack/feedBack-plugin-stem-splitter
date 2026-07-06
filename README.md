@@ -35,3 +35,7 @@ engine if installed, else the action is offered with a prompt to download the en
   (registered via `libraryCardActions`).
 
 Target Host: feedBack desktop with the v3 UI (`window.feedBack.uiVersion === 'v3'`).
+
+## License
+
+**AGPL-3.0-only** — the same license as the feedBack app. See [LICENSE](LICENSE).
