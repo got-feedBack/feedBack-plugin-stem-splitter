@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -45,7 +46,8 @@ def transcribe_pak(pak_path: Path, *, mode: str, server_url: str | None = None,
                    api_key: str | None = None, whisperx_model: str = "medium",
                    language: str | None = None, min_word_score: float = 0.35,
                    force: bool = False, engine_dir: str | None = None,
-                   split_kwargs: dict | None = None,
+                   models_dir: str | None = None, split_kwargs: dict | None = None,
+                   cancel_cb: Optional[Callable[[], None]] = None,
                    progress_cb: ProgressCB = None) -> bool:
     """Transcribe lyrics for ``pak_path`` and write them back into the pak.
 
@@ -64,10 +66,18 @@ def transcribe_pak(pak_path: Path, *, mode: str, server_url: str | None = None,
     # Ensure a vocals stem exists (split first if needed).
     vocals_rel = _vocals_relpath(manifest)
     if not vocals_rel:
+        skw = dict(split_kwargs or {})
+        if not skw.get("engine"):
+            raise RuntimeError(
+                "no vocal stem present and no split engine available to create one "
+                "— configure a server or install a local split engine"
+            )
         if progress_cb:
             progress_cb(0.05, "No vocal stem — splitting first")
-        skw = dict(split_kwargs or {})
-        split_stems.split_pak(pak_path, progress_cb=lambda p, m: progress_cb(0.05 + p * 0.5, m) if progress_cb else None, **skw)
+        split_stems.split_pak(
+            pak_path, cancel_cb=cancel_cb,
+            progress_cb=lambda p, m: progress_cb(0.05 + p * 0.5, m) if progress_cb else None,
+            **skw)
         manifest = pak_io.read_manifest(pak_path)
         vocals_rel = _vocals_relpath(manifest)
         if not vocals_rel:
@@ -108,6 +118,12 @@ def transcribe_pak(pak_path: Path, *, mode: str, server_url: str | None = None,
         else:
             if engine_dir and engine_dir not in sys.path:
                 sys.path.insert(0, engine_dir)
+            # Pin WhisperX' downloaded weights (HF hub + torch) inside the
+            # plugin-managed models dir so Uninstall reclaims them instead of
+            # leaving GBs in ~/.cache/huggingface and ~/.cache/torch.
+            if models_dir:
+                os.environ.setdefault("HF_HOME", models_dir)
+                os.environ.setdefault("TORCH_HOME", models_dir)
             if not whisperx_available():
                 raise RuntimeError(
                     "local whisperx not installed — use 'Download local engine' "

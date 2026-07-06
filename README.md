@@ -19,6 +19,17 @@ Two ways to run, picked in the plugin's **Settings**:
 Precedence in "Auto": use the remote server if one is configured, else the local
 engine if installed, else the action is offered with a prompt to download the engine.
 
+> **Stem count depends on the model.** `bs_roformer_sw` (the remote default and the
+> local `audio-separator` engine) is a **2-stem** vocals/instrumental separator — it
+> yields a `vocals` stem plus an instrumental mapped to `other`. To get the full
+> per-instrument set (`guitar`/`bass`/`drums`/`vocals`/`piano`/`other`) use the local
+> **demucs** engine (`htdemucs_6s`), or point the remote server at a 6-stem model.
+> Output labels are normalized to canonical stem ids regardless of engine.
+
+Lyrics can use a dedicated WhisperX host: set `whisperx.server_url` in the app config
+and lyric transcription posts there (falling back to `demucs_server_url`); splitting
+always uses `demucs_server_url`.
+
 ## What it does
 
 - **Split stems** — extracts the full mix, runs source separation, writes

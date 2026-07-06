@@ -157,6 +157,14 @@ def _repack_zip(path: Path, add_files: dict[str, Path], remove: set[str], manife
             if manifest is not None:
                 zout.writestr(manifest_name, dump_manifest(manifest))
     out_tmp.replace(path)
+    # The atomic replace succeeded, so the new pak is safely in place and the
+    # backup is no longer needed. Removing it keeps a batch run from leaving one
+    # `.feedpak.bak` per processed song on disk. (The backup only guards a crash
+    # mid-repack, i.e. everything before this line.)
+    try:
+        backup.unlink()
+    except OSError:
+        pass
 
 
 def _repack_dir(path: Path, add_files: dict[str, Path], remove: set[str], manifest: dict | None) -> None:

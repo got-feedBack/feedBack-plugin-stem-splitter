@@ -18,18 +18,27 @@ it imports lazily and raises a clear error if a local engine isn't available.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Callable, Optional
 
-import pak_io
+# NB: ``pak_io`` (which imports the core ``sloppak`` lib) is imported lazily inside
+# ``split_pak`` — keeping this module import-clean means its pure helpers
+# (``_normalize_stem_id``, ``_sanitize``) can be unit-tested without the host.
 
 log = logging.getLogger("feedBack.plugin.stem_splitter")
 
 ProgressCB = Optional[Callable[[float, str], None]]
+# Optional cancellation checkpoint: a no-arg callable the caller supplies that
+# RAISES when the job has been asked to cancel. Engines invoke it at safe points
+# (loop iterations, around the heavy step) so a cancel actually interrupts an
+# in-flight separation instead of only taking effect for still-queued jobs.
+CancelCB = Optional[Callable[[], None]]
 
 STEM_SEPARATION_SCHEMA_VERSION = "1.0.0"
 DEFAULT_REMOTE_MODEL = "bs_roformer_sw"
@@ -45,6 +54,40 @@ _AUDIO_EXTS = (".wav", ".flac", ".mp3", ".ogg", ".opus", ".m4a")
 def _sanitize(name: str) -> str:
     s = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("_").lower()
     return s or "stem"
+
+
+# Canonical feedpak stem ids the v3 library filter understands. Separators label
+# their outputs inconsistently — demucs writes bare "vocals.wav"/"drums.wav",
+# while audio-separator / bs-roformer write "<mix>_(Vocals)_<model>.wav" and
+# "<mix>_(Instrumental)_<model>.wav" — so map the label onto a canonical id
+# instead of trusting the raw filename (which otherwise yields ids like
+# "mix_vocals_model_bs_roformer_ep_317_sdr_12_9755" that the library ignores).
+_STEM_ALIASES = {
+    "vocals": "vocals", "vocal": "vocals", "voice": "vocals",
+    "drums": "drums", "drum": "drums",
+    "bass": "bass",
+    "guitar": "guitar", "guitars": "guitar",
+    "piano": "piano", "keys": "piano", "keyboard": "piano",
+    # 2-stem separators emit an "instrumental" / "no_vocals" companion to vocals;
+    # map it to the catch-all "other" so it is still a recognized stem.
+    "other": "other", "instrumental": "other", "instruments": "other",
+    "instrument": "other", "music": "other", "accompaniment": "other",
+    "no_vocals": "other", "novocals": "other",
+}
+
+
+def _normalize_stem_id(raw_name: str) -> str | None:
+    """Best-effort map a separator's output stem label to a canonical stem id.
+
+    Matches an alias as a whole ``_``-delimited token, longest alias first so
+    ``no_vocals`` (instrumental) beats a bare ``vocals`` match. Returns None when
+    nothing maps — the caller then keeps a sanitized fallback id.
+    """
+    s = re.sub(r"[^a-z0-9]+", "_", raw_name.lower()).strip("_")
+    for alias in sorted(_STEM_ALIASES, key=len, reverse=True):
+        if re.search(rf"(^|_){re.escape(alias)}(_|$)", s):
+            return _STEM_ALIASES[alias]
+    return None
 
 
 def _prepend_engine_path(engine_dir: str | None) -> None:
@@ -75,9 +118,8 @@ def audio_separator_available(engine_dir: str | None = None) -> bool:
 
 def _run_remote(mix: Path, out_dir: Path, model: str, server_url: str,
                 api_key: str | None, stems: tuple[str, ...],
-                progress_cb: ProgressCB) -> Path:
+                progress_cb: ProgressCB, cancel_cb: CancelCB = None) -> Path:
     """POST the mix to ``{server_url}/separate`` and download the stems."""
-    import time
     import requests
 
     server_url = server_url.rstrip("/")
@@ -105,6 +147,8 @@ def _run_remote(mix: Path, out_dir: Path, model: str, server_url: str,
         job_id = data["job_id"]
         for _ in range(120):  # up to ~10 min
             time.sleep(5)
+            if cancel_cb:
+                cancel_cb()  # raises to abort a canceled job between polls
             jr = requests.get(f"{server_url}/jobs/{job_id}", timeout=30).json()
             status = jr.get("status")
             if status == "complete":
@@ -168,7 +212,8 @@ def _as_model_filename(model: str) -> str:
 
 
 def _run_demucs_local(mix: Path, out_dir: Path, model: str, engine_dir: str | None,
-                      progress_cb: ProgressCB) -> Path:
+                      models_dir: str | None = None, progress_cb: ProgressCB = None,
+                      cancel_cb: CancelCB = None) -> Path:
     _prepend_engine_path(engine_dir)
     if not demucs_available(engine_dir):
         raise RuntimeError(
@@ -179,11 +224,39 @@ def _run_demucs_local(mix: Path, out_dir: Path, model: str, engine_dir: str | No
     result_dir.mkdir(parents=True, exist_ok=True)
     if progress_cb:
         progress_cb(0.15, f"Running demucs ({model})")
+    # Pin demucs' downloaded model weights inside the plugin-managed models dir
+    # (via TORCH_HOME) so engine_status accounts for them and Uninstall reclaims
+    # them — otherwise they land in ~/.cache/torch and leak past an uninstall.
+    env = dict(os.environ)
+    if models_dir:
+        env.setdefault("TORCH_HOME", models_dir)
     # Subprocess keeps torch out of the server process and isolates crashes.
+    # Popen + poll (not subprocess.run) so a cancel can terminate it mid-run;
+    # output drains to a temp file to avoid a full-PIPE deadlock.
     cmd = [sys.executable, "-m", "demucs", "-n", model, "-o", str(result_dir), str(mix)]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    if proc.returncode != 0:
-        raise RuntimeError(f"demucs failed: {(proc.stderr or proc.stdout)[:400]}")
+    with tempfile.TemporaryFile(mode="w+") as logf:
+        proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT,
+                                text=True, env=env)
+        try:
+            while proc.poll() is None:
+                if cancel_cb:
+                    try:
+                        cancel_cb()
+                    except BaseException:
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=5)
+                        except Exception:
+                            proc.kill()
+                        raise
+                time.sleep(0.3)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+        if proc.returncode != 0:
+            logf.seek(0)
+            tail = logf.read()[-400:]
+            raise RuntimeError(f"demucs failed: {tail}")
     # demucs writes <out>/<model>/<track>/<stem>.wav
     subdir = result_dir / model
     tracks = [p for p in subdir.glob("*") if p.is_dir()] if subdir.is_dir() else []
@@ -215,12 +288,14 @@ def split_pak(pak_path: Path, *, engine: str, model: str | None = None,
               server_url: str | None = None, api_key: str | None = None,
               engine_dir: str | None = None, models_dir: str | None = None,
               stems: tuple[str, ...] = DEFAULT_STEMS,
-              progress_cb: ProgressCB = None) -> list[str]:
+              progress_cb: ProgressCB = None, cancel_cb: CancelCB = None) -> list[str]:
     """Split ``pak_path`` into per-instrument stems, write them back into the pak,
     and rewrite the manifest. Returns the list of produced stem ids.
 
     ``engine`` is one of ``"remote"``, ``"audio-separator"``, ``"demucs"``.
     """
+    import pak_io  # lazy — pulls in the core sloppak lib (see module docstring)
+
     pak_path = Path(pak_path)
     manifest = pak_io.read_manifest(pak_path)
 
@@ -232,13 +307,13 @@ def split_pak(pak_path: Path, *, engine: str, model: str | None = None,
             if not server_url:
                 raise RuntimeError("remote engine selected but no split server configured")
             result_dir = _run_remote(mix, work, model or DEFAULT_REMOTE_MODEL,
-                                     server_url, api_key, stems, progress_cb)
+                                     server_url, api_key, stems, progress_cb, cancel_cb)
         elif engine == "audio-separator":
             result_dir = _run_audio_separator(mix, work, model or DEFAULT_REMOTE_MODEL,
                                                models_dir, engine_dir, progress_cb)
         elif engine == "demucs":
             result_dir = _run_demucs_local(mix, work, model or DEFAULT_DEMUCS_MODEL,
-                                           engine_dir, progress_cb)
+                                           engine_dir, models_dir, progress_cb, cancel_cb)
         else:
             raise RuntimeError(f"unknown split engine: {engine!r}")
 
@@ -251,11 +326,21 @@ def split_pak(pak_path: Path, *, engine: str, model: str | None = None,
 
         add_files: dict[str, Path] = {}
         produced: list[dict] = []
+        seen_ids: set[str] = set()
         for wav in stem_files:
-            stem_id = _sanitize(wav.stem)
-            # Some engines suffix the mix name onto the stem file; keep the last token.
-            if "_" in stem_id and stem_id.split("_")[-1] in pak_io.ALLOWED_STEM_IDS:
-                stem_id = stem_id.split("_")[-1]
+            stem_id = _normalize_stem_id(wav.stem)
+            if stem_id is None:
+                # Unrecognized label — keep a sanitized token so no audio is lost
+                # (it just won't match the v3 stem filter).
+                sid = _sanitize(wav.stem)
+                if "_" in sid and sid.split("_")[-1] in pak_io.ALLOWED_STEM_IDS:
+                    sid = sid.split("_")[-1]
+                stem_id = sid
+            if stem_id in seen_ids:
+                # Two outputs mapped to the same id (e.g. a 2-stem model's
+                # instrumental collapsing onto "other"): keep the first.
+                continue
+            seen_ids.add(stem_id)
             rel = f"stems/{stem_id}.ogg"
             out_ogg = work / f"enc_{stem_id}.ogg"
             _encode_ogg(wav, out_ogg)
