@@ -24,6 +24,11 @@ INSTRUMENT_STEM_IDS = ["guitar", "bass", "drums", "vocals", "other", "piano"]
 _BROADCAST_MIN_INTERVAL = 0.15  # s — throttle progress spam
 
 
+class JobCanceled(Exception):
+    """Raised by a job's cancel checkpoint so an in-flight split/transcribe
+    unwinds cleanly and the worker marks it ``canceled`` (not ``failed``)."""
+
+
 class JobManager:
     def __init__(self, app: FastAPI, context: dict):
         self.app = app
@@ -122,14 +127,23 @@ class JobManager:
             return {}
 
     def _server_url(self) -> str | None:
+        """Split server URL (demucs/roformer)."""
         cfg = self._app_config()
         url = cfg.get("demucs_server_url")
-        if isinstance(cfg.get("whisperx"), dict) and cfg["whisperx"].get("server_url"):
-            # whisperx.server_url overrides for lyrics; split still uses demucs_server_url
-            pass
         if isinstance(url, str) and url.strip():
             return url.strip().rstrip("/")
         return None
+
+    def _lyrics_server_url(self) -> str | None:
+        """Lyrics server URL. Prefers a dedicated ``whisperx.server_url`` (a
+        separate WhisperX host is common); falls back to the split server."""
+        cfg = self._app_config()
+        wx = cfg.get("whisperx")
+        if isinstance(wx, dict):
+            u = wx.get("server_url")
+            if isinstance(u, str) and u.strip():
+                return u.strip().rstrip("/")
+        return self._server_url()
 
     def _api_key(self) -> str | None:
         cfg = self._app_config()
@@ -171,7 +185,7 @@ class JobManager:
     def resolve_lyrics_engine(self) -> tuple[str | None, str]:
         s = self.read_settings()
         choice = s.get("lyrics_engine", "auto")
-        server_url = self._server_url()
+        server_url = self._lyrics_server_url()
         edir = str(engine_install.engine_dir(self.config_dir))
         import sys as _sys
         if edir not in _sys.path:
@@ -234,8 +248,14 @@ class JobManager:
             j.update(fields)
         self.broadcast_snapshot()
 
+    def _check_cancel(self, job_id: str) -> None:
+        """Cancellation checkpoint — raises if the job was asked to cancel."""
+        if job_id in self._cancel:
+            raise JobCanceled()
+
     def _make_progress_cb(self, job_id: str, base: float = 0.0, span: float = 1.0):
         def cb(p: float, message: str):
+            self._check_cancel(job_id)  # every progress tick is a cancel point
             frac = max(0.0, min(1.0, base + p * span))
             with self.lock:
                 j = self.jobs.get(job_id)
@@ -253,6 +273,9 @@ class JobManager:
             with self.lock:
                 job = self.jobs.get(job_id)
             if not job or job.get("status") != "queued":
+                # A job canceled while still queued already had its status flipped;
+                # discard its id here so it doesn't leak in `_cancel` forever.
+                self._cancel.discard(job_id)
                 continue
             if job_id in self._cancel:
                 self._cancel.discard(job_id)
@@ -263,9 +286,13 @@ class JobManager:
             try:
                 self._run_job(job)
                 self._update(job_id, status="done", progress=1.0, message="Done")
+            except JobCanceled:
+                self._update(job_id, status="canceled", progress=0.0, message="Canceled")
             except Exception as e:
                 self.log.exception("stem_splitter: job %s failed", job_id)
                 self._update(job_id, status="failed", error=str(e), message=f"Failed: {e}")
+            finally:
+                self._cancel.discard(job_id)
             self._save_jobs()
 
     def _run_job(self, job: dict) -> None:
@@ -275,6 +302,7 @@ class JobManager:
         filename = job["filename"]
         pak_path = self._resolve_pak(filename)
         cb = self._make_progress_cb(job["id"])
+        cancel_cb = lambda: self._check_cancel(job["id"])  # noqa: E731
         settings = self.read_settings()
         server_url = self._server_url()
         api_key = self._api_key()
@@ -290,12 +318,13 @@ class JobManager:
                 pak_path, engine=engine,
                 model=settings.get("remote_model") if engine != "demucs" else None,
                 server_url=server_url, api_key=api_key,
-                engine_dir=edir, models_dir=mdir, progress_cb=cb,
+                engine_dir=edir, models_dir=mdir, progress_cb=cb, cancel_cb=cancel_cb,
             )
         elif job["kind"] == "transcribe":
             lyr_engine, lyr_reason = self.resolve_lyrics_engine()
             if not lyr_engine:
                 raise RuntimeError(lyr_reason)
+            lyr_server = self._lyrics_server_url()
             split_engine, _ = self.resolve_split_engine()
             split_kwargs = {
                 "engine": split_engine, "server_url": server_url, "api_key": api_key,
@@ -304,10 +333,11 @@ class JobManager:
             } if split_engine else None
             self._update(job["id"], message=f"Transcribing via {lyr_reason}")
             transcribe.transcribe_pak(
-                pak_path, mode=lyr_engine, server_url=server_url, api_key=api_key,
+                pak_path, mode=lyr_engine, server_url=lyr_server, api_key=api_key,
                 whisperx_model=settings.get("whisperx_model", "medium"),
                 language=settings.get("language") or None,
-                engine_dir=edir, split_kwargs=split_kwargs, progress_cb=cb,
+                engine_dir=edir, models_dir=mdir, split_kwargs=split_kwargs,
+                cancel_cb=cancel_cb, progress_cb=cb,
             )
         else:
             raise RuntimeError(f"unknown job kind {job['kind']!r}")
@@ -374,9 +404,14 @@ def setup(app: FastAPI, context: dict) -> None:
     log = mgr.log
 
     try:
-        mgr._loop = asyncio.get_event_loop()
-    except Exception:
-        mgr._loop = None
+        # setup() is marshalled onto the event-loop thread by the host, so the
+        # running loop is the uvicorn loop the worker thread must push onto.
+        mgr._loop = asyncio.get_running_loop()
+    except RuntimeError:
+        try:
+            mgr._loop = asyncio.get_event_loop()
+        except Exception:
+            mgr._loop = None
 
     P = "/api/plugins/stem_splitter"
 
@@ -457,12 +492,25 @@ def setup(app: FastAPI, context: dict) -> None:
     def _query(**kwargs):
         if not mgr.meta_db:
             return []
+        out: list = []
+        page, size = 0, 500
         try:
-            songs, _total = mgr.meta_db.query_page(page=0, size=1000, **kwargs)
-            return songs or []
+            while True:
+                songs, total = mgr.meta_db.query_page(page=page, size=size, **kwargs)
+                if not songs:
+                    break
+                out.extend(songs)
+                if len(songs) < size:
+                    break  # short page = last page (correct even if `total` is None)
+                if isinstance(total, int) and len(out) >= total:
+                    break
+                page += 1
+                if page > 2000:  # backstop (~1M rows) so a bad `total` can't spin
+                    log.warning("stem_splitter: query truncated at %d rows", len(out))
+                    break
         except Exception as e:
             log.warning("stem_splitter: query_page failed: %s", e)
-            return []
+        return out
 
     @app.get(f"{P}/missing_stems")
     def missing_stems():
