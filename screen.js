@@ -114,9 +114,12 @@
       var row = document.createElement('div');
       row.className = 'ss-job';
       var pct = Math.round((j.progress || 0) * 100);
+      var label = j.title
+        ? j.title + (j.artist ? ' — ' + j.artist : '')
+        : baseName(j.filename);
       row.innerHTML =
         '<span class="ss-pill ' + (j.kind === 'split' ? 'split' : 'transcribe') + '">' + j.kind + '</span>' +
-        '<span class="name" title="' + esc(j.filename) + '">' + esc(baseName(j.filename)) +
+        '<span class="name" title="' + esc(j.filename) + '">' + esc(label) +
         '<br><span class="msg">' + esc(j.message || '') + '</span></span>' +
         '<div class="ss-bar"><i style="width:' + pct + '%"></i></div>' +
         '<span class="ss-status ' + esc(j.status) + '">' + esc(j.status) + '</span>' +
