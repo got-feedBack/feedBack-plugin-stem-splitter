@@ -23,7 +23,9 @@ engine if installed, else the action is offered with a prompt to download the en
 
 - **Split stems** — extracts the full mix, runs source separation, writes
   `stems/<id>.ogg` back into the pak, rewrites the manifest (`stems:` +
-  `stem_separation:`), removes the combined `stems/full.ogg`, and reindexes the song.
+  `stem_separation:`), and reindexes the song. The full mix is **kept** as a
+  `default: false` fallback (its original file — e.g. `full.wav` — is preserved
+  verbatim), so there's always a guaranteed-playable baseline.
 - **Transcribe lyrics** — isolates a vocal stem (splitting first if needed), runs
   WhisperX, writes `lyrics.json` + manifest `lyrics` / `lyrics_source`, reindexes.
 
