@@ -57,21 +57,21 @@ def _sanitize(name: str) -> str:
 
 
 # Canonical feedpak stem ids the v3 library filter understands. Separators label
-# their outputs inconsistently — demucs writes bare "vocals.wav"/"drums.wav",
-# while audio-separator / bs-roformer write "<mix>_(Vocals)_<model>.wav" and
-# "<mix>_(Instrumental)_<model>.wav" — so map the label onto a canonical id
-# instead of trusting the raw filename (which otherwise yields ids like
-# "mix_vocals_model_bs_roformer_ep_317_sdr_12_9755" that the library ignores).
+# their outputs inconsistently — demucs writes bare "drums.wav"/"guitar.wav",
+# while audio-separator (BS-Roformer-SW etc.) writes "<mix>_(Guitar)_<model>.flac"
+# — so map the label onto a canonical id instead of trusting the raw filename
+# (which otherwise yields ids like "mix_guitar_bs_roformer_sw" the library ignores).
 _STEM_ALIASES = {
     "vocals": "vocals", "vocal": "vocals", "voice": "vocals",
     "drums": "drums", "drum": "drums",
     "bass": "bass",
     "guitar": "guitar", "guitars": "guitar",
     "piano": "piano", "keys": "piano", "keyboard": "piano",
-    # 2-stem separators emit an "instrumental" / "no_vocals" companion to vocals;
-    # map it to the catch-all "other" so it is still a recognized stem.
-    "other": "other", "instrumental": "other", "instruments": "other",
-    "instrument": "other", "music": "other", "accompaniment": "other",
+    "other": "other",
+    # A 2-stem model (should one be configured) emits an instrumental companion
+    # to vocals; map it to the catch-all "other" so it is still a recognized stem.
+    "instrumental": "other", "instruments": "other", "instrument": "other",
+    "music": "other", "accompaniment": "other",
     "no_vocals": "other", "novocals": "other",
 }
 
@@ -79,10 +79,17 @@ _STEM_ALIASES = {
 def _normalize_stem_id(raw_name: str) -> str | None:
     """Best-effort map a separator's output stem label to a canonical stem id.
 
-    Matches an alias as a whole ``_``-delimited token, longest alias first so
-    ``no_vocals`` (instrumental) beats a bare ``vocals`` match. Returns None when
-    nothing maps — the caller then keeps a sanitized fallback id.
+    Prefers audio-separator's parenthesised ``<base>_(<Label>)_<model>`` label,
+    exactly as slopsmith-demucs-server does (``server.py`` ``_run_roformer``);
+    falls back to a whole-token scan (longest alias first, so ``no_vocals`` beats
+    a bare ``vocals``) for demucs' bare names and the server's clean keys.
+    Returns None when nothing maps — the caller keeps a sanitized fallback id.
     """
+    m = re.search(r"_\(([^)]+)\)_", raw_name)
+    if m:
+        lbl = re.sub(r"[^a-z0-9]+", "_", m.group(1).lower()).strip("_")
+        if lbl in _STEM_ALIASES:
+            return _STEM_ALIASES[lbl]
     s = re.sub(r"[^a-z0-9]+", "_", raw_name.lower()).strip("_")
     for alias in sorted(_STEM_ALIASES, key=len, reverse=True):
         if re.search(rf"(^|_){re.escape(alias)}(_|$)", s):
@@ -204,9 +211,15 @@ def _run_audio_separator(mix: Path, out_dir: Path, model: str, models_dir: str |
 
 
 def _as_model_filename(model: str) -> str:
-    """Map our short model id to an audio-separator model filename."""
+    """Map our short model id to an audio-separator checkpoint filename.
+
+    MUST match the demucs server's ``ROFORMER_MODELS`` mapping so the local
+    audio-separator engine loads the same checkpoint and produces the same
+    6-stem output as the remote server (the plugin's stated local-parity goal) —
+    not a different stock 2-stem checkpoint.
+    """
     known = {
-        "bs_roformer_sw": "model_bs_roformer_ep_317_sdr_12.9755.ckpt",
+        "bs_roformer_sw": "BS-Roformer-SW.ckpt",  # 6-stem, matches slopsmith-demucs-server
     }
     return known.get(model, model if model.endswith((".ckpt", ".onnx", ".pth")) else f"{model}.ckpt")
 

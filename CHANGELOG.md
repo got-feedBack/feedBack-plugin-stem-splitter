@@ -4,12 +4,15 @@
 
 Fixes from code review:
 
-- **Stem-id normalization.** Output stems are now mapped to canonical feedpak ids
-  (`guitar`/`bass`/`drums`/`vocals`/`piano`/`other`) by label rather than by raw
-  filename. Fixes `audio-separator`/`bs-roformer` outputs like
-  `mix_(Vocals)_model_bs_roformer_ep_317_sdr_12.9755.wav` becoming unrecognized
-  garbage ids — which also broke local lyrics transcription (couldn't find the
-  `vocals` stem). 2-stem models now map their instrumental to `other`.
+- **Local audio-separator now matches the server (6-stem).** `bs_roformer_sw` mapped
+  to the stock 2-stem `model_bs_roformer_ep_317_sdr_12.9755.ckpt`, so the local
+  engine produced different results than the remote server, which loads the custom
+  6-stem `BS-Roformer-SW.ckpt`. The local mapping now uses the same checkpoint.
+- **Stem-id normalization.** Output stems are mapped to canonical feedpak ids by
+  label (preferring audio-separator's `_(<Label>)_` token, matching the server's
+  extraction) rather than by raw filename. Fixes outputs like
+  `mix_(Guitar)_BS-Roformer-SW.flac` becoming unrecognized garbage ids — which also
+  broke local lyrics transcription (couldn't find the `vocals` stem).
 - **Model weights stay in the managed dir.** The demucs subprocess (`TORCH_HOME`)
   and local WhisperX (`HF_HOME`/`TORCH_HOME`) now cache weights under
   `{config_dir}/models` instead of `~/.cache`, so `engine_status` counts them and

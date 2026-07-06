@@ -24,6 +24,20 @@ class NormalizeStemId(unittest.TestCase):
         self.assertEqual(ss._normalize_stem_id(v), "vocals")
         self.assertEqual(ss._normalize_stem_id(i), "other")
 
+    def test_bs_roformer_sw_6_stem_labels(self):
+        # Real server naming: "<base>_(<Label>)_BS-Roformer-SW.flac"
+        for label, expect in [("Vocals", "vocals"), ("Drums", "drums"),
+                              ("Bass", "bass"), ("Guitar", "guitar"),
+                              ("Piano", "piano"), ("Other", "other")]:
+            name = f"mix_({label})_BS-Roformer-SW"
+            self.assertEqual(ss._normalize_stem_id(name), expect,
+                             f"{name!r} -> {expect}")
+
+    def test_model_token_does_not_shadow_paren_label(self):
+        # "BS-Roformer-SW" contains no stem word, but ensure the paren label wins.
+        self.assertEqual(
+            ss._normalize_stem_id("mix_(Bass)_BS-Roformer-SW"), "bass")
+
     def test_no_vocals_maps_to_other_not_vocals(self):
         # "no_vocals" (the instrumental companion) must not match bare "vocals".
         self.assertEqual(ss._normalize_stem_id("mix_no_vocals_htdemucs"), "other")
