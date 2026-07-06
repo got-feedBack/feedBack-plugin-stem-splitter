@@ -4,10 +4,6 @@ Splits `.feedpak` songs that do not yet have per-instrument stems, and transcrib
 lyrics when they're absent. Single-song or batch, with automatic "what's missing"
 detection driven by the library index.
 
-This is a standalone plugin. It is **inspired by** the retired Sloppak Converter but
-shares no code with it — all PSARC conversion is out of scope, and the split/lyrics
-orchestration is reimplemented self-contained against feedBack's own pak APIs.
-
 ## Engines
 
 Two ways to run, picked in the plugin's **Settings**:
