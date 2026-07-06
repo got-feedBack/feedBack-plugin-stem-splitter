@@ -193,11 +193,26 @@ class JobManager:
         return (None, "no lyrics engine available — configure a server or install whisperx")
 
     # ── job lifecycle ────────────────────────────────────────────────────────
+    def _song_label(self, filename: str) -> tuple[str | None, str | None]:
+        """Best-effort (title, artist) for the queue display. Fast — extract_meta
+        only reads the manifest. Falls back to (None, None) so the UI shows the
+        filename."""
+        try:
+            if self.extract_meta and self.get_dlc_dir and self.get_dlc_dir():
+                m = self.extract_meta(self._resolve_pak(filename)) or {}
+                return (m.get("title") or None, m.get("artist") or None)
+        except Exception:
+            pass
+        return (None, None)
+
     def enqueue(self, kind: str, filename: str) -> dict:
+        title, artist = self._song_label(filename)
         job = {
             "id": uuid.uuid4().hex[:12],
             "kind": kind,
             "filename": filename,
+            "title": title,
+            "artist": artist,
             "status": "queued",
             "progress": 0.0,
             "message": "Queued",
