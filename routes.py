@@ -258,6 +258,9 @@ class JobManager:
             with self.lock:
                 job = self.jobs.get(job_id)
             if not job or job.get("status") != "queued":
+                # A job canceled while still queued already had its status flipped;
+                # discard its id here so it doesn't leak in `_cancel` forever.
+                self._cancel.discard(job_id)
                 continue
             if job_id in self._cancel:
                 self._cancel.discard(job_id)
@@ -482,7 +485,9 @@ def setup(app: FastAPI, context: dict) -> None:
                 if not songs:
                     break
                 out.extend(songs)
-                if len(out) >= (total or 0) or len(songs) < size:
+                if len(songs) < size:
+                    break  # short page = last page (correct even if `total` is None)
+                if isinstance(total, int) and len(out) >= total:
                     break
                 page += 1
                 if page > 2000:  # backstop (~1M rows) so a bad `total` can't spin

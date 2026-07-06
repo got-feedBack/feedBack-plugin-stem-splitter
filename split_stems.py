@@ -247,9 +247,8 @@ def _run_demucs_local(mix: Path, out_dir: Path, model: str, engine_dir: str | No
     # Popen + poll (not subprocess.run) so a cancel can terminate it mid-run;
     # output drains to a temp file to avoid a full-PIPE deadlock.
     cmd = [sys.executable, "-m", "demucs", "-n", model, "-o", str(result_dir), str(mix)]
-    with tempfile.TemporaryFile(mode="w+") as logf:
-        proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT,
-                                text=True, env=env)
+    with tempfile.TemporaryFile() as logf:  # binary — child writes raw bytes to the fd
+        proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, env=env)
         try:
             while proc.poll() is None:
                 if cancel_cb:
@@ -261,14 +260,17 @@ def _run_demucs_local(mix: Path, out_dir: Path, model: str, engine_dir: str | No
                             proc.wait(timeout=5)
                         except Exception:
                             proc.kill()
+                            proc.wait()  # reap so we don't leave a zombie
                         raise
                 time.sleep(0.3)
         finally:
             if proc.poll() is None:
                 proc.kill()
+                proc.wait()  # reap
         if proc.returncode != 0:
-            logf.seek(0)
-            tail = logf.read()[-400:]
+            logf.seek(0, os.SEEK_END)          # read only the last ~400 bytes,
+            logf.seek(max(0, logf.tell() - 400))  # not the whole log, on the error path
+            tail = logf.read().decode("utf-8", "replace")
             raise RuntimeError(f"demucs failed: {tail}")
     # demucs writes <out>/<model>/<track>/<stem>.wav
     subdir = result_dir / model
