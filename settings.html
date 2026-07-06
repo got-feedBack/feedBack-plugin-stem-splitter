@@ -57,7 +57,7 @@
       <span id="ss-install-pct" class="ss-muted">0%</span>
     </div>
     <div class="ss-bar" style="width:100%;margin:.35rem 0"><i id="ss-install-fill" style="width:0%"></i></div>
-    <pre class="ss-log" id="ss-install-log"></pre>
+    <pre class="ss-log" id="ss-install-log" style="height:240px;max-height:240px;overflow:auto;margin:0;padding:.6rem;background:#0b1220;color:#94a3b8;border:1px solid rgba(148,163,184,.2);border-radius:6px;font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;word-break:break-word"></pre>
   </div>
 </div>
 
@@ -102,6 +102,19 @@
       .then(function () { $('ss-set-saved').textContent = 'Saved.'; setTimeout(function () { $('ss-set-saved').textContent = ''; }, 2000); });
   }
 
+  var MAX_LOG_LINES = 500;
+  function appendLog(log, line) {
+    // Keep only the last N lines so a long pip run can't balloon the DOM; the
+    // fixed-height box scrolls, and we pin to the bottom unless the user has
+    // scrolled up to read back.
+    var atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 4;
+    var lines = log.textContent ? log.textContent.split('\n') : [];
+    lines.push(line);
+    if (lines.length > MAX_LOG_LINES) lines = lines.slice(lines.length - MAX_LOG_LINES);
+    log.textContent = lines.join('\n');
+    if (atBottom) log.scrollTop = log.scrollHeight;
+  }
+
   function setBar(pct, phase) {
     $('ss-install-fill').style.width = Math.round((pct || 0) * 100) + '%';
     $('ss-install-pct').textContent = Math.round((pct || 0) * 100) + '%';
@@ -125,12 +138,12 @@
     ws.onmessage = function (ev) {
       var m; try { m = JSON.parse(ev.data); } catch (e) { return; }
       if (m.type === 'install') {
-        if (m.line) { log.textContent += m.line + '\n'; log.scrollTop = log.scrollHeight; }
+        if (m.line) { appendLog(log, m.line); }
         setBar(m.pct, m.phase);
       } else if (m.type === 'install_done') {
-        log.textContent += '\n✓ Done.\n'; setBar(1, 'Done'); renderStatus(m.status);
+        appendLog(log, '✓ Done.'); setBar(1, 'Done'); renderStatus(m.status);
       } else if (m.type === 'install_error') {
-        log.textContent += '\n✗ ' + m.error + '\n'; $('ss-install-phase').textContent = 'Failed';
+        appendLog(log, '✗ ' + m.error); $('ss-install-phase').textContent = 'Failed';
       }
     };
     ws.onclose = function () { ws = null; };
