@@ -64,9 +64,17 @@ def transcribe_pak(pak_path: Path, *, mode: str, server_url: str | None = None,
     # Ensure a vocals stem exists (split first if needed).
     vocals_rel = _vocals_relpath(manifest)
     if not vocals_rel:
+        # Auto-split to produce a vocal stem — but only if a split engine is
+        # actually available. Without one, fail with a clear message instead of a
+        # TypeError from split_pak's missing required `engine` argument.
+        if not split_kwargs or not split_kwargs.get("engine"):
+            raise RuntimeError(
+                "this song has no vocal stem yet and no split engine is available "
+                "to create one — configure a split server or install a local engine"
+            )
         if progress_cb:
             progress_cb(0.05, "No vocal stem — splitting first")
-        skw = dict(split_kwargs or {})
+        skw = dict(split_kwargs)
         split_stems.split_pak(pak_path, progress_cb=lambda p, m: progress_cb(0.05 + p * 0.5, m) if progress_cb else None, **skw)
         manifest = pak_io.read_manifest(pak_path)
         vocals_rel = _vocals_relpath(manifest)
