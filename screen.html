@@ -1,0 +1,43 @@
+<!-- Injected by the Host into div#plugin-stem_splitter.screen. No outer .screen wrapper. -->
+<div class="stem-splitter">
+  <h1>Stem Splitter</h1>
+  <p class="ss-sub">Split feedpak stems and transcribe lyrics — remote server or on-device engine.</p>
+
+  <div class="ss-card">
+    <div class="ss-row">
+      <div>
+        <span class="ss-muted">Split engine</span><br>
+        <strong id="ss-split-engine">…</strong>
+      </div>
+      <div>
+        <span class="ss-muted">Lyrics engine</span><br>
+        <strong id="ss-lyrics-engine">…</strong>
+      </div>
+      <div class="ss-spacer"></div>
+      <button class="ss-btn secondary" id="ss-open-settings">Engine settings / download</button>
+    </div>
+  </div>
+
+  <div class="ss-card">
+    <div class="ss-row">
+      <h2 style="margin:0">Batch</h2>
+      <div class="ss-spacer"></div>
+      <button class="ss-btn" id="ss-split-all">Split all missing (<span id="ss-missing-stems-n">0</span>)</button>
+      <button class="ss-btn" id="ss-transcribe-all">Transcribe all missing (<span id="ss-missing-lyrics-n">0</span>)</button>
+      <button class="ss-btn secondary" id="ss-refresh-missing">Refresh</button>
+    </div>
+  </div>
+
+  <div class="ss-card">
+    <div class="ss-row">
+      <h2 style="margin:0">Queue</h2>
+      <div class="ss-spacer"></div>
+      <button class="ss-btn secondary" id="ss-pause">Pause</button>
+      <button class="ss-btn secondary" id="ss-resume">Resume</button>
+      <button class="ss-btn secondary" id="ss-retry">Retry failed</button>
+      <button class="ss-btn secondary" id="ss-cancel">Cancel queued</button>
+      <button class="ss-btn secondary" id="ss-clear">Clear finished</button>
+    </div>
+    <div id="ss-jobs" style="margin-top:.75rem"><p class="ss-muted">No jobs yet.</p></div>
+  </div>
+</div>

@@ -1,0 +1,11 @@
+# Stem Splitter — base install stays intentionally light.
+#
+# The heavy split/transcribe engines (torch, demucs, audio-separator, whisperx —
+# multiple GB) are NOT listed here on purpose: they are installed on demand, only
+# when the user opts in via the in-app "Download local engine" button (see
+# engine_install.py). Remote-only users pay nothing, and a multi-GB install never
+# blocks the plugin loader or the other plugins loading behind it.
+#
+# `requests` is the only hard dependency — the remote /separate and /align clients
+# use it. soundfile/numpy are optional (guarded imports) for the local silence gate.
+requests>=2.31

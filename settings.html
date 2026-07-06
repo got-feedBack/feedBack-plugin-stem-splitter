@@ -1,0 +1,149 @@
+<!-- Stem Splitter settings — injected into the app Settings panel. Scoped under
+     .stem-splitter-settings. Nothing heavy loads until the user clicks Download. -->
+<div class="stem-splitter-settings" id="ss-settings">
+  <h3>Stem Splitter</h3>
+  <p class="ss-muted">Pick how splitting and lyric transcription run. Remote uses the
+    server configured in the app's audio settings (<code>demucs_server_url</code>).
+    Local runs on this machine after an opt-in download.</p>
+
+  <label for="ss-set-split">Split engine</label>
+  <select id="ss-set-split">
+    <option value="auto">Auto (remote if available, else local)</option>
+    <option value="remote">Remote server (bs_roformer_sw)</option>
+    <option value="audio-separator">Local — audio-separator (bs_roformer_sw)</option>
+    <option value="demucs">Local — demucs (htdemucs_6s)</option>
+  </select>
+
+  <label for="ss-set-lyrics">Lyrics engine</label>
+  <select id="ss-set-lyrics">
+    <option value="auto">Auto (remote if available, else local)</option>
+    <option value="remote">Remote server (/align)</option>
+    <option value="local">Local — whisperx</option>
+  </select>
+
+  <div class="row">
+    <div>
+      <label for="ss-set-remote-model">Remote split model</label>
+      <input type="text" id="ss-set-remote-model" value="bs_roformer_sw">
+    </div>
+    <div>
+      <label for="ss-set-wx-model">WhisperX model (local)</label>
+      <select id="ss-set-wx-model">
+        <option>tiny</option><option>base</option><option>small</option>
+        <option selected>medium</option><option>large-v2</option><option>large-v3</option>
+      </select>
+    </div>
+    <div>
+      <label for="ss-set-lang">Language (blank = auto)</label>
+      <input type="text" id="ss-set-lang" placeholder="en" style="width:5rem">
+    </div>
+  </div>
+
+  <div style="margin-top:1rem"><button class="ss-btn" id="ss-set-save" style="background:#2563eb;color:#fff;border:0;border-radius:7px;padding:.45rem .85rem;font-weight:600;cursor:pointer">Save</button>
+    <span id="ss-set-saved" class="ss-muted"></span></div>
+
+  <h3 style="margin-top:1.75rem">Local engine (opt-in download)</h3>
+  <p class="ss-muted" id="ss-engine-status">Checking…</p>
+  <div class="row">
+    <button class="ss-btn" id="ss-dl-all" style="background:#2563eb;color:#fff;border:0;border-radius:7px;padding:.45rem .85rem;font-weight:600;cursor:pointer">Download local engine + models (~2 GB+)</button>
+    <button class="ss-btn" id="ss-dl-as" style="background:rgba(148,163,184,.2);color:#e2e8f0;border:0;border-radius:7px;padding:.45rem .85rem;cursor:pointer">audio-separator only</button>
+    <button class="ss-btn" id="ss-dl-demucs" style="background:rgba(148,163,184,.2);color:#e2e8f0;border:0;border-radius:7px;padding:.45rem .85rem;cursor:pointer">demucs only</button>
+    <button class="ss-btn" id="ss-dl-wx" style="background:rgba(148,163,184,.2);color:#e2e8f0;border:0;border-radius:7px;padding:.45rem .85rem;cursor:pointer">whisperx only</button>
+    <button class="ss-btn" id="ss-uninstall" style="background:#b91c1c;color:#fff;border:0;border-radius:7px;padding:.45rem .85rem;cursor:pointer">Uninstall</button>
+  </div>
+  <div id="ss-install-progress" style="display:none;margin-top:.75rem">
+    <div class="ss-row" style="justify-content:space-between">
+      <strong id="ss-install-phase" style="font-size:.85rem">Starting…</strong>
+      <span id="ss-install-pct" class="ss-muted">0%</span>
+    </div>
+    <div class="ss-bar" style="width:100%;margin:.35rem 0"><i id="ss-install-fill" style="width:0%"></i></div>
+    <pre class="ss-log" id="ss-install-log"></pre>
+  </div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+  if (window.__stemSplitterSettingsLoaded) return;
+  window.__stemSplitterSettingsLoaded = true;
+  var API = '/api/plugins/stem_splitter';
+  function $(id) { return document.getElementById(id); }
+  function j(path, opts) { return fetch(API + path, opts).then(function (r) { return r.json(); }); }
+
+  function loadConfig() {
+    j('/config').then(function (cfg) {
+      var s = cfg.settings || {};
+      $('ss-set-split').value = s.split_engine || 'auto';
+      $('ss-set-lyrics').value = s.lyrics_engine || 'auto';
+      $('ss-set-remote-model').value = s.remote_model || 'bs_roformer_sw';
+      $('ss-set-wx-model').value = s.whisperx_model || 'medium';
+      $('ss-set-lang').value = s.language || '';
+      renderStatus(cfg.engine_status);
+    }).catch(function () {});
+  }
+
+  function renderStatus(st) {
+    if (!st) { j('/engine_status').then(renderStatus); return; }
+    var inst = st.installed || {};
+    var parts = Object.keys(inst).map(function (k) { return k + ': ' + (inst[k] ? '✓' : '—'); });
+    var gb = (st.engine_bytes + st.models_bytes) / 1e9;
+    $('ss-engine-status').textContent = parts.join('   ') + '   (' + gb.toFixed(2) + ' GB on disk)';
+  }
+
+  function save() {
+    var body = {
+      split_engine: $('ss-set-split').value,
+      lyrics_engine: $('ss-set-lyrics').value,
+      remote_model: $('ss-set-remote-model').value,
+      whisperx_model: $('ss-set-wx-model').value,
+      language: $('ss-set-lang').value,
+    };
+    j('/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+      .then(function () { $('ss-set-saved').textContent = 'Saved.'; setTimeout(function () { $('ss-set-saved').textContent = ''; }, 2000); });
+  }
+
+  function setBar(pct, phase) {
+    $('ss-install-fill').style.width = Math.round((pct || 0) * 100) + '%';
+    $('ss-install-pct').textContent = Math.round((pct || 0) * 100) + '%';
+    if (phase) $('ss-install-phase').textContent = phase;
+  }
+
+  function install(which) {
+    $('ss-install-progress').style.display = 'block';
+    var log = $('ss-install-log');
+    log.textContent = 'Starting download of ' + which + '…\n';
+    setBar(0.02, 'Starting');
+    connectWS(log);
+    j('/install_engine', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ which: which }) });
+  }
+
+  var ws = null;
+  function connectWS(log) {
+    if (ws) return;
+    var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    ws = new WebSocket(proto + '//' + location.host + API + '/events');
+    ws.onmessage = function (ev) {
+      var m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+      if (m.type === 'install') {
+        if (m.line) { log.textContent += m.line + '\n'; log.scrollTop = log.scrollHeight; }
+        setBar(m.pct, m.phase);
+      } else if (m.type === 'install_done') {
+        log.textContent += '\n✓ Done.\n'; setBar(1, 'Done'); renderStatus(m.status);
+      } else if (m.type === 'install_error') {
+        log.textContent += '\n✗ ' + m.error + '\n'; $('ss-install-phase').textContent = 'Failed';
+      }
+    };
+    ws.onclose = function () { ws = null; };
+  }
+
+  $('ss-set-save').addEventListener('click', save);
+  $('ss-dl-all').addEventListener('click', function () { install('all'); });
+  $('ss-dl-as').addEventListener('click', function () { install('audio-separator'); });
+  $('ss-dl-demucs').addEventListener('click', function () { install('demucs'); });
+  $('ss-dl-wx').addEventListener('click', function () { install('whisperx'); });
+  $('ss-uninstall').addEventListener('click', function () {
+    j('/uninstall_engine', { method: 'POST' }).then(renderStatus);
+  });
+  loadConfig();
+})();
+</script>
