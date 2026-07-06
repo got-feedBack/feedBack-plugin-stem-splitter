@@ -123,30 +123,44 @@
 
   function install(which) {
     $('ss-install-progress').style.display = 'block';
-    var log = $('ss-install-log');
-    log.textContent = 'Starting download of ' + which + '…\n';
+    $('ss-install-log').textContent = 'Starting download of ' + which + '…\n';
     setBar(0.02, 'Starting');
-    connectWS(log);
+    connectWS();
     j('/install_engine', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ which: which }) });
   }
 
+  // Render bar/phase from a persisted install state carried in the WS snapshot.
+  // This is how a reconnected page recovers a "Done" (or "Failed") that finished
+  // while the socket was down.
+  function renderInstall(st) {
+    if (!st) return;
+    $('ss-install-progress').style.display = 'block';
+    setBar(st.pct, st.phase || (st.active ? 'Installing' : 'Done'));
+    if (st.error) appendLog($('ss-install-log'), '✗ ' + st.error);
+  }
+
   var ws = null;
-  function connectWS(log) {
+  function connectWS() {
     if (ws) return;
     var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     ws = new WebSocket(proto + '//' + location.host + API + '/events');
     ws.onmessage = function (ev) {
       var m; try { m = JSON.parse(ev.data); } catch (e) { return; }
-      if (m.type === 'install') {
-        if (m.line) { appendLog(log, m.line); }
+      var log = $('ss-install-log');
+      if (m.type === 'jobs') {
+        if (m.install) renderInstall(m.install);   // snapshot recovery
+      } else if (m.type === 'install') {
+        $('ss-install-progress').style.display = 'block';
+        if (m.line) appendLog(log, m.line);
         setBar(m.pct, m.phase);
       } else if (m.type === 'install_done') {
         appendLog(log, '✓ Done.'); setBar(1, 'Done'); renderStatus(m.status);
       } else if (m.type === 'install_error') {
-        appendLog(log, '✗ ' + m.error); $('ss-install-phase').textContent = 'Failed';
+        appendLog(log, '✗ ' + m.error); setBar(m.pct || 0, 'Failed');
       }
     };
-    ws.onclose = function () { ws = null; };
+    ws.onclose = function () { ws = null; setTimeout(connectWS, 2000); };
+    ws.onerror = function () { try { ws.close(); } catch (e) {} };
   }
 
   $('ss-set-save').addEventListener('click', save);
@@ -158,5 +172,6 @@
     j('/uninstall_engine', { method: 'POST' }).then(renderStatus);
   });
   loadConfig();
+  connectWS();  // connect on load so a snapshot recovers any install that finished while away
 })();
 </script>

@@ -44,6 +44,10 @@ class JobManager:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._last_broadcast = 0.0
         self._cancel: set[str] = set()
+        # Last install lifecycle state, echoed into the WS snapshot so a fresh or
+        # reconnected settings page recovers the terminal state even if it missed
+        # the live install_done event (long silent pip stretches can drop the WS).
+        self._install: dict | None = None
 
         self._load_jobs()
         self._worker = threading.Thread(target=self._worker_loop, name="stem_splitter-worker", daemon=True)
@@ -325,7 +329,8 @@ class JobManager:
     def snapshot(self) -> dict:
         with self.lock:
             jobs = sorted(self.jobs.values(), key=lambda j: j.get("created", 0))
-        return {"type": "jobs", "paused": self.paused.is_set(), "jobs": jobs}
+        return {"type": "jobs", "paused": self.paused.is_set(), "jobs": jobs,
+                "install": self._install}
 
     def broadcast_snapshot(self, throttle: bool = False) -> None:
         if throttle:
@@ -391,13 +396,17 @@ def setup(app: FastAPI, context: dict) -> None:
         # stream progress over the WS.
         def _run():
             def cb(ev: dict):
-                mgr.push_event({"type": "install", "which": which,
-                                "line": ev.get("line", ""), "pct": ev.get("pct", 0.0),
-                                "phase": ev.get("phase", "")})
+                st = {"active": True, "which": which, "line": ev.get("line", ""),
+                      "pct": ev.get("pct", 0.0), "phase": ev.get("phase", "")}
+                mgr._install = st
+                mgr.push_event({"type": "install", **st})
             try:
                 status = engine_install.install_engine(mgr.config_dir, which, progress_cb=cb)
+                mgr._install = {"active": False, "which": which, "pct": 1.0, "phase": "Done"}
                 mgr.push_event({"type": "install_done", "which": which, "status": status})
             except Exception as e:
+                mgr._install = {"active": False, "which": which, "pct": 0.0,
+                                "phase": "Failed", "error": str(e)}
                 mgr.push_event({"type": "install_error", "which": which, "error": str(e)})
         threading.Thread(target=_run, name="stem_splitter-install", daemon=True).start()
         return {"ok": True, "started": which}
