@@ -47,11 +47,13 @@ PKG_SETS: dict[str, list[str]] = {
 }
 
 # "all" installs each engine in ITS OWN pip transaction, in this order, and does
-# NOT abort the rest if one fails. demucs is last on purpose: it pulls `diffq`, a
-# C-extension with no prebuilt wheels for recent Python, so on a machine without a
-# C++ toolchain its wheel build fails - that must not take down audio-separator
-# (bs_roformer, the primary engine - pure wheels, no compiler) or whisperx.
-_ALL_ORDER = ["audio-separator", "whisperx", "demucs"]
+# NOT abort the rest if one fails. whisperx first: it has the strictest torch pin,
+# so installing it right after the shared base settles torch before the others
+# build against it. demucs last: it pulls `diffq`, a C-extension with no prebuilt
+# wheels for recent Python, so on a machine without a C++ toolchain its wheel build
+# fails - that must not take down audio-separator (bs_roformer, the primary
+# engine - pure wheels, no compiler) or whisperx.
+_ALL_ORDER = ["whisperx", "audio-separator", "demucs"]
 
 # Importable module name per engine (for status probing).
 _PROBE_MODULE = {
@@ -110,16 +112,20 @@ def _build_failure_hint(engine: str, output_tail: str) -> str:
     hint points at the right fix.
     """
     low = output_tail.lower()
+    # NB: `diffq` is a package NAME, not a build signal — keep it out of
+    # build_smell so "no matching distribution found for diffq" is classified as
+    # a version/availability failure, not a toolchain one.
     build_smell = any(s in low for s in (
-        "failed to build", "failed-wheel-build", "diffq",
+        "failed to build", "failed-wheel-build",
         "microsoft visual c++", "error: command", "gcc", "clang",
     ))
     version_smell = any(s in low for s in (
         "requires-python", "no matching distribution",
     ))
-    # Only surface the diffq-specific guidance when diffq is actually the culprit;
-    # other demucs failures fall through to the generic hints below.
-    if engine == "demucs" and "diffq" in low:
+    # Surface the diffq-specific guidance only when diffq is the culprit AND it's
+    # not a version/availability failure (a missing diffq wheel is a Python-version
+    # problem, not a missing compiler). Other demucs failures fall through below.
+    if engine == "demucs" and "diffq" in low and not version_smell:
         return (
             "demucs needs to compile `diffq`, which has no prebuilt wheel for this "
             "Python and requires a C++ build toolchain. On Windows install "
