@@ -334,9 +334,13 @@ def uninstall_engine(config_dir: Path) -> dict:
     if locked:
         try:
             _pending_marker(config_dir).write_text("1", encoding="utf-8")
-        except OSError:
+        except OSError as e:
             # Marker couldn't be saved -> don't advertise deferred cleanup that
-            # apply_pending_uninstall() will never find.
+            # apply_pending_uninstall() will never find. Log it: this blocks the
+            # deferred removal entirely, so it should be diagnosable from logs.
+            log.warning("stem_splitter: engine files are locked AND the pending "
+                        "uninstall marker could not be written (%s); deferred "
+                        "cleanup is not scheduled", e)
             status["uninstall"] = {
                 "removed": False, "pending": False,
                 "message": "Some engine files are in use and the pending-uninstall "
