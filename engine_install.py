@@ -287,6 +287,10 @@ def apply_pending_uninstall(config_dir: Path) -> bool:
     for p in (engine_dir(config_dir), models_dir(config_dir)):
         if p.exists():
             shutil.rmtree(p, ignore_errors=True)
+    # Keep the marker if anything is still locked/undeleted, so the cleanup
+    # retries on the next restart rather than being silently lost.
+    if any(p.exists() for p in (engine_dir(config_dir), models_dir(config_dir))):
+        return False
     try:
         marker.unlink()
     except OSError:
@@ -314,13 +318,21 @@ def uninstall_engine(config_dir: Path) -> dict:
         try:
             _pending_marker(config_dir).write_text("1", encoding="utf-8")
         except OSError:
-            pass
-        status["uninstall"] = {
-            "removed": False, "pending": True,
-            "message": "Some engine files are in use by the running app (a split "
-                       "or transcribe loaded them this session). They will be "
-                       "removed automatically the next time you restart the app.",
-        }
+            # Marker couldn't be saved -> don't advertise deferred cleanup that
+            # apply_pending_uninstall() will never find.
+            status["uninstall"] = {
+                "removed": False, "pending": False,
+                "message": "Some engine files are in use and the pending-uninstall "
+                           "marker could not be saved. Close the app and delete the "
+                           "engine folder manually, or retry after a restart.",
+            }
+        else:
+            status["uninstall"] = {
+                "removed": False, "pending": True,
+                "message": "Some engine files are in use by the running app (a split "
+                           "or transcribe loaded them this session). They will be "
+                           "removed automatically the next time you restart the app.",
+            }
     else:
         try:
             _pending_marker(config_dir).unlink()
@@ -329,4 +341,3 @@ def uninstall_engine(config_dir: Path) -> dict:
         status["uninstall"] = {"removed": True, "pending": False,
                                "message": "Local engine removed."}
     return status
-    return engine_status(config_dir)

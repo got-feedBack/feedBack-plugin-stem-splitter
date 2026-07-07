@@ -402,12 +402,14 @@ def setup(app: FastAPI, context: dict) -> None:
     # Finish any uninstall that was deferred last session because the engine's
     # native DLLs were locked. Do this first, before anything can import from the
     # engine dir again.
+    _log = context.get("log") or logging.getLogger("feedBack.plugin.stem_splitter")
     try:
         if engine_install.apply_pending_uninstall(Path(context["config_dir"])):
-            (context.get("log") or logging.getLogger("feedBack.plugin.stem_splitter")).info(
-                "stem_splitter: applied pending engine uninstall on startup")
-    except Exception:
-        pass
+            _log.info("stem_splitter: applied pending engine uninstall on startup")
+    except Exception as e:
+        # Don't let a cleanup hiccup block plugin load, but leave a diagnostic —
+        # otherwise the user sees "installed" after a restart with no explanation.
+        _log.warning("stem_splitter: pending engine uninstall failed on startup: %s", e)
 
     mgr = JobManager(app, context)
     log = mgr.log
