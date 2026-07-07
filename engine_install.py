@@ -89,10 +89,18 @@ def _installed_dist(edir: Path, module: str) -> bool:
     return any(edir.glob(f"{module.replace('_', '?')}*.dist-info"))
 
 
+def installed_map(config_dir: Path) -> dict:
+    """Cheap dir-presence check per engine — no directory-size walk. Use this for
+    availability gating (resolve_*); reserve engine_status() for when the byte
+    sizes are actually needed (the status panel)."""
+    edir = engine_dir(config_dir)
+    return {name: _installed_dist(edir, mod) for name, mod in _PROBE_MODULE.items()}
+
+
 def engine_status(config_dir: Path) -> dict:
     edir = engine_dir(config_dir)
     mdir = models_dir(config_dir)
-    installed = {name: _installed_dist(edir, mod) for name, mod in _PROBE_MODULE.items()}
+    installed = installed_map(config_dir)
     return {
         "engine_dir": str(edir),
         "models_dir": str(mdir),
@@ -291,10 +299,12 @@ def apply_pending_uninstall(config_dir: Path) -> bool:
     # retries on the next restart rather than being silently lost.
     if any(p.exists() for p in (engine_dir(config_dir), models_dir(config_dir))):
         return False
+    # Only report success once the marker is actually cleared; otherwise leave it
+    # so a later startup retries (and doesn't keep logging "applied" forever).
     try:
         marker.unlink()
     except OSError:
-        pass
+        return False
     return True
 
 
@@ -329,9 +339,9 @@ def uninstall_engine(config_dir: Path) -> dict:
         else:
             status["uninstall"] = {
                 "removed": False, "pending": True,
-                "message": "Some engine files are in use by the running app (a split "
-                           "or transcribe loaded them this session). They will be "
-                           "removed automatically the next time you restart the app.",
+                "message": "Some engine files could not be removed (they may be in "
+                           "use by the running app, or held by antivirus). They will "
+                           "be removed automatically the next time you restart the app.",
             }
     else:
         try:

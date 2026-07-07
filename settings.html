@@ -175,13 +175,18 @@
       var u = st && st.uninstall;
       if (u) {
         $('ss-install-progress').style.display = 'block';
-        $('ss-install-phase').textContent = u.pending ? 'Restart required' : 'Removed';
-        setBar(u.pending ? 0 : 1, u.pending ? 'Restart required' : 'Removed');
+        var phase, done;
+        if (u.removed) { phase = 'Removed'; done = 1; }
+        else if (u.pending) { phase = 'Restart required'; done = 0; }
+        else { phase = 'Uninstall incomplete'; done = 0; }  // removed:false, pending:false
+        $('ss-install-phase').textContent = phase;
+        setBar(done, phase);
         $('ss-install-log').textContent = u.message + '\n';
       }
     }).catch(function (err) {
       $('ss-install-progress').style.display = 'block';
       $('ss-install-phase').textContent = 'Uninstall failed';
+      setBar(0, 'Uninstall failed');
       $('ss-install-log').textContent = 'Uninstall request failed: ' + err + '\n';
     }).finally(function () { $('ss-uninstall').disabled = false; });
   });

@@ -166,7 +166,7 @@ class JobManager:
         # importing torch/demucs/audio-separator loads native DLLs and locks the
         # engine files on Windows, which then makes Uninstall silently no-op. A
         # dir check is enough for gating; the real import still happens at run time.
-        inst = engine_install.engine_status(self.config_dir)["installed"]
+        inst = engine_install.installed_map(self.config_dir)
         as_ok = inst.get("audio-separator")
         demucs_ok = inst.get("demucs")
 
@@ -192,7 +192,7 @@ class JobManager:
         # Dir-based detection (see resolve_split_engine) — avoids importing whisperx
         # / torch just to check availability, so viewing settings doesn't lock the
         # engine files against Uninstall.
-        inst = engine_install.engine_status(self.config_dir)["installed"]
+        inst = engine_install.installed_map(self.config_dir)
         wx_ok = inst.get("whisperx")
 
         if choice == "remote":
