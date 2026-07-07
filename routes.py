@@ -170,8 +170,11 @@ class JobManager:
         # engine files on Windows, which then makes Uninstall silently no-op. A
         # dir check is enough for gating; the real import still happens at run time.
         inst = engine_install.installed_map(self.config_dir)
-        as_ok = inst.get("audio-separator")
-        demucs_ok = inst.get("demucs")
+        # Gate local engines on torch too: an engine package present without a
+        # working torch in the target dir would fail immediately at run time.
+        torch_ok = bool(inst.get("torch"))
+        as_ok = bool(inst.get("audio-separator")) and torch_ok
+        demucs_ok = bool(inst.get("demucs")) and torch_ok
 
         if choice == "remote":
             return ("remote", "remote (forced)") if server_url else (None, "remote forced but no server configured")
@@ -196,7 +199,8 @@ class JobManager:
         # / torch just to check availability, so viewing settings doesn't lock the
         # engine files against Uninstall.
         inst = engine_install.installed_map(self.config_dir)
-        wx_ok = inst.get("whisperx")
+        # whisperx also needs torch present in the target dir to run locally.
+        wx_ok = bool(inst.get("whisperx")) and bool(inst.get("torch"))
 
         if choice == "remote":
             return ("remote", "remote (forced)") if server_url else (None, "remote forced but no server configured")
