@@ -101,7 +101,10 @@ def _build_failure_hint(engine: str, output_tail: str) -> str:
         "microsoft visual c++", "error: command", "gcc", "clang",
         "requires-python", "no matching distribution",
     ))
-    if engine == "demucs" and ("diffq" in low or compiler_smell):
+    # Only surface the diffq-specific guidance when diffq is actually the culprit;
+    # other demucs failures (e.g. "no matching distribution for demucs") fall
+    # through to the generic build hint below.
+    if engine == "demucs" and "diffq" in low:
         return (
             "demucs needs to compile `diffq`, which has no prebuilt wheel for this "
             "Python and requires a C++ build toolchain. On Windows install "
@@ -219,7 +222,9 @@ def install_engine(config_dir: Path, which: str, progress_cb: ProgressCB = None)
 
     ok = [e for e, v in results.items() if v == "ok"]
     if not ok:
-        raise RuntimeError("all engine installs failed: " +
+        prefix = ("all engine installs failed" if which == "all"
+                  else f"{which} install failed")
+        raise RuntimeError(prefix + ": " +
                            "; ".join(f"{e}: {v}" for e, v in results.items()))
     status = engine_status(config_dir)
     status["results"] = results
