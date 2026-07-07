@@ -3,7 +3,10 @@
 All work is namespaced under ``/api/plugins/stem_splitter/``. Heavy work (HTTP to
 a split/transcribe server, ffmpeg, zip repack, pip installs) runs on a background
 worker thread — never inside an ``async def`` handler — so it can't block the
-event loop. ``setup()`` only wires; it performs no I/O and imports nothing heavy.
+event loop. ``setup()`` imports nothing heavy and does no network I/O; its only
+disk touch is a fast marker check for a deferred engine uninstall (a no-op unless
+the user requested an uninstall that was blocked by locked files last session, in
+which case it removes the already-orphaned engine dir before anything re-imports it).
 """
 from __future__ import annotations
 
@@ -162,10 +165,16 @@ class JobManager:
         s = self.read_settings()
         choice = s.get("split_engine", "auto")
         server_url = self._server_url()
-        edir = str(engine_install.engine_dir(self.config_dir))
-        import split_stems
-        as_ok = split_stems.audio_separator_available(edir)
-        demucs_ok = split_stems.demucs_available(edir)
+        # Detect installed engines by DIRECTORY presence, not by importing them:
+        # importing torch/demucs/audio-separator loads native DLLs and locks the
+        # engine files on Windows, which then makes Uninstall silently no-op. A
+        # dir check is enough for gating; the real import still happens at run time.
+        inst = engine_install.installed_map(self.config_dir)
+        # Gate local engines on torch too: an engine package present without a
+        # working torch in the target dir would fail immediately at run time.
+        torch_ok = bool(inst.get("torch"))
+        as_ok = bool(inst.get("audio-separator")) and torch_ok
+        demucs_ok = bool(inst.get("demucs")) and torch_ok
 
         if choice == "remote":
             return ("remote", "remote (forced)") if server_url else (None, "remote forced but no server configured")
@@ -186,15 +195,12 @@ class JobManager:
         s = self.read_settings()
         choice = s.get("lyrics_engine", "auto")
         server_url = self._lyrics_server_url()
-        edir = str(engine_install.engine_dir(self.config_dir))
-        import sys as _sys
-        if edir not in _sys.path:
-            _sys.path.insert(0, edir)
-        try:
-            from lyrics_transcribe import whisperx_available
-            wx_ok = whisperx_available()
-        except Exception:
-            wx_ok = False
+        # Dir-based detection (see resolve_split_engine) — avoids importing whisperx
+        # / torch just to check availability, so viewing settings doesn't lock the
+        # engine files against Uninstall.
+        inst = engine_install.installed_map(self.config_dir)
+        # whisperx also needs torch present in the target dir to run locally.
+        wx_ok = bool(inst.get("whisperx")) and bool(inst.get("torch"))
 
         if choice == "remote":
             return ("remote", "remote (forced)") if server_url else (None, "remote forced but no server configured")
@@ -400,6 +406,18 @@ class JobManager:
 
 
 def setup(app: FastAPI, context: dict) -> None:
+    # Finish any uninstall that was deferred last session because the engine's
+    # native DLLs were locked. Do this first, before anything can import from the
+    # engine dir again.
+    _log = context.get("log") or logging.getLogger("feedBack.plugin.stem_splitter")
+    try:
+        if engine_install.apply_pending_uninstall(Path(context["config_dir"])):
+            _log.info("stem_splitter: applied pending engine uninstall on startup")
+    except Exception as e:
+        # Don't let a cleanup hiccup block plugin load, but leave a diagnostic —
+        # otherwise the user sees "installed" after a restart with no explanation.
+        _log.warning("stem_splitter: pending engine uninstall failed on startup: %s", e)
+
     mgr = JobManager(app, context)
     log = mgr.log
 

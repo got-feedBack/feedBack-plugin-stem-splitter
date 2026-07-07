@@ -89,10 +89,18 @@ def _installed_dist(edir: Path, module: str) -> bool:
     return any(edir.glob(f"{module.replace('_', '?')}*.dist-info"))
 
 
+def installed_map(config_dir: Path) -> dict:
+    """Cheap dir-presence check per engine — no directory-size walk. Use this for
+    availability gating (resolve_*); reserve engine_status() for when the byte
+    sizes are actually needed (the status panel)."""
+    edir = engine_dir(config_dir)
+    return {name: _installed_dist(edir, mod) for name, mod in _PROBE_MODULE.items()}
+
+
 def engine_status(config_dir: Path) -> dict:
     edir = engine_dir(config_dir)
     mdir = models_dir(config_dir)
-    installed = {name: _installed_dist(edir, mod) for name, mod in _PROBE_MODULE.items()}
+    installed = installed_map(config_dir)
     return {
         "engine_dir": str(edir),
         "models_dir": str(mdir),
@@ -272,9 +280,89 @@ def install_engine(config_dir: Path, which: str, progress_cb: ProgressCB = None)
     return status
 
 
-def uninstall_engine(config_dir: Path) -> dict:
-    """Delete the installed engine + downloaded models to reclaim disk."""
+def _pending_marker(config_dir: Path) -> Path:
+    return Path(config_dir) / ".stem_splitter_uninstall_pending"
+
+
+def apply_pending_uninstall(config_dir: Path) -> bool:
+    """Delete the engine/models dirs if a prior uninstall was deferred because
+    files were locked (native DLLs loaded into the last session). Call this at
+    plugin startup BEFORE anything imports from the engine dir. Returns True if a
+    pending uninstall was applied."""
+    marker = _pending_marker(config_dir)
+    if not marker.exists():
+        return False
     for p in (engine_dir(config_dir), models_dir(config_dir)):
         if p.exists():
             shutil.rmtree(p, ignore_errors=True)
-    return engine_status(config_dir)
+    # Keep the marker if anything is still locked/undeleted, so the cleanup
+    # retries on the next restart rather than being silently lost.
+    if any(p.exists() for p in (engine_dir(config_dir), models_dir(config_dir))):
+        # Marker present but files survived (locked/permission/AV). Warn so a
+        # persistent "still installed after restart" is diagnosable, and keep the
+        # marker so a later startup retries.
+        log.warning("stem_splitter: deferred engine uninstall incomplete - files "
+                    "still present after rmtree; will retry on next startup")
+        return False
+    # Only report success once the marker is actually cleared; otherwise leave it
+    # so a later startup retries (and doesn't keep logging "applied" forever).
+    try:
+        marker.unlink()
+    except OSError as e:
+        log.warning("stem_splitter: deferred engine uninstall removed the dirs but "
+                    "could not clear the marker (%s); will retry on next startup", e)
+        return False
+    return True
+
+
+def uninstall_engine(config_dir: Path) -> dict:
+    """Delete the installed engine + downloaded models to reclaim disk.
+
+    On Windows the native torch/onnxruntime DLLs are locked once a split or
+    transcribe has loaded them this session, so an in-process rmtree can't remove
+    them. In that case we leave a marker and finish the removal on next startup
+    (``apply_pending_uninstall``), and tell the user a restart is needed — rather
+    than silently doing nothing.
+    """
+    locked = False
+    for p in (engine_dir(config_dir), models_dir(config_dir)):
+        if p.exists():
+            shutil.rmtree(p, ignore_errors=True)
+            if p.exists():  # something inside is locked (loaded DLLs)
+                locked = True
+    status = engine_status(config_dir)
+    if locked:
+        try:
+            _pending_marker(config_dir).write_text("1", encoding="utf-8")
+        except OSError as e:
+            # Marker couldn't be saved -> don't advertise deferred cleanup that
+            # apply_pending_uninstall() will never find. Log it: this blocks the
+            # deferred removal entirely, so it should be diagnosable from logs.
+            log.warning("stem_splitter: engine files are locked AND the pending "
+                        "uninstall marker could not be written (%s); deferred "
+                        "cleanup is not scheduled", e)
+            status["uninstall"] = {
+                "removed": False, "pending": False,
+                "message": "Some engine files are in use and the pending-uninstall "
+                           "marker could not be saved. Close the app and delete the "
+                           "engine folder manually, or retry after a restart.",
+            }
+        else:
+            status["uninstall"] = {
+                "removed": False, "pending": True,
+                "message": "Some engine files could not be removed (they may be in "
+                           "use by the running app, or held by antivirus). They will "
+                           "be removed automatically the next time you restart the app.",
+            }
+    else:
+        # Clear any stale marker from a prior deferred uninstall. missing_ok keeps
+        # the common "no marker" case quiet; a real unlink failure is logged so a
+        # sticky marker (which would make startup retry+warn forever) is visible.
+        try:
+            _pending_marker(config_dir).unlink(missing_ok=True)
+        except OSError as e:
+            log.warning("stem_splitter: engine removed but could not clear a stale "
+                        "uninstall marker (%s); startup will retry clearing it", e)
+        status["uninstall"] = {"removed": True, "pending": False,
+                               "message": "Local engine removed."}
+    return status
