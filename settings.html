@@ -169,7 +169,17 @@
   $('ss-dl-demucs').addEventListener('click', function () { install('demucs'); });
   $('ss-dl-wx').addEventListener('click', function () { install('whisperx'); });
   $('ss-uninstall').addEventListener('click', function () {
-    j('/uninstall_engine', { method: 'POST' }).then(renderStatus);
+    $('ss-uninstall').disabled = true;
+    j('/uninstall_engine', { method: 'POST' }).then(function (st) {
+      renderStatus(st);
+      var u = st && st.uninstall;
+      if (u) {
+        $('ss-install-progress').style.display = 'block';
+        $('ss-install-phase').textContent = u.pending ? 'Restart required' : 'Removed';
+        setBar(u.pending ? 0 : 1, u.pending ? 'Restart required' : 'Removed');
+        $('ss-install-log').textContent = u.message + '\n';
+      }
+    }).finally(function () { $('ss-uninstall').disabled = false; });
   });
   loadConfig();
   connectWS();  // connect on load so a snapshot recovers any install that finished while away

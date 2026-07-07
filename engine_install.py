@@ -272,9 +272,61 @@ def install_engine(config_dir: Path, which: str, progress_cb: ProgressCB = None)
     return status
 
 
-def uninstall_engine(config_dir: Path) -> dict:
-    """Delete the installed engine + downloaded models to reclaim disk."""
+def _pending_marker(config_dir: Path) -> Path:
+    return Path(config_dir) / ".stem_splitter_uninstall_pending"
+
+
+def apply_pending_uninstall(config_dir: Path) -> bool:
+    """Delete the engine/models dirs if a prior uninstall was deferred because
+    files were locked (native DLLs loaded into the last session). Call this at
+    plugin startup BEFORE anything imports from the engine dir. Returns True if a
+    pending uninstall was applied."""
+    marker = _pending_marker(config_dir)
+    if not marker.exists():
+        return False
     for p in (engine_dir(config_dir), models_dir(config_dir)):
         if p.exists():
             shutil.rmtree(p, ignore_errors=True)
+    try:
+        marker.unlink()
+    except OSError:
+        pass
+    return True
+
+
+def uninstall_engine(config_dir: Path) -> dict:
+    """Delete the installed engine + downloaded models to reclaim disk.
+
+    On Windows the native torch/onnxruntime DLLs are locked once a split or
+    transcribe has loaded them this session, so an in-process rmtree can't remove
+    them. In that case we leave a marker and finish the removal on next startup
+    (``apply_pending_uninstall``), and tell the user a restart is needed — rather
+    than silently doing nothing.
+    """
+    locked = False
+    for p in (engine_dir(config_dir), models_dir(config_dir)):
+        if p.exists():
+            shutil.rmtree(p, ignore_errors=True)
+            if p.exists():  # something inside is locked (loaded DLLs)
+                locked = True
+    status = engine_status(config_dir)
+    if locked:
+        try:
+            _pending_marker(config_dir).write_text("1", encoding="utf-8")
+        except OSError:
+            pass
+        status["uninstall"] = {
+            "removed": False, "pending": True,
+            "message": "Some engine files are in use by the running app (a split "
+                       "or transcribe loaded them this session). They will be "
+                       "removed automatically the next time you restart the app.",
+        }
+    else:
+        try:
+            _pending_marker(config_dir).unlink()
+        except OSError:
+            pass
+        status["uninstall"] = {"removed": True, "pending": False,
+                               "message": "Local engine removed."}
+    return status
     return engine_status(config_dir)

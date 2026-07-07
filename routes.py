@@ -162,10 +162,13 @@ class JobManager:
         s = self.read_settings()
         choice = s.get("split_engine", "auto")
         server_url = self._server_url()
-        edir = str(engine_install.engine_dir(self.config_dir))
-        import split_stems
-        as_ok = split_stems.audio_separator_available(edir)
-        demucs_ok = split_stems.demucs_available(edir)
+        # Detect installed engines by DIRECTORY presence, not by importing them:
+        # importing torch/demucs/audio-separator loads native DLLs and locks the
+        # engine files on Windows, which then makes Uninstall silently no-op. A
+        # dir check is enough for gating; the real import still happens at run time.
+        inst = engine_install.engine_status(self.config_dir)["installed"]
+        as_ok = inst.get("audio-separator")
+        demucs_ok = inst.get("demucs")
 
         if choice == "remote":
             return ("remote", "remote (forced)") if server_url else (None, "remote forced but no server configured")
@@ -186,15 +189,11 @@ class JobManager:
         s = self.read_settings()
         choice = s.get("lyrics_engine", "auto")
         server_url = self._lyrics_server_url()
-        edir = str(engine_install.engine_dir(self.config_dir))
-        import sys as _sys
-        if edir not in _sys.path:
-            _sys.path.insert(0, edir)
-        try:
-            from lyrics_transcribe import whisperx_available
-            wx_ok = whisperx_available()
-        except Exception:
-            wx_ok = False
+        # Dir-based detection (see resolve_split_engine) — avoids importing whisperx
+        # / torch just to check availability, so viewing settings doesn't lock the
+        # engine files against Uninstall.
+        inst = engine_install.engine_status(self.config_dir)["installed"]
+        wx_ok = inst.get("whisperx")
 
         if choice == "remote":
             return ("remote", "remote (forced)") if server_url else (None, "remote forced but no server configured")
@@ -400,6 +399,16 @@ class JobManager:
 
 
 def setup(app: FastAPI, context: dict) -> None:
+    # Finish any uninstall that was deferred last session because the engine's
+    # native DLLs were locked. Do this first, before anything can import from the
+    # engine dir again.
+    try:
+        if engine_install.apply_pending_uninstall(Path(context["config_dir"])):
+            (context.get("log") or logging.getLogger("feedBack.plugin.stem_splitter")).info(
+                "stem_splitter: applied pending engine uninstall on startup")
+    except Exception:
+        pass
+
     mgr = JobManager(app, context)
     log = mgr.log
 
