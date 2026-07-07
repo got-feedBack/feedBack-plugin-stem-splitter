@@ -2,7 +2,7 @@
 
 Nothing here runs on plugin load. It runs ONLY when the user clicks "Download
 local engine + models" in the settings, which calls ``install_engine``. The
-heavy libraries (torch, demucs / audio-separator, whisperx — multiple GB) are
+heavy libraries (torch, demucs / audio-separator, whisperx - multiple GB) are
 pip-installed into ``{config_dir}/engine`` (the only writable path), and model
 weights land in ``{config_dir}/models``. Both are added to ``sys.path`` / used
 as cache dirs at run time by ``split_stems`` / ``transcribe``.
@@ -30,18 +30,27 @@ ProgressCB = Optional[Callable[[dict], None]]
 # who want GPU can install torch themselves into the engine dir.
 _TORCH_INDEX = "https://download.pytorch.org/whl/cpu"
 
-# Package sets per engine. Kept explicit so the UI can offer them individually.
+# Shared PyTorch base, installed ONCE before any engine. All three engines depend
+# on torch/torchaudio; installing it per-engine into the same --target tree with
+# --upgrade made the versions order-dependent (a later engine could rewrite the
+# torch an earlier one needs) and re-downloaded the multi-hundred-MB wheels each
+# time. Installing it once, then layering engine-only packages with the default
+# only-if-needed upgrade strategy, keeps a single consistent torch for everyone.
+_SHARED_PKGS = ["torch", "torchaudio"]
+
+# Engine-specific packages (torch/torchaudio come from _SHARED_PKGS above). Kept
+# explicit so the UI can offer each engine individually.
 PKG_SETS: dict[str, list[str]] = {
-    "audio-separator": ["torch", "torchaudio", "audio-separator", "onnxruntime"],
-    "demucs": ["torch", "torchaudio", "demucs", "soundfile"],
-    "whisperx": ["torch", "torchaudio", "whisperx"],
+    "audio-separator": ["audio-separator", "onnxruntime"],
+    "demucs": ["demucs", "soundfile"],
+    "whisperx": ["whisperx"],
 }
 
 # "all" installs each engine in ITS OWN pip transaction, in this order, and does
 # NOT abort the rest if one fails. demucs is last on purpose: it pulls `diffq`, a
 # C-extension with no prebuilt wheels for recent Python, so on a machine without a
-# C++ toolchain its wheel build fails — that must not take down audio-separator
-# (bs_roformer, the primary engine — pure wheels, no compiler) or whisperx.
+# C++ toolchain its wheel build fails - that must not take down audio-separator
+# (bs_roformer, the primary engine - pure wheels, no compiler) or whisperx.
 _ALL_ORDER = ["audio-separator", "whisperx", "demucs"]
 
 # Importable module name per engine (for status probing).
@@ -94,43 +103,60 @@ def engine_status(config_dir: Path) -> dict:
 
 
 def _build_failure_hint(engine: str, output_tail: str) -> str:
-    """Turn an opaque wheel-build failure into an actionable message."""
+    """Turn an opaque install failure into an actionable message.
+
+    Distinguishes true source-build failures (need a C++ toolchain) from
+    version/availability failures (no compatible wheel for this Python) so the
+    hint points at the right fix.
+    """
     low = output_tail.lower()
-    compiler_smell = any(s in low for s in (
+    build_smell = any(s in low for s in (
         "failed to build", "failed-wheel-build", "diffq",
         "microsoft visual c++", "error: command", "gcc", "clang",
+    ))
+    version_smell = any(s in low for s in (
         "requires-python", "no matching distribution",
     ))
     # Only surface the diffq-specific guidance when diffq is actually the culprit;
-    # other demucs failures (e.g. "no matching distribution for demucs") fall
-    # through to the generic build hint below.
+    # other demucs failures fall through to the generic hints below.
     if engine == "demucs" and "diffq" in low:
         return (
             "demucs needs to compile `diffq`, which has no prebuilt wheel for this "
             "Python and requires a C++ build toolchain. On Windows install "
             "\"Microsoft C++ Build Tools\" (Desktop development with C++), then retry "
-            "— OR just skip demucs and use audio-separator (bs_roformer_sw), which "
+            "- OR just skip demucs and use audio-separator (bs_roformer_sw), which "
             "needs no compiler."
         )
-    if compiler_smell:
+    if build_smell:
         return (
             f"a dependency of {engine} failed to build from source (no prebuilt wheel "
-            "for this Python + no compiler available). Try a supported Python (3.10–3.11) "
-            "or install a C++ build toolchain, then retry."
+            "for this Python and no C++ compiler available). Install a C++ build "
+            "toolchain, or use a Python version with prebuilt wheels, then retry."
+        )
+    if version_smell:
+        return (
+            f"no compatible wheel for {engine} on this Python version. Use a supported "
+            "Python (3.10-3.11) and retry - this is a version/availability problem, not "
+            "a missing compiler."
         )
     return ""
 
 
-def _pip_install_set(config_dir: Path, engine: str, progress_cb: ProgressCB,
-                     base: float, span: float) -> None:
-    """Install one engine's package set in its own pip transaction. Raises
-    ``RuntimeError`` (with an actionable hint) on failure."""
+def _pip_install(config_dir: Path, label: str, pkgs: list[str], progress_cb: ProgressCB,
+                 base: float, span: float) -> None:
+    """Install one package set in its own pip transaction. Raises ``RuntimeError``
+    (with an actionable hint) on failure.
+
+    ``--upgrade-strategy only-if-needed`` (pip's default, made explicit) means a
+    layered engine install only touches the shared torch/torchaudio if it actually
+    needs a different version - so one engine can't gratuitously rewrite the torch
+    another engine already installed.
+    """
     edir = engine_dir(config_dir)
-    pkgs = PKG_SETS[engine]
     cmd = [
         sys.executable, "-m", "pip", "install",
         "--target", str(edir),
-        "--upgrade",
+        "--upgrade", "--upgrade-strategy", "only-if-needed",
         "--progress-bar", "off",
         "--extra-index-url", _TORCH_INDEX,
         *pkgs,
@@ -140,9 +166,9 @@ def _pip_install_set(config_dir: Path, engine: str, progress_cb: ProgressCB,
         if progress_cb:
             pct = base + max(0.0, min(1.0, local)) * span
             progress_cb({"line": line, "pct": max(0.0, min(1.0, pct)),
-                         "phase": f"{engine}: {phase}" if phase else engine})
+                         "phase": f"{label}: {phase}" if phase else label})
 
-    emit(f"Installing {engine}: {', '.join(pkgs)}", 0.02, "Starting")
+    emit(f"Installing {label}: {', '.join(pkgs)}", 0.02, "Starting")
 
     env = dict(os.environ)
     env.setdefault("PYTHONUNBUFFERED", "1")
@@ -182,23 +208,24 @@ def _pip_install_set(config_dir: Path, engine: str, progress_cb: ProgressCB,
 
     rc = proc.wait()
     if rc != 0:
-        hint = _build_failure_hint(engine, "\n".join(tail))
-        msg = f"pip install failed (exit {rc}) for {engine}"
+        hint = _build_failure_hint(label, "\n".join(tail))
+        msg = f"pip install failed (exit {rc}) for {label}"
         if hint:
-            msg += " — " + hint
+            msg += " - " + hint
         raise RuntimeError(msg)
 
-    emit(f"Done installing {engine}.", 1.0, "Done")
+    emit(f"Done installing {label}.", 1.0, "Done")
 
 
 def install_engine(config_dir: Path, which: str, progress_cb: ProgressCB = None) -> dict:
     """pip-install engine package sets into ``{config_dir}/engine``.
 
-    ``which`` is a single engine name or ``"all"``. For ``"all"`` each engine is
-    installed in its OWN pip transaction so one failure (typically demucs' `diffq`
-    wheel build on a machine without a C++ compiler) does not abort the others.
-    Streams progress via ``progress_cb``. Idempotent. Returns ``engine_status``
-    augmented with a per-engine ``results`` map. Raises only if EVERY engine failed.
+    ``which`` is a single engine name or ``"all"``. The shared PyTorch base is
+    installed ONCE first, then each engine is installed in its OWN pip transaction
+    so one failure (typically demucs' `diffq` wheel build on a machine without a
+    C++ compiler) does not abort the others. Streams progress via ``progress_cb``.
+    Idempotent. Returns ``engine_status`` augmented with a per-step ``results``
+    map. Raises only if EVERY requested engine failed.
     """
     if which != "all" and which not in PKG_SETS:
         raise ValueError(f"unknown engine {which!r}; expected 'all' or one of {sorted(PKG_SETS)}")
@@ -207,21 +234,26 @@ def install_engine(config_dir: Path, which: str, progress_cb: ProgressCB = None)
     models_dir(config_dir).mkdir(parents=True, exist_ok=True)
 
     order = _ALL_ORDER if which == "all" else [which]
-    n = len(order)
+    # Shared torch base first (once), then the engine-specific packages. If the
+    # base step fails the engine steps still self-heal (pip resolves torch as a
+    # dependency), just less efficiently.
+    steps: list[tuple[str, list[str]]] = [("pytorch", _SHARED_PKGS)]
+    steps += [(eng, PKG_SETS[eng]) for eng in order]
+    n = len(steps)
     results: dict[str, str] = {}
-    for i, eng in enumerate(order):
+    for i, (label, pkgs) in enumerate(steps):
         try:
-            _pip_install_set(config_dir, eng, progress_cb, base=i / n, span=1 / n)
-            results[eng] = "ok"
-        except Exception as e:  # keep going — a fragile engine must not sink the rest
-            results[eng] = str(e)
-            log.warning("stem_splitter: engine %s install failed: %s", eng, e)
+            _pip_install(config_dir, label, pkgs, progress_cb, base=i / n, span=1 / n)
+            results[label] = "ok"
+        except Exception as e:  # keep going - a fragile step must not sink the rest
+            results[label] = str(e)
+            log.warning("stem_splitter: install step %s failed: %s", label, e)
             if progress_cb:
-                progress_cb({"line": f"✗ {eng} skipped: {e}",
-                             "pct": (i + 1) / n, "phase": f"{eng}: failed"})
+                progress_cb({"line": f"✗ {label} skipped: {e}",
+                             "pct": (i + 1) / n, "phase": f"{label}: failed"})
 
-    ok = [e for e, v in results.items() if v == "ok"]
-    if not ok:
+    ok_engines = [e for e in order if results.get(e) == "ok"]
+    if not ok_engines:
         prefix = ("all engine installs failed" if which == "all"
                   else f"{which} install failed")
         raise RuntimeError(prefix + ": " +
@@ -229,8 +261,8 @@ def install_engine(config_dir: Path, which: str, progress_cb: ProgressCB = None)
     status = engine_status(config_dir)
     status["results"] = results
     if progress_cb:
-        failed = [e for e in results if results[e] != "ok"]
-        summary = f"Installed: {', '.join(ok)}" + (f" · failed: {', '.join(failed)}" if failed else "")
+        failed = [e for e in order if results.get(e) != "ok"]
+        summary = f"Installed: {', '.join(ok_engines)}" + (f" | failed: {', '.join(failed)}" if failed else "")
         progress_cb({"line": summary, "pct": 1.0, "phase": "Done"})
     return status
 
