@@ -298,12 +298,19 @@ def apply_pending_uninstall(config_dir: Path) -> bool:
     # Keep the marker if anything is still locked/undeleted, so the cleanup
     # retries on the next restart rather than being silently lost.
     if any(p.exists() for p in (engine_dir(config_dir), models_dir(config_dir))):
+        # Marker present but files survived (locked/permission/AV). Warn so a
+        # persistent "still installed after restart" is diagnosable, and keep the
+        # marker so a later startup retries.
+        log.warning("stem_splitter: deferred engine uninstall incomplete - files "
+                    "still present after rmtree; will retry on next startup")
         return False
     # Only report success once the marker is actually cleared; otherwise leave it
     # so a later startup retries (and doesn't keep logging "applied" forever).
     try:
         marker.unlink()
-    except OSError:
+    except OSError as e:
+        log.warning("stem_splitter: deferred engine uninstall removed the dirs but "
+                    "could not clear the marker (%s); will retry on next startup", e)
         return False
     return True
 
