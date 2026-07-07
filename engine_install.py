@@ -351,10 +351,14 @@ def uninstall_engine(config_dir: Path) -> dict:
                            "be removed automatically the next time you restart the app.",
             }
     else:
+        # Clear any stale marker from a prior deferred uninstall. missing_ok keeps
+        # the common "no marker" case quiet; a real unlink failure is logged so a
+        # sticky marker (which would make startup retry+warn forever) is visible.
         try:
-            _pending_marker(config_dir).unlink()
-        except OSError:
-            pass
+            _pending_marker(config_dir).unlink(missing_ok=True)
+        except OSError as e:
+            log.warning("stem_splitter: engine removed but could not clear a stale "
+                        "uninstall marker (%s); startup will retry clearing it", e)
         status["uninstall"] = {"removed": True, "pending": False,
                                "message": "Local engine removed."}
     return status
