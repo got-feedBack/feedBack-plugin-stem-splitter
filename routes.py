@@ -3,7 +3,10 @@
 All work is namespaced under ``/api/plugins/stem_splitter/``. Heavy work (HTTP to
 a split/transcribe server, ffmpeg, zip repack, pip installs) runs on a background
 worker thread — never inside an ``async def`` handler — so it can't block the
-event loop. ``setup()`` only wires; it performs no I/O and imports nothing heavy.
+event loop. ``setup()`` imports nothing heavy and does no network I/O; its only
+disk touch is a fast marker check for a deferred engine uninstall (a no-op unless
+the user requested an uninstall that was blocked by locked files last session, in
+which case it removes the already-orphaned engine dir before anything re-imports it).
 """
 from __future__ import annotations
 
