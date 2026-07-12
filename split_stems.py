@@ -206,7 +206,14 @@ def _run_remote(mix: Path, out_dir: Path, model: str, server_url: str,
         wait = min(_BUSY_MAX_BACKOFF, _BUSY_BASE_BACKOFF * (2 ** attempt))
         if progress_cb:
             progress_cb(0.12, f"Split server busy - retrying in {wait}s")
-        time.sleep(wait)
+        # Sleep in slices and check for cancellation between them: with backoff up
+        # to a minute, a single sleep(wait) would leave a user's cancel unnoticed
+        # for that whole time.
+        deadline = time.time() + wait
+        while time.time() < deadline:
+            if cancel_cb:
+                cancel_cb()  # raises to abort
+            time.sleep(min(0.5, max(0.0, deadline - time.time())))
 
     if resp is None or resp.status_code != 200:
         code = resp.status_code if resp is not None else "no response"

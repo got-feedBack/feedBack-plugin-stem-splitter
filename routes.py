@@ -451,14 +451,27 @@ class JobManager:
                 self._server = {"active": False, "op": op, "pct": 0.0,
                                 "phase": "Failed", "error": str(e)}
                 self.push_event({"type": "server_error", "op": op, "error": str(e)})
+            finally:
+                # The server's log reader outlives the op. Detach it now so its
+                # ongoing output can't keep pushing progress events (which would
+                # flip the UI back to "active" and re-disable the controls after
+                # we've already reported the op as done).
+                demucs_server.clear_stream_cb()
         threading.Thread(target=_run, name=f"stem_splitter-server-{op}", daemon=True).start()
 
     def needs_server_setup(self) -> dict | None:
         """If the split would go to our managed local server but its weights aren't
         downloaded yet, say so instead of letting the job silently stall on a ~2 GB
         lazy fetch. The UI turns this into a 'download now?' prompt."""
-        if not self.local_server_url():
+        # Only when the job would ACTUALLY go through the server. A user who forced
+        # a local engine (demucs / audio-separator) doesn't need the server's models
+        # at all, and must not be blocked just because the server happens to be
+        # running without them.
+        engine, _reason = self.resolve_split_engine()
+        if engine != "remote":
             return None
+        if not self.local_server_url():
+            return None   # a real remote server: not ours to set up
         if demucs_server.models_downloaded(self.config_dir):
             return None
         return {

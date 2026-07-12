@@ -6,8 +6,8 @@ without touching a terminal.
 
 Nothing here runs on plugin load, and nothing large is EVER downloaded implicitly:
 
-* ``install_server()``  — only from the explicit "Install server" button (a few GB of
-  a few GB of wheels).
+* ``install_server()``  — only from the explicit "Install server" button (a few GB
+  of wheels).
 * ``prepare_models()``  — only from the explicit "Prepare models" button (the
   ~2 GB of model weights).
 * ``start_server()``    — cheap. Warms up ONLY when the weights are already on
@@ -77,6 +77,48 @@ _DEMUCS_EXTRAS = ["einops", "julius", "lameenc", "openunmix", "pyyaml", "tqdm", 
 # Track a server we started in THIS process, so we can stream its output and reap it.
 _proc: subprocess.Popen | None = None
 _proc_lock = threading.Lock()
+
+# The progress callback of the op currently in flight (install / start /
+# prepare_models), or None when nothing is running.
+#
+# The server's stdout reader thread outlives start_server() — it streams for the
+# whole life of the process. If it kept using the callback captured at spawn, then
+# every log line AFTER the op finished (and the exit line, whenever the server is
+# eventually stopped) would push another "server" progress event, flipping the UI
+# back to active=True and re-disabling the controls long after the op was done.
+#
+# So the reader emits through whatever callback is active *now*. run_server_op()
+# clears this when the op completes, which both stops those zombie events and still
+# lets a long op like prepare_models keep streaming the server's warmup lines.
+_stream_cb: ProgressCB = None
+_stream_lock = threading.Lock()
+
+# Short-lived memo for is_running()'s /health probe: it's on the /config path, so a
+# burst of UI calls shouldn't each pay a network round-trip.
+_running_memo: dict[tuple[str, int], tuple[float, bool]] = {}
+_running_lock = threading.Lock()
+_RUNNING_TTL = 3.0  # seconds
+
+
+def set_stream_cb(cb: ProgressCB) -> None:
+    global _stream_cb
+    with _stream_lock:
+        _stream_cb = cb
+
+
+def clear_stream_cb() -> None:
+    set_stream_cb(None)
+
+
+def _current_stream_cb() -> ProgressCB:
+    with _stream_lock:
+        return _stream_cb
+
+
+def _invalidate_running() -> None:
+    """Drop the is_running() memo so a start/stop is reflected immediately."""
+    with _running_lock:
+        _running_memo.clear()
 
 
 # ── paths ────────────────────────────────────────────────────────────────────
@@ -495,7 +537,15 @@ def _server_env(config_dir: Path) -> dict:
 
 def is_running(config_dir: Path, port: int | None = None) -> tuple[bool, int | None]:
     """(running, port). True if we own a live child, or if a previously-recorded
-    port still answers /health (an orphan from a crashed app)."""
+    port still answers /health (an orphan from a crashed app).
+
+    Called from /config and engine resolution, so it must be CHEAP in the common
+    case. Two guards:
+      * If we never started a server (no state file), don't probe at all — a
+        blocking 1.5s /health on every UI call, on a machine that never installed
+        the server, is pure latency.
+      * Otherwise memoize the probe result briefly.
+    """
     with _proc_lock:
         p = _proc
     if p is not None and p.poll() is None:
@@ -503,12 +553,21 @@ def is_running(config_dir: Path, port: int | None = None) -> tuple[bool, int | N
         return True, st.get("port", port)
 
     st = _read_state(config_dir)
-    known = port or st.get("port")
-    if known:
-        ok, _ = server_health(url_for(int(known)), timeout=1.5)
-        if ok:
-            return True, int(known)
-    return False, None
+    known = st.get("port")   # NOT `port or ...`: only probe a port we actually started
+    if not known:
+        return False, None
+
+    key = (str(config_dir), int(known))
+    now = time.monotonic()
+    with _running_lock:
+        hit = _running_memo.get(key)
+        if hit and now - hit[0] < _RUNNING_TTL:
+            return (True, int(known)) if hit[1] else (False, None)
+
+    ok, _ = server_health(url_for(int(known)), timeout=1.5)
+    with _running_lock:
+        _running_memo[key] = (now, ok)
+    return (True, int(known)) if ok else (False, None)
 
 
 def start_server(config_dir: Path, port: int = DEFAULT_PORT, device: str = "",
@@ -568,8 +627,10 @@ def start_server(config_dir: Path, port: int = DEFAULT_PORT, device: str = "",
     with _proc_lock:
         _proc = proc
     _write_state(config_dir, {"pid": proc.pid, "port": port, "started_at": time.time()})
+    _invalidate_running()
 
     tail: list[str] = []
+    set_stream_cb(progress_cb)
 
     def _reader() -> None:
         try:
@@ -581,6 +642,12 @@ def start_server(config_dir: Path, port: int = DEFAULT_PORT, device: str = "",
                 tail.append(line)
                 if len(tail) > 60:
                     tail.pop(0)
+                # Emit through the CURRENTLY active op's callback, not the one
+                # captured at spawn — see set_stream_cb().
+                cb = _current_stream_cb()
+                if cb is None:
+                    log.debug("stem_splitter[server]: %s", line)
+                    continue
                 low = line.lower()
                 phase = "Running"
                 pct = 0.6
@@ -588,12 +655,16 @@ def start_server(config_dir: Path, port: int = DEFAULT_PORT, device: str = "",
                     phase = "Warming up"
                     if "ready" in low:
                         pct = 0.9
-                _emit(progress_cb, line, pct, phase)
+                _emit(cb, line, pct, phase)
         except Exception:
             pass
         finally:
             rc = proc.poll()
-            _emit(progress_cb, f"Server process exited (code {rc}).", 0.0, "Stopped")
+            cb = _current_stream_cb()
+            if cb is None:
+                log.info("stem_splitter: server process exited (code %s)", rc)
+            else:
+                _emit(cb, f"Server process exited (code {rc}).", 0.0, "Stopped")
 
     threading.Thread(target=_reader, name="stem_splitter-server-log", daemon=True).start()
 
@@ -679,13 +750,26 @@ def _posix_kill_tree(pid: int) -> None:
         log.warning("stem_splitter: SIGTERM to server failed: %s", e)
 
     # Give it a moment to shut down cleanly, then insist.
-    for _ in range(20):  # ~2s
+    #
+    # Probe the same target we signalled. When killing the group, polling only the
+    # parent pid is wrong: uvicorn can exit while its run_demucs.py / run_roformer.py
+    # workers are still handling SIGTERM, so the loop would return early and skip the
+    # SIGKILL — leaving exactly the orphans this function exists to prevent.
+    def _alive() -> bool:
         try:
-            os.kill(pid, 0)
+            if use_group:
+                os.killpg(pgid, 0)
+            else:
+                os.kill(pid, 0)
+            return True
         except ProcessLookupError:
-            return
+            return False
         except OSError:
-            break
+            return True  # e.g. EPERM: it exists but isn't ours to signal
+
+    for _ in range(20):  # ~2s
+        if not _alive():
+            return
         time.sleep(0.1)
 
     try:
@@ -729,6 +813,7 @@ def stop_server(config_dir: Path) -> dict:
         state_file(config_dir).unlink(missing_ok=True)
     except OSError as e:
         log.warning("stem_splitter: could not clear server state file: %s", e)
+    _invalidate_running()
 
     return server_status(config_dir)
 

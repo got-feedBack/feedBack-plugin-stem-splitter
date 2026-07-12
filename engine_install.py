@@ -17,6 +17,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Callable, Optional
@@ -29,6 +30,11 @@ ProgressCB = Optional[Callable[[dict], None]]
 # CPU wheels for torch keep the download sane on machines without CUDA. Callers
 # who want GPU can install torch themselves into the engine dir.
 _TORCH_INDEX = "https://download.pytorch.org/whl/cpu"
+
+# Kill pip if it goes completely silent this long. A real multi-GB download is
+# slow but never silent, so this only trips on a genuine stall - without it a
+# hung download blocks the installer thread forever.
+_PIP_STALL_TIMEOUT = 600  # seconds
 
 # Shared PyTorch base, installed ONCE before any engine. All three engines depend
 # on torch/torchaudio; installing it per-engine into the same --target tree with
@@ -92,7 +98,7 @@ def _installed_dist(edir: Path, module: str) -> bool:
 
 # Walking a big HF cache isn't free, and engine_status() is called from the settings
 # panel; memoize briefly so repeated reads don't re-scan it.
-_ext_cache_memo: dict = {"t": 0.0, "val": None}
+_ext_cache_memo: dict = {"t": 0.0, "val": None, "key": None}
 
 
 def external_caches(config_dir: Path) -> list[dict]:
@@ -107,7 +113,12 @@ def external_caches(config_dir: Path) -> list[dict]:
     them on uninstall: they're the conventional cache and other tools share them.
     """
     now = time.monotonic()
-    if _ext_cache_memo["val"] is not None and now - _ext_cache_memo["t"] < 60:
+    key = str(config_dir)
+    # Key the memo by config_dir, not just elapsed time — otherwise a call with a
+    # different config_dir inside the window silently gets the previous dir's result.
+    if (_ext_cache_memo["val"] is not None
+            and _ext_cache_memo["key"] == key
+            and now - _ext_cache_memo["t"] < 60):
         return _ext_cache_memo["val"]
 
     try:
@@ -135,6 +146,7 @@ def external_caches(config_dir: Path) -> list[dict]:
             out.append({"label": label, "path": str(rp), "bytes": size})
 
     _ext_cache_memo["t"] = now
+    _ext_cache_memo["key"] = key
     _ext_cache_memo["val"] = out
     return out
 
@@ -241,8 +253,33 @@ def stream_pip(python_exe: str, pip_args: list[str], label: str, progress_cb: Pr
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, bufsize=1, env=env,
     )
+
+    # Watchdog: a stalled download would otherwise block on readline()/wait()
+    # forever, hanging the installer with no way out but restarting the app. Kill
+    # pip if it goes completely silent for too long. (Inactivity, not a wall-clock
+    # cap — a legitimate multi-GB torch download is slow but never silent.)
+    last_output = [time.monotonic()]
+    stalled = threading.Event()
+
+    def _watchdog() -> None:
+        while proc.poll() is None:
+            if time.monotonic() - last_output[0] > _PIP_STALL_TIMEOUT:
+                stalled.set()
+                log.warning("stem_splitter: pip produced no output for %ss - killing it",
+                            _PIP_STALL_TIMEOUT)
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+                return
+            time.sleep(5)
+
+    threading.Thread(target=_watchdog, name="stem_splitter-pip-watchdog",
+                     daemon=True).start()
+
     assert proc.stdout is not None
     for raw in proc.stdout:
+        last_output[0] = time.monotonic()
         line = raw.rstrip()
         if not line:
             continue
@@ -268,6 +305,12 @@ def stream_pip(python_exe: str, pip_args: list[str], label: str, progress_cb: Pr
         emit(line, local, phase)
 
     rc = proc.wait()
+    if stalled.is_set():
+        raise RuntimeError(
+            f"pip stalled while installing {label} (no output for "
+            f"{_PIP_STALL_TIMEOUT // 60} min) and was killed. Check your network "
+            "connection and try again."
+        )
     if rc != 0:
         hint = _build_failure_hint(label, "\n".join(tail))
         msg = f"pip install failed (exit {rc}) for {label}"
