@@ -736,11 +736,31 @@ def setup(app: FastAPI, context: dict) -> None:
         body = body or {}
         port = _as_port(body.get("port"))
         gpu = bool(body.get("gpu"))
+        # cb takes the same {line, pct, phase} dict docker_sidecar already emits.
         if not mgr.run_server_op("sidecar_up", lambda cb: docker_sidecar.up(
-                port=port, gpu=gpu,
-                progress_cb=lambda ev: cb(ev.get("line", ""), ev.get("pct"), ev.get("phase")))):
+                port=port, gpu=gpu, progress_cb=cb)):
             return _busy()
         return {"ok": True}
+
+    @app.get(f"{P}/sidecar/health")
+    def get_sidecar_health():
+        """Backend proxy for the sidecar's 'Test status' button.
+
+        Takes NO url from the caller, on purpose. A route that health-checks whatever URL
+        it is handed is an SSRF proxy - it would let anything that can reach this endpoint
+        probe hosts and ports behind the app. It resolves the sidecar's own URL itself.
+
+        The proxy is needed because the BROWSER often can't reach the container: inside a
+        compose network its URL is a container NAME, which resolves for the server and not
+        for the page. The server can always reach it.
+        """
+        st = docker_sidecar.status()
+        url = st.get("url")
+        if not url:
+            return {"ok": False, "url": None, "health": {},
+                    "message": "the demucs container is not running"}
+        ok, payload = demucs_server.server_health(url, timeout=4.0)
+        return {"ok": ok, "url": url, "health": payload}
 
     @app.post(f"{P}/sidecar/down")
     def post_sidecar_down(body: dict | None = Body(None)):
