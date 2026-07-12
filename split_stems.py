@@ -50,6 +50,15 @@ _STEM_ORDER = ["guitar", "bass", "drums", "vocals", "piano", "other", "full"]
 
 _AUDIO_EXTS = (".wav", ".flac", ".mp3", ".ogg", ".opus", ".m4a")
 
+# Remote-split job limits. The server allows a roformer job up to 30 min, so give
+# it headroom rather than the old 10-min cap (which failed long splits mid-flight).
+_JOB_TIMEOUT = 35 * 60
+# The server returns 503 once MAX_CONCURRENT separations are in flight; a batch
+# split will hit that routinely, so back off and retry instead of erroring.
+_BUSY_RETRIES = 6
+_BUSY_BASE_BACKOFF = 5
+_BUSY_MAX_BACKOFF = 60
+
 
 def _sanitize(name: str) -> str:
     s = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("_").lower()
@@ -137,26 +146,50 @@ def _run_remote(mix: Path, out_dir: Path, model: str, server_url: str,
     params: dict[str, str] = {"model": model}
     if stems:
         params["stems"] = ",".join(stems)
-    headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
+    # The server authenticates with X-API-Key (or an ?api_key= query param) - NOT
+    # an Authorization: Bearer header. Only /health, /docs and /openapi.json are
+    # exempt, so /jobs and /download need the key too.
+    headers = {"X-API-Key": api_key} if api_key else None
 
-    with open(mix, "rb") as f:
-        resp = requests.post(
-            f"{server_url}/separate",
-            files={"file": (mix.name, f, content_type)},
-            params=params, headers=headers, timeout=600,
-        )
-    if resp.status_code != 200:
-        raise RuntimeError(f"split server error ({resp.status_code}): {resp.text[:300]}")
+    # The server caps concurrent separations (MAX_CONCURRENT) and answers 503 when
+    # it's saturated - which a batch split WILL hit. Back off and retry instead of
+    # failing the job.
+    resp = None
+    for attempt in range(_BUSY_RETRIES):
+        if cancel_cb:
+            cancel_cb()
+        with open(mix, "rb") as f:
+            resp = requests.post(
+                f"{server_url}/separate",
+                files={"file": (mix.name, f, content_type)},
+                params=params, headers=headers, timeout=600,
+            )
+        if resp.status_code != 503:
+            break
+        wait = min(_BUSY_MAX_BACKOFF, _BUSY_BASE_BACKOFF * (2 ** attempt))
+        if progress_cb:
+            progress_cb(0.12, f"Split server busy - retrying in {wait}s")
+        time.sleep(wait)
+
+    if resp is None or resp.status_code != 200:
+        code = resp.status_code if resp is not None else "no response"
+        body = resp.text[:300] if resp is not None else ""
+        raise RuntimeError(f"split server error ({code}): {body}")
 
     data = resp.json()
     stem_urls = data.get("stems") or {}
     if not stem_urls and data.get("job_id"):
         job_id = data["job_id"]
-        for _ in range(120):  # up to ~10 min
+        # Wall-clock deadline, not an iteration count: the server allows a roformer
+        # job up to 30 min, so the old 120x5s (=10 min) cap failed long splits that
+        # were actually still running.
+        deadline = time.time() + _JOB_TIMEOUT
+        while time.time() < deadline:
             time.sleep(5)
             if cancel_cb:
                 cancel_cb()  # raises to abort a canceled job between polls
-            jr = requests.get(f"{server_url}/jobs/{job_id}", timeout=30).json()
+            jr = requests.get(f"{server_url}/jobs/{job_id}",
+                              headers=headers, timeout=30).json()
             status = jr.get("status")
             if status == "complete":
                 stem_urls = jr.get("stems") or {}
@@ -164,7 +197,12 @@ def _run_remote(mix: Path, out_dir: Path, model: str, server_url: str,
             if status == "failed":
                 raise RuntimeError(f"split server job failed: {jr.get('error')}")
             if progress_cb:
-                progress_cb(0.4, f"Separating on server ({status or 'working'})")
+                pct = jr.get("progress")
+                detail = f"{pct}%" if isinstance(pct, (int, float)) else (status or "working")
+                progress_cb(0.4, f"Separating on server ({detail})")
+        else:
+            raise RuntimeError(
+                f"split server job timed out after {_JOB_TIMEOUT // 60} min")
     if not stem_urls:
         raise RuntimeError("split server returned no stems")
 
@@ -173,9 +211,12 @@ def _run_remote(mix: Path, out_dir: Path, model: str, server_url: str,
     for name, url in stem_urls.items():
         if isinstance(url, str) and url.startswith("/"):
             url = f"{server_url}{url}"
-        sr = requests.get(url, timeout=180)
+        sr = requests.get(url, headers=headers, timeout=180)
         if sr.status_code == 200:
-            ext = ".mp3" if ".mp3" in str(url).lower() else ".wav"
+            # Trust the URL's own extension: roformer emits .flac, demucs .wav.
+            # (Hardcoding .wav mislabels flac stems.)
+            suffix = Path(str(url).split("?")[0]).suffix.lower()
+            ext = suffix if suffix in _AUDIO_EXTS else ".wav"
             (result_dir / f"{_sanitize(name)}{ext}").write_bytes(sr.content)
     return result_dir
 

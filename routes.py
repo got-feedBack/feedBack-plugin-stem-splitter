@@ -21,6 +21,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 
+import demucs_server
 import engine_install
 
 INSTRUMENT_STEM_IDS = ["guitar", "bass", "drums", "vocals", "other", "piano"]
@@ -56,6 +57,9 @@ class JobManager:
         # reconnected settings page recovers the terminal state even if it missed
         # the live install_done event (long silent pip stretches can drop the WS).
         self._install: dict | None = None
+        # Same idea for the managed demucs-server lifecycle (install / start /
+        # prepare-models), so a reconnecting settings page recovers its state.
+        self._server: dict | None = None
 
         self._load_jobs()
         self._worker = threading.Thread(target=self._worker_loop, name="stem_splitter-worker", daemon=True)
@@ -98,6 +102,13 @@ class JobManager:
             "remote_model": "bs_roformer_sw",
             "whisperx_model": "medium",
             "language": "",
+            # Managed local demucs server. autostart is on by default but is a
+            # no-op until the server is actually installed, and start never pulls
+            # weights (see demucs_server.start_server).
+            "local_server_port": demucs_server.DEFAULT_PORT,
+            "local_server_autostart": True,
+            "local_server_use_globally": False,
+            "local_server_device": "",   # "" = auto | cpu | cuda
         }
         try:
             data = json.loads(self.settings_file.read_text(encoding="utf-8"))
@@ -129,8 +140,24 @@ class JobManager:
         except Exception:
             return {}
 
+    def local_server_url(self) -> str | None:
+        """URL of the plugin-managed local server, if it's actually running."""
+        s = self.read_settings()
+        port = int(s.get("local_server_port") or demucs_server.DEFAULT_PORT)
+        running, live_port = demucs_server.is_running(self.config_dir, port)
+        return demucs_server.url_for(int(live_port or port)) if running else None
+
     def _server_url(self) -> str | None:
-        """Split server URL (demucs/roformer)."""
+        """Split server URL (demucs/roformer).
+
+        The plugin-managed local server wins whenever it's running — that's the
+        "plugin uses it automatically" half of the toggle, and it needs no mutation
+        of the app's config.json (so there's nothing to clean up when it stops).
+        The app's `demucs_server_url` remains the fallback.
+        """
+        local = self.local_server_url()
+        if local:
+            return local
         cfg = self._app_config()
         url = cfg.get("demucs_server_url")
         if isinstance(url, str) and url.strip():
@@ -381,7 +408,7 @@ class JobManager:
         with self.lock:
             jobs = sorted(self.jobs.values(), key=lambda j: j.get("created", 0))
         return {"type": "jobs", "paused": self.paused.is_set(), "jobs": jobs,
-                "install": self._install}
+                "install": self._install, "server": self._server}
 
     def broadcast_snapshot(self, throttle: bool = False) -> None:
         if throttle:
@@ -403,6 +430,43 @@ class JobManager:
 
     def push_event(self, msg: dict) -> None:
         self._push(msg)
+
+    # ── managed demucs server ────────────────────────────────────────────────
+    def run_server_op(self, op: str, fn) -> None:
+        """Run a demucs-server lifecycle op (install / start / prepare_models) on a
+        daemon thread, streaming progress over the WS. Same contract as the engine
+        install, so the settings page reuses the exact same widgets."""
+        def _run() -> None:
+            def cb(ev: dict) -> None:
+                st = {"active": True, "op": op, "line": ev.get("line", ""),
+                      "pct": ev.get("pct", 0.0), "phase": ev.get("phase", "")}
+                self._server = st
+                self.push_event({"type": "server", **st})
+            try:
+                status = fn(cb)
+                self._server = {"active": False, "op": op, "pct": 1.0, "phase": "Done"}
+                self.push_event({"type": "server_done", "op": op, "status": status})
+            except Exception as e:
+                self.log.warning("stem_splitter: server op %s failed: %s", op, e)
+                self._server = {"active": False, "op": op, "pct": 0.0,
+                                "phase": "Failed", "error": str(e)}
+                self.push_event({"type": "server_error", "op": op, "error": str(e)})
+        threading.Thread(target=_run, name=f"stem_splitter-server-{op}", daemon=True).start()
+
+    def needs_server_setup(self) -> dict | None:
+        """If the split would go to our managed local server but its weights aren't
+        downloaded yet, say so instead of letting the job silently stall on a ~2 GB
+        lazy fetch. The UI turns this into a 'download now?' prompt."""
+        if not self.local_server_url():
+            return None
+        if demucs_server.models_downloaded(self.config_dir):
+            return None
+        return {
+            "needs_setup": True,
+            "message": "The local demucs server is running, but its models "
+                       "haven't been downloaded yet (~2 GB, one time). "
+                       "Download them now?",
+        }
 
 
 def setup(app: FastAPI, context: dict) -> None:
@@ -483,6 +547,55 @@ def setup(app: FastAPI, context: dict) -> None:
     def uninstall_engine():
         return engine_install.uninstall_engine(mgr.config_dir)
 
+    # ── managed demucs server ────────────────────────────────────────────────
+    def _server_opts() -> tuple[int, str]:
+        s = mgr.read_settings()
+        port = int(s.get("local_server_port") or demucs_server.DEFAULT_PORT)
+        device = str(s.get("local_server_device") or "")
+        return port, device
+
+    @app.get(f"{P}/server_status")
+    def get_server_status():
+        return demucs_server.server_status(mgr.config_dir)
+
+    @app.get(f"{P}/server/health")
+    def get_server_health():
+        """Backend proxy for the 'Test status' button. /health needs no API key."""
+        port, _ = _server_opts()
+        url = mgr.local_server_url() or demucs_server.url_for(port)
+        ok, payload = demucs_server.server_health(url, timeout=4.0)
+        return {"ok": ok, "url": url, "health": payload}
+
+    @app.post(f"{P}/server/install")
+    def post_server_install():
+        mgr.run_server_op("install", lambda cb: demucs_server.install_server(
+            mgr.config_dir, progress_cb=cb))
+        return {"ok": True, "started": "install"}
+
+    @app.post(f"{P}/server/start")
+    def post_server_start():
+        port, device = _server_opts()
+        # warmup=None -> warm up only if the weights are already on disk, so a
+        # start can never trigger the big download.
+        mgr.run_server_op("start", lambda cb: demucs_server.start_server(
+            mgr.config_dir, port=port, device=device, warmup=None, progress_cb=cb))
+        return {"ok": True, "started": "start"}
+
+    @app.post(f"{P}/server/stop")
+    def post_server_stop():
+        return demucs_server.stop_server(mgr.config_dir)
+
+    @app.post(f"{P}/server/prepare_models")
+    def post_server_prepare_models():
+        port, device = _server_opts()
+        mgr.run_server_op("prepare_models", lambda cb: demucs_server.prepare_models(
+            mgr.config_dir, port=port, device=device, progress_cb=cb))
+        return {"ok": True, "started": "prepare_models"}
+
+    @app.post(f"{P}/server/uninstall")
+    def post_server_uninstall():
+        return demucs_server.uninstall_server(mgr.config_dir)
+
     # ── jobs ─────────────────────────────────────────────────────────────────
     @app.get(f"{P}/jobs")
     def get_jobs():
@@ -495,6 +608,13 @@ def setup(app: FastAPI, context: dict) -> None:
         names = [n for n in (names or []) if isinstance(n, str) and n]
         if not names:
             return {"error": "no filename(s) provided"}
+        # Warn-and-ask rather than silently stalling on a lazy ~2 GB model fetch.
+        # The client re-POSTs with force_setup once the user has agreed (and the
+        # models have been prepared).
+        if not body.get("skip_setup_check"):
+            needs = mgr.needs_server_setup()
+            if needs:
+                return {**needs, "ok": False, "enqueued": 0}
         created = [mgr.enqueue(kind, n) for n in names]
         return {"ok": True, "enqueued": len(created), "jobs": created}
 
@@ -616,5 +736,29 @@ def setup(app: FastAPI, context: dict) -> None:
             pass
         finally:
             mgr._clients.discard(q)
+
+    # ── auto-start the managed server ────────────────────────────────────────
+    # Entirely on a daemon thread: setup() must never block app launch. And the
+    # start itself only warms up models that are ALREADY downloaded, so launching
+    # can never kick off the ~2 GB fetch (see demucs_server.start_server).
+    def _autostart() -> None:
+        try:
+            s = mgr.read_settings()
+            if not s.get("local_server_autostart"):
+                return
+            if not demucs_server.installed(mgr.config_dir):
+                return  # nothing installed -> nothing to start
+            port, device = _server_opts()
+            running, _ = demucs_server.is_running(mgr.config_dir, port)
+            if running:
+                log.info("stem_splitter: demucs server already running on %s", port)
+                return
+            log.info("stem_splitter: auto-starting demucs server on port %s", port)
+            mgr.run_server_op("start", lambda cb: demucs_server.start_server(
+                mgr.config_dir, port=port, device=device, warmup=None, progress_cb=cb))
+        except Exception as e:
+            log.warning("stem_splitter: demucs server auto-start failed: %s", e)
+
+    threading.Thread(target=_autostart, name="stem_splitter-autostart", daemon=True).start()
 
     log.info("stem_splitter: routes registered")

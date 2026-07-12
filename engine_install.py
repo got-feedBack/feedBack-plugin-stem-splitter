@@ -155,25 +155,18 @@ def _build_failure_hint(engine: str, output_tail: str) -> str:
     return ""
 
 
-def _pip_install(config_dir: Path, label: str, pkgs: list[str], progress_cb: ProgressCB,
-                 base: float, span: float) -> None:
-    """Install one package set in its own pip transaction. Raises ``RuntimeError``
-    (with an actionable hint) on failure.
+def stream_pip(python_exe: str, pip_args: list[str], label: str, progress_cb: ProgressCB,
+               base: float, span: float, pkg_count: int = 1) -> None:
+    """Run one ``pip install`` transaction, streaming its output as progress events.
 
-    ``--upgrade-strategy only-if-needed`` (pip's default, made explicit) means a
-    layered engine install only touches the shared torch/torchaudio if it actually
-    needs a different version - so one engine can't gratuitously rewrite the torch
-    another engine already installed.
+    Shared by the plugin's engine installer (``--target {config_dir}/engine``) and
+    the managed demucs-server installer (a venv). Raises ``RuntimeError`` with an
+    actionable hint on failure.
+
+    ``pip_args`` are everything after ``pip install`` (packages + flags), so the
+    caller decides between ``--target`` and a venv, ``--no-deps``, etc.
     """
-    edir = engine_dir(config_dir)
-    cmd = [
-        sys.executable, "-m", "pip", "install",
-        "--target", str(edir),
-        "--upgrade", "--upgrade-strategy", "only-if-needed",
-        "--progress-bar", "off",
-        "--extra-index-url", _TORCH_INDEX,
-        *pkgs,
-    ]
+    cmd = [python_exe, "-m", "pip", "install", "--progress-bar", "off", *pip_args]
 
     def emit(line: str = "", local: float = 0.0, phase: str = "") -> None:
         if progress_cb:
@@ -181,11 +174,11 @@ def _pip_install(config_dir: Path, label: str, pkgs: list[str], progress_cb: Pro
             progress_cb({"line": line, "pct": max(0.0, min(1.0, pct)),
                          "phase": f"{label}: {phase}" if phase else label})
 
-    emit(f"Installing {label}: {', '.join(pkgs)}", 0.02, "Starting")
+    emit(f"Installing {label}", 0.02, "Starting")
 
     env = dict(os.environ)
     env.setdefault("PYTHONUNBUFFERED", "1")
-    total = max(1, len(pkgs))
+    total = max(1, pkg_count)
     collected = 0
     local = 0.02
     tail: list[str] = []
@@ -228,6 +221,24 @@ def _pip_install(config_dir: Path, label: str, pkgs: list[str], progress_cb: Pro
         raise RuntimeError(msg)
 
     emit(f"Done installing {label}.", 1.0, "Done")
+
+
+def _pip_install(config_dir: Path, label: str, pkgs: list[str], progress_cb: ProgressCB,
+                 base: float, span: float) -> None:
+    """Install one engine package set into the plugin's ``--target`` engine tree.
+
+    ``--upgrade-strategy only-if-needed`` (pip's default, made explicit) means a
+    layered engine install only touches the shared torch/torchaudio if it actually
+    needs a different version - so one engine can't gratuitously rewrite the torch
+    another engine already installed.
+    """
+    args = [
+        "--target", str(engine_dir(config_dir)),
+        "--upgrade", "--upgrade-strategy", "only-if-needed",
+        "--extra-index-url", _TORCH_INDEX,
+        *pkgs,
+    ]
+    stream_pip(sys.executable, args, label, progress_cb, base, span, pkg_count=len(pkgs))
 
 
 def install_engine(config_dir: Path, which: str, progress_cb: ProgressCB = None) -> dict:

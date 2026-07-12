@@ -20,6 +20,7 @@
     lyricsEngine: null,
     ws: null,
     inited: false,
+    pendingAfterSetup: [],   // jobs waiting on a one-time model download
   };
 
   function $(id) { return document.getElementById(id); }
@@ -38,12 +39,43 @@
     return fetch(API + path, opts).then(function (r) { return r.json(); });
   }
 
-  function enqueue(kind, filenames) {
-    var body = Array.isArray(filenames) ? { filenames: filenames } : { filename: filenames };
+  function post(kind, body) {
     return api('/' + kind, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
+    });
+  }
+
+  // Enqueue, but never let a job silently stall on a lazy multi-GB model fetch:
+  // the backend answers `needs_setup` when the split would go to the managed local
+  // server and its weights aren't downloaded. Ask, then set it up, then run.
+  function enqueue(kind, filenames) {
+    var body = Array.isArray(filenames) ? { filenames: filenames } : { filename: filenames };
+    return post(kind, body).then(function (res) {
+      if (!res || !res.needs_setup) return res;
+      if (!window.confirm(res.message + '\n\nThe download runs in the background; your '
+                          + (kind === 'split' ? 'split' : 'transcription')
+                          + ' starts automatically when it finishes.')) {
+        toast('Cancelled', 'Models are needed before this can run.');
+        return res;
+      }
+      state.pendingAfterSetup.push({ kind: kind, body: body });
+      connectWS();
+      return api('/server/prepare_models', { method: 'POST' }).then(function () {
+        toast('Downloading models', 'This is a one-time ~2 GB download.');
+        return res;
+      });
+    });
+  }
+
+  function flushPendingAfterSetup() {
+    var pending = state.pendingAfterSetup.splice(0);
+    pending.forEach(function (p) {
+      var body = Object.assign({}, p.body, { skip_setup_check: true });
+      post(p.kind, body).then(function () {
+        toast('Models ready', 'Queued ' + p.kind + ' now.');
+      });
     });
   }
 
@@ -85,7 +117,9 @@
       enabled: function (song) { return state.missingStems.has(song.filename); },
       run: function (song) {
         if (!state.splitEngine) { toast('No split engine', 'Open Stem Splitter settings to configure a server or download a local engine.', 'warn'); return; }
-        enqueue('split', song.filename).then(function () { toast('Split queued', song.filename); });
+        enqueue('split', song.filename).then(function (r) {
+          if (r && r.enqueued) toast('Split queued', song.filename);
+        });
       },
     });
     reg.register({
@@ -98,7 +132,9 @@
       enabled: function (song) { return state.missingLyrics.has(song.filename); },
       run: function (song) {
         if (!state.lyricsEngine) { toast('No lyrics engine', 'Open Stem Splitter settings to configure a server or download whisperx.', 'warn'); return; }
-        enqueue('transcribe', song.filename).then(function () { toast('Transcription queued', song.filename); });
+        enqueue('transcribe', song.filename).then(function (r) {
+          if (r && r.enqueued) toast('Transcription queued', song.filename);
+        });
       },
     });
   }
@@ -155,6 +191,15 @@
         refreshConfig();
       } else if (msg.type === 'install_error') {
         toast('Install failed', msg.error, 'warn');
+      } else if (msg.type === 'server_done') {
+        if (msg.op === 'prepare_models') {
+          toast('Models ready', 'The local server is warmed up.', 'ok');
+          flushPendingAfterSetup();
+        }
+        refreshConfig();
+      } else if (msg.type === 'server_error') {
+        toast('Server error', msg.error, 'warn');
+        state.pendingAfterSetup.length = 0;   // don't silently retry a failed setup
       }
     };
     ws.onclose = function () { state.ws = null; setTimeout(connectWS, 2000); };
@@ -175,12 +220,16 @@
     bind('ss-split-all', function () {
       var list = Array.from(state.missingStems);
       if (!list.length) { toast('Nothing to split', 'No songs are missing stems.'); return; }
-      enqueue('split', list).then(function (r) { toast('Queued', r.enqueued + ' split job(s)'); });
+      enqueue('split', list).then(function (r) {
+        if (r && r.enqueued) toast('Queued', r.enqueued + ' split job(s)');
+      });
     });
     bind('ss-transcribe-all', function () {
       var list = Array.from(state.missingLyrics);
       if (!list.length) { toast('Nothing to transcribe', 'No songs are missing lyrics.'); return; }
-      enqueue('transcribe', list).then(function (r) { toast('Queued', r.enqueued + ' transcription job(s)'); });
+      enqueue('transcribe', list).then(function (r) {
+        if (r && r.enqueued) toast('Queued', r.enqueued + ' transcription job(s)');
+      });
     });
     bind('ss-refresh-missing', function () { refreshMissing(); refreshConfig(); });
     bind('ss-pause', function () { api('/pause', { method: 'POST' }); });

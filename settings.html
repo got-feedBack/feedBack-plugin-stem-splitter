@@ -59,6 +59,49 @@
     <div class="ss-bar" style="width:100%;margin:.35rem 0"><i id="ss-install-fill" style="width:0%"></i></div>
     <pre class="ss-log" id="ss-install-log" style="height:240px;max-height:240px;overflow:auto;margin:0;padding:.6rem;background:#0b1220;color:#94a3b8;border:1px solid rgba(148,163,184,.2);border-radius:6px;font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;word-break:break-word"></pre>
   </div>
+
+  <h3 style="margin-top:1.75rem">Local demucs server</h3>
+  <p class="ss-muted">Run got-feedBack's demucs/whisperx server on this machine. Once it's running the
+    plugin uses it automatically. Starting it is cheap — the big model download only happens when you
+    click <em>Prepare models</em>.</p>
+  <p class="ss-muted" id="ss-srv-status">Checking…</p>
+
+  <div class="row">
+    <div>
+      <label for="ss-srv-port">Port</label>
+      <input type="text" id="ss-srv-port" value="7865" style="width:5.5rem">
+    </div>
+    <div>
+      <label for="ss-srv-device">Device</label>
+      <select id="ss-srv-device">
+        <option value="">Auto</option>
+        <option value="cpu">CPU</option>
+        <option value="cuda">CUDA (GPU)</option>
+      </select>
+    </div>
+    <div>
+      <label><input type="checkbox" id="ss-srv-autostart"> Start with the app</label>
+      <label><input type="checkbox" id="ss-srv-global"> Use for the whole app</label>
+    </div>
+  </div>
+
+  <div class="row" style="margin-top:.6rem">
+    <button class="ss-btn" id="ss-srv-install" style="background:#2563eb;color:#fff;border:0;border-radius:7px;padding:.45rem .85rem;font-weight:600;cursor:pointer">Install server</button>
+    <button class="ss-btn" id="ss-srv-start" style="background:#16a34a;color:#fff;border:0;border-radius:7px;padding:.45rem .85rem;font-weight:600;cursor:pointer">Start</button>
+    <button class="ss-btn" id="ss-srv-stop" style="background:rgba(148,163,184,.2);color:#e2e8f0;border:0;border-radius:7px;padding:.45rem .85rem;cursor:pointer">Stop</button>
+    <button class="ss-btn" id="ss-srv-test" style="background:rgba(148,163,184,.2);color:#e2e8f0;border:0;border-radius:7px;padding:.45rem .85rem;cursor:pointer">Test status</button>
+    <button class="ss-btn" id="ss-srv-prepare" style="background:rgba(148,163,184,.2);color:#e2e8f0;border:0;border-radius:7px;padding:.45rem .85rem;cursor:pointer">Prepare models (~2 GB)</button>
+    <button class="ss-btn" id="ss-srv-uninstall" style="background:#b91c1c;color:#fff;border:0;border-radius:7px;padding:.45rem .85rem;cursor:pointer">Uninstall server</button>
+  </div>
+
+  <div id="ss-srv-progress" style="display:none;margin-top:.75rem">
+    <div class="ss-row" style="justify-content:space-between">
+      <strong id="ss-srv-phase" style="font-size:.85rem">Starting…</strong>
+      <span id="ss-srv-pct" class="ss-muted">0%</span>
+    </div>
+    <div class="ss-bar" style="width:100%;margin:.35rem 0"><i id="ss-srv-fill" style="width:0%"></i></div>
+    <pre class="ss-log" id="ss-srv-log" style="height:240px;max-height:240px;overflow:auto;margin:0;padding:.6rem;background:#0b1220;color:#94a3b8;border:1px solid rgba(148,163,184,.2);border-radius:6px;font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;word-break:break-word"></pre>
+  </div>
 </div>
 
 <script>
@@ -78,8 +121,13 @@
       $('ss-set-remote-model').value = s.remote_model || 'bs_roformer_sw';
       $('ss-set-wx-model').value = s.whisperx_model || 'medium';
       $('ss-set-lang').value = s.language || '';
+      $('ss-srv-port').value = s.local_server_port || 7865;
+      $('ss-srv-device').value = s.local_server_device || '';
+      $('ss-srv-autostart').checked = !!s.local_server_autostart;
+      $('ss-srv-global').checked = !!s.local_server_use_globally;
       renderStatus(cfg.engine_status);
     }).catch(function () {});
+    loadServerStatus();
   }
 
   function renderStatus(st) {
@@ -97,6 +145,10 @@
       remote_model: $('ss-set-remote-model').value,
       whisperx_model: $('ss-set-wx-model').value,
       language: $('ss-set-lang').value,
+      local_server_port: parseInt($('ss-srv-port').value, 10) || 7865,
+      local_server_device: $('ss-srv-device').value,
+      local_server_autostart: $('ss-srv-autostart').checked,
+      local_server_use_globally: $('ss-srv-global').checked,
     };
     j('/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
       .then(function () { $('ss-set-saved').textContent = 'Saved.'; setTimeout(function () { $('ss-set-saved').textContent = ''; }, 2000); });
@@ -153,6 +205,15 @@
     setEngineButtons(!!st.active);  // keep buttons locked if an install is still running
   }
 
+  // Snapshot recovery for a server op that was still running while the page was away.
+  function renderServerOp(st) {
+    if (!st) return;
+    $('ss-srv-progress').style.display = 'block';
+    setSrvBar(st.pct, st.phase || (st.active ? st.op : 'Done'));
+    if (st.error) appendLog($('ss-srv-log'), '✗ ' + st.error);
+    setServerButtons(!!st.active);
+  }
+
   var ws = null;
   function connectWS() {
     if (ws) return;
@@ -163,6 +224,22 @@
       var log = $('ss-install-log');
       if (m.type === 'jobs') {
         if (m.install) renderInstall(m.install);   // snapshot recovery
+        if (m.server) renderServerOp(m.server);
+      } else if (m.type === 'server') {
+        $('ss-srv-progress').style.display = 'block';
+        if (m.line) appendLog($('ss-srv-log'), m.line);
+        setSrvBar(m.pct, m.phase);
+        setServerButtons(true);
+      } else if (m.type === 'server_done') {
+        appendLog($('ss-srv-log'), '✓ ' + m.op + ' done.');
+        setSrvBar(1, 'Done');
+        setServerButtons(false);
+        if (m.status) renderServerStatus(m.status); else loadServerStatus();
+      } else if (m.type === 'server_error') {
+        appendLog($('ss-srv-log'), '✗ ' + m.error);
+        setSrvBar(0, 'Failed');
+        setServerButtons(false);
+        loadServerStatus();
       } else if (m.type === 'install') {
         $('ss-install-progress').style.display = 'block';
         if (m.line) appendLog(log, m.line);
@@ -204,6 +281,117 @@
       $('ss-install-log').textContent = 'Uninstall request failed: ' + err + '\n';
     }).finally(function () { setEngineButtons(false); });
   });
+  // ── managed demucs server ──────────────────────────────────────────────────
+  var SERVER_BTNS = ['ss-srv-install', 'ss-srv-start', 'ss-srv-stop', 'ss-srv-test',
+                     'ss-srv-prepare', 'ss-srv-uninstall'];
+  function setServerButtons(disabled) {
+    SERVER_BTNS.forEach(function (id) { var el = $(id); if (el) el.disabled = disabled; });
+  }
+  function setSrvBar(pct, phase) {
+    $('ss-srv-fill').style.width = Math.round((pct || 0) * 100) + '%';
+    $('ss-srv-pct').textContent = Math.round((pct || 0) * 100) + '%';
+    if (phase) $('ss-srv-phase').textContent = phase;
+  }
+  function srvLog(line) { $('ss-srv-progress').style.display = 'block'; appendLog($('ss-srv-log'), line); }
+
+  var lastServerStatus = null;
+  function renderServerStatus(st) {
+    lastServerStatus = st || null;
+    var el = $('ss-srv-status');
+    if (!st) { el.textContent = 'Status unavailable.'; return; }
+    var bits = [];
+    if (!st.installed) {
+      bits.push('Not installed');
+    } else if (st.running) {
+      var h = st.health || {};
+      bits.push('Running on port ' + st.port);
+      if (h.device) bits.push(h.device + (h.gpu ? ' (GPU)' : ''));
+      var wu = h.warmup || {};
+      var wuBits = Object.keys(wu).map(function (k) { return k + ':' + wu[k]; });
+      if (wuBits.length) bits.push('warmup ' + wuBits.join(' '));
+    } else {
+      bits.push('Installed, not running');
+    }
+    bits.push(st.models_downloaded ? 'models downloaded' : 'models NOT downloaded');
+    if (st.disk_bytes) bits.push((st.disk_bytes / 1e9).toFixed(2) + ' GB on disk');
+    el.textContent = bits.join(' · ');
+    syncGlobalUrl(st);
+  }
+
+  function loadServerStatus() {
+    return j('/server_status').then(renderServerStatus).catch(function () {});
+  }
+
+  // "Use for the whole app": mirror the running local URL into the app's own
+  // demucs_server_url via the app's writer (it holds the settings lock + does an
+  // atomic write; a plugin-side config.json write would race it).
+  function appSettings(body) {
+    return fetch('/api/settings', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }).then(function (r) { return r.json(); });
+  }
+  function syncGlobalUrl(st) {
+    if (!$('ss-srv-global').checked || !st) return;
+    if (st.running && st.url) {
+      appSettings({ demucs_server_url: st.url }).catch(function () {});
+    } else {
+      // Only clear it if it still points at OUR local server — never clobber a
+      // remote URL the user set in the meantime.
+      fetch('/api/settings').then(function (r) { return r.json(); }).then(function (cur) {
+        var mine = 'http://127.0.0.1:' + (st.port || 7865);
+        if (cur && cur.demucs_server_url === mine) appSettings({ demucs_server_url: '' });
+      }).catch(function () {});
+    }
+  }
+
+  function serverOp(path, label) {
+    setServerButtons(true);
+    $('ss-srv-progress').style.display = 'block';
+    $('ss-srv-log').textContent = label + '…\n';
+    setSrvBar(0.02, label);
+    connectWS();
+    return j(path, { method: 'POST' }).then(function (res) {
+      // stop/uninstall answer synchronously with a status; install/start/prepare
+      // stream over the WS and unlock on server_done/server_error.
+      if (res && typeof res.installed !== 'undefined') {
+        renderServerStatus(res);
+        setSrvBar(1, 'Done');
+        setServerButtons(false);
+      }
+      return res;
+    }).catch(function (err) {
+      srvLog('✗ ' + label + ' failed: ' + err);
+      setSrvBar(0, 'Failed');
+      setServerButtons(false);
+    });
+  }
+
+  $('ss-srv-install').addEventListener('click', function () {
+    if (!confirm('Download and install the demucs server? This installs a few GB of Python packages.')) return;
+    serverOp('/server/install', 'Installing server');
+  });
+  $('ss-srv-start').addEventListener('click', function () { serverOp('/server/start', 'Starting server'); });
+  $('ss-srv-stop').addEventListener('click', function () { serverOp('/server/stop', 'Stopping server'); });
+  $('ss-srv-uninstall').addEventListener('click', function () {
+    if (!confirm('Remove the demucs server, its virtualenv and all downloaded models?')) return;
+    serverOp('/server/uninstall', 'Uninstalling server');
+  });
+  $('ss-srv-prepare').addEventListener('click', function () {
+    if (!confirm('Download the model weights (~2 GB, one time)? The server will restart and warm up.')) return;
+    serverOp('/server/prepare_models', 'Preparing models');
+  });
+  $('ss-srv-test').addEventListener('click', function () {
+    setServerButtons(true);
+    $('ss-srv-progress').style.display = 'block';
+    j('/server/health').then(function (r) {
+      srvLog((r.ok ? '✓ ' : '✗ ') + r.url + ' → ' + JSON.stringify(r.health));
+      setSrvBar(r.ok ? 1 : 0, r.ok ? 'Healthy' : 'No response');
+      return loadServerStatus();
+    }).catch(function (e) { srvLog('✗ ' + e); })
+      .finally(function () { setServerButtons(false); });
+  });
+
   loadConfig();
   connectWS();  // connect on load so a snapshot recovers any install that finished while away
 })();
