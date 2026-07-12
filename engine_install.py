@@ -31,10 +31,29 @@ ProgressCB = Optional[Callable[[dict], None]]
 # who want GPU can install torch themselves into the engine dir.
 _TORCH_INDEX = "https://download.pytorch.org/whl/cpu"
 
-# Kill pip if it goes completely silent this long. A real multi-GB download is
-# slow but never silent, so this only trips on a genuine stall - without it a
-# hung download blocks the installer thread forever.
-_PIP_STALL_TIMEOUT = 600  # seconds
+# Kill pip if it goes completely silent this long — without it a hung download blocks
+# the installer thread forever with no way out but restarting the app.
+#
+# The bar for "silent" has to clear the WORST legitimate case, not the typical one. We
+# pass --progress-bar off (pip suppresses it on a non-tty anyway), so pip prints one line
+# per wheel and then nothing at all while it downloads it. torch is ~2.5 GB: on a 1 MB/s
+# link that's ~40 minutes of entirely healthy silence. A 10-minute watchdog turned a slow
+# connection into a hard failure — and the retry just fails again, slower.
+#
+# 60 min is deliberately far past any plausible real download while still bounded. Both
+# installers (local engine + managed server) share this via stream_pip, and users on a
+# genuinely awful link can raise it without a rebuild.
+def _stall_timeout() -> int:
+    # Module-level int() on an env var would raise at IMPORT time on a typo, taking the
+    # whole plugin down rather than one setting.
+    try:
+        v = int(os.environ.get("STEM_SPLITTER_PIP_STALL_TIMEOUT") or 0)
+    except ValueError:
+        v = 0
+    return max(60, v or 60 * 60)
+
+
+_PIP_STALL_TIMEOUT = _stall_timeout()
 
 # Shared PyTorch base, installed ONCE before any engine. All three engines depend
 # on torch/torchaudio; installing it per-engine into the same --target tree with
@@ -310,7 +329,8 @@ def stream_pip(python_exe: str, pip_args: list[str], label: str, progress_cb: Pr
         raise RuntimeError(
             f"pip stalled while installing {label} (no output for "
             f"{_PIP_STALL_TIMEOUT // 60} min) and was killed. Check your network "
-            "connection and try again."
+            "connection and try again. If your link is simply very slow, raise "
+            "STEM_SPLITTER_PIP_STALL_TIMEOUT (seconds)."
         )
     if rc != 0:
         hint = _build_failure_hint(label, "\n".join(tail))
