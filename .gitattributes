@@ -1,0 +1,13 @@
+# Normalize line endings on commit. Without this, a contributor on Windows (or a tool
+# that writes files with the platform default, which is how this got in) can commit CRLF
+# and turn an edit of three lines into a whole-file rewrite — routes.py showed 1489
+# changed lines in an 869-line file, which is unreviewable.
+* text=auto eol=lf
+
+# Never touch binaries.
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.whl binary
