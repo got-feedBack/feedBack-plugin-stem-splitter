@@ -131,7 +131,7 @@
   </div>
 
   <div class="row" style="margin-top:.6rem">
-    <button class="ss-actionbtn blue" id="ss-srv-install">Install server + models (~5 GB)</button>
+    <button class="ss-actionbtn blue" id="ss-srv-install"><span id="ss-srv-install-label">Install server + models (~5 GB)</span></button>
     <!-- One button. Its COLOUR is the server's state (red = down, green = up); its
          LABEL is what clicking will do. -->
     <button class="ss-actionbtn red" id="ss-srv-toggle"><i class="dot"></i><span id="ss-srv-toggle-label">Start server</span></button>
@@ -385,6 +385,30 @@
     el.classList.remove('green', 'red', 'blue', 'grey', 'amber', 'busy');
     el.classList.add(tone);
   }
+  // The setup button reflects what's still MISSING, rather than just disabling itself
+  // once the deps exist: installing the dependencies without the model weights leaves a
+  // server that starts but can't split, and that half-state needs a way forward.
+  function renderInstallBtn(st) {
+    var btn = $('ss-srv-install'), label = $('ss-srv-install-label');
+    if (!btn || !label) return;
+    if (!st) { btn.disabled = true; return; }
+
+    if (!st.installed) {
+      setBtnTone('ss-srv-install', 'blue');
+      label.textContent = 'Install server + models (~5 GB)';
+      btn.disabled = serverBusy || !serverManageable;
+    } else if (!st.models_downloaded) {
+      setBtnTone('ss-srv-install', 'amber');
+      label.textContent = 'Download models (~2 GB)';   // deps are there; finish the job
+      btn.disabled = serverBusy || !serverManageable;
+    } else {
+      setBtnTone('ss-srv-install', 'grey');
+      label.textContent = 'Installed ✓';
+      btn.disabled = true;                              // nothing left to do
+      btn.title = 'Server and models are installed. Use Uninstall server to remove them.';
+    }
+  }
+
   function renderToggle(st) {
     var label = $('ss-srv-toggle-label');
     if (!st || !st.installed) {
@@ -417,6 +441,7 @@
       serverManageable = false;
       bar.innerHTML = chip('Unavailable here', 'bad', { dot: true });
       renderToggle(null);
+      renderInstallBtn(null);
       note.textContent = st.manage_reason || '';
       note.className = 'ss-note warn';
       setServerButtons(true);
@@ -452,6 +477,7 @@
     if (st.disk_bytes) chips.push(chip(gb(st.disk_bytes) + ' on disk', 'info'));
     bar.innerHTML = chips.join('');
     renderToggle(st);
+    renderInstallBtn(st);
 
     var notes = [];
     if (st.advisory) notes.push('⚠ ' + st.advisory);
