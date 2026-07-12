@@ -82,30 +82,33 @@
   <p class="ss-subtitle">Split stems and transcribe lyrics — using a server, or on this machine.</p>
 
   <section class="ss-section engines">
-    <h3>Engines <span class="ss-h-note">how splitting and transcription run</span></h3>
+    <h3>Engines <span class="ss-h-note">applies to the server AND the in-app engine</span></h3>
+    <p class="ss-note">“Server” means the <em>managed local demucs server</em> below whenever it's
+      running, otherwise whatever <code>demucs_server_url</code> points at. “In-app” runs the models
+      inside feedBack itself.</p>
 
   <label for="ss-set-split">Split engine</label>
   <select id="ss-set-split">
-    <option value="auto">Auto (remote if available, else local)</option>
-    <option value="remote">Remote server (bs_roformer_sw)</option>
-    <option value="audio-separator">Local — audio-separator (bs_roformer_sw)</option>
-    <option value="demucs">Local — demucs (htdemucs_6s)</option>
+    <option value="auto">Auto — server if running, else in-app</option>
+    <option value="remote">Server (managed local, or demucs_server_url)</option>
+    <option value="audio-separator">In-app — audio-separator (bs_roformer_sw)</option>
+    <option value="demucs">In-app — demucs (htdemucs_6s)</option>
   </select>
 
   <label for="ss-set-lyrics">Lyrics engine</label>
   <select id="ss-set-lyrics">
-    <option value="auto">Auto (remote if available, else local)</option>
-    <option value="remote">Remote server (/align)</option>
-    <option value="local">Local — whisperx</option>
+    <option value="auto">Auto — server if running, else in-app</option>
+    <option value="remote">Server (/align)</option>
+    <option value="local">In-app — whisperx</option>
   </select>
 
   <div class="row">
     <div>
-      <label for="ss-set-remote-model">Remote split model</label>
+      <label for="ss-set-remote-model" title="Sent to the server AND used by the in-app audio-separator engine">Split model (server + in-app)</label>
       <input type="text" id="ss-set-remote-model" value="bs_roformer_sw">
     </div>
     <div>
-      <label for="ss-set-wx-model">WhisperX model (local)</label>
+      <label for="ss-set-wx-model" title="Only the in-app whisperx uses this; the server has its own">WhisperX model (in-app only)</label>
       <select id="ss-set-wx-model">
         <option>tiny</option><option>base</option><option>small</option>
         <option selected>medium</option><option>large-v2</option><option>large-v3</option>
