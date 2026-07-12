@@ -24,6 +24,22 @@
 @keyframes ss-pulse { 0%,100% { opacity: 1 } 50% { opacity: .25 } }
 #ss-settings .ss-note { font-size: .78rem; color: #94a3b8; margin: .1rem 0 .6rem; }
 #ss-settings .ss-note.warn { color: #facc15; }
+
+/* Action buttons whose colour reflects state, not decoration. */
+#ss-settings .ss-actionbtn {
+  border: 0; border-radius: 7px; padding: .45rem .85rem;
+  font-weight: 600; cursor: pointer; color: #fff;
+  display: inline-flex; align-items: center; gap: .4rem;
+  transition: background .15s ease, opacity .15s ease;
+}
+#ss-settings .ss-actionbtn .dot { width: .5rem; height: .5rem; border-radius: 50%; background: currentColor; }
+#ss-settings .ss-actionbtn.green { background: #16a34a; }   /* server up */
+#ss-settings .ss-actionbtn.red   { background: #b91c1c; }   /* server down */
+#ss-settings .ss-actionbtn.blue  { background: #2563eb; }
+#ss-settings .ss-actionbtn.grey  { background: rgba(148,163,184,.2); color: #e2e8f0; }
+#ss-settings .ss-actionbtn.amber { background: #a16207; }
+#ss-settings .ss-actionbtn[disabled] { opacity: .45; cursor: not-allowed; }
+#ss-settings .ss-actionbtn.busy .dot { animation: ss-pulse 1.4s ease-in-out infinite; }
 </style>
 
 <div class="stem-splitter-settings" id="ss-settings">
@@ -115,11 +131,12 @@
   </div>
 
   <div class="row" style="margin-top:.6rem">
-    <button class="ss-btn" id="ss-srv-install" style="background:#2563eb;color:#fff;border:0;border-radius:7px;padding:.45rem .85rem;font-weight:600;cursor:pointer">Install server + models (~5 GB)</button>
-    <button class="ss-btn" id="ss-srv-start" style="background:#16a34a;color:#fff;border:0;border-radius:7px;padding:.45rem .85rem;font-weight:600;cursor:pointer">Start</button>
-    <button class="ss-btn" id="ss-srv-stop" style="background:rgba(148,163,184,.2);color:#e2e8f0;border:0;border-radius:7px;padding:.45rem .85rem;cursor:pointer">Stop</button>
-    <button class="ss-btn" id="ss-srv-test" style="background:rgba(148,163,184,.2);color:#e2e8f0;border:0;border-radius:7px;padding:.45rem .85rem;cursor:pointer">Test status</button>
-    <button class="ss-btn" id="ss-srv-uninstall" style="background:#b91c1c;color:#fff;border:0;border-radius:7px;padding:.45rem .85rem;cursor:pointer">Uninstall server</button>
+    <button class="ss-actionbtn blue" id="ss-srv-install">Install server + models (~5 GB)</button>
+    <!-- One button. Its COLOUR is the server's state (red = down, green = up); its
+         LABEL is what clicking will do. -->
+    <button class="ss-actionbtn red" id="ss-srv-toggle"><i class="dot"></i><span id="ss-srv-toggle-label">Start server</span></button>
+    <button class="ss-actionbtn grey" id="ss-srv-test">Test status</button>
+    <button class="ss-actionbtn grey" id="ss-srv-uninstall">Uninstall server</button>
   </div>
 
   <div id="ss-srv-progress" style="display:none;margin-top:.75rem">
@@ -342,10 +359,11 @@
     }).finally(function () { setEngineButtons(false); });
   });
   // ── managed demucs server ──────────────────────────────────────────────────
-  var SERVER_BTNS = ['ss-srv-install', 'ss-srv-start', 'ss-srv-stop', 'ss-srv-test',
-                     'ss-srv-uninstall'];
+  var SERVER_BTNS = ['ss-srv-install', 'ss-srv-toggle', 'ss-srv-test', 'ss-srv-uninstall'];
   var serverManageable = true;   // false when the backend says it can't manage a server here
+  var serverBusy = false;        // an install/start/stop/prepare is in flight
   function setServerButtons(disabled) {
+    serverBusy = !!disabled;
     var d = disabled || !serverManageable;   // never re-enable an unsupported section
     SERVER_BTNS.forEach(function (id) { var el = $(id); if (el) el.disabled = d; });
   }
@@ -357,6 +375,33 @@
   function srvLog(line) { $('ss-srv-progress').style.display = 'block'; appendLog($('ss-srv-log'), line); }
 
   var lastServerStatus = null;
+
+  // The toggle's colour tracks the SERVER's state (red = down, green = up); its label
+  // says what a click will do. Previously Start was always green and Stop always grey,
+  // so the controls told you nothing about what was actually happening.
+  function setBtnTone(id, tone) {
+    var el = $(id);
+    if (!el) return;
+    el.classList.remove('green', 'red', 'blue', 'grey', 'amber', 'busy');
+    el.classList.add(tone);
+  }
+  function renderToggle(st) {
+    var label = $('ss-srv-toggle-label');
+    if (!st || !st.installed) {
+      setBtnTone('ss-srv-toggle', 'grey');
+      label.textContent = 'Not installed';
+      $('ss-srv-toggle').disabled = true;
+      return;
+    }
+    $('ss-srv-toggle').disabled = serverBusy || !serverManageable;
+    if (st.running) {
+      setBtnTone('ss-srv-toggle', 'green');
+      label.textContent = 'Running — click to stop';
+    } else {
+      setBtnTone('ss-srv-toggle', 'red');
+      label.textContent = 'Stopped — click to start';
+    }
+  }
   var WARMUP_TONE = { ready: 'ok', skipped: 'ok', downloading: 'warn',
                       pending: 'off', failed: 'bad', evicted: 'off' };
 
@@ -371,6 +416,7 @@
     if (st.manageable === false) {
       serverManageable = false;
       bar.innerHTML = chip('Unavailable here', 'bad', { dot: true });
+      renderToggle(null);
       note.textContent = st.manage_reason || '';
       note.className = 'ss-note warn';
       setServerButtons(true);
@@ -405,6 +451,7 @@
 
     if (st.disk_bytes) chips.push(chip(gb(st.disk_bytes) + ' on disk', 'info'));
     bar.innerHTML = chips.join('');
+    renderToggle(st);
 
     var notes = [];
     if (st.advisory) notes.push('⚠ ' + st.advisory);
@@ -481,8 +528,17 @@
                  + '(~3 GB) and the model weights (~2 GB), then starts it. One time.')) return;
     serverOp('/server/install', 'Setting up server');
   });
-  $('ss-srv-start').addEventListener('click', function () { serverOp('/server/start', 'Starting server'); });
-  $('ss-srv-stop').addEventListener('click', function () { serverOp('/server/stop', 'Stopping server'); });
+  $('ss-srv-toggle').addEventListener('click', function () {
+    var running = lastServerStatus && lastServerStatus.running;
+    var label = $('ss-srv-toggle-label');
+    setBtnTone('ss-srv-toggle', 'amber');
+    $('ss-srv-toggle').classList.add('busy');
+    label.textContent = running ? 'Stopping…' : 'Starting…';
+    serverOp(running ? '/server/stop' : '/server/start',
+             running ? 'Stopping server' : 'Starting server')
+      .then(loadServerStatus)      // settle the toggle from real status, not optimism
+      .catch(loadServerStatus);
+  });
   $('ss-srv-uninstall').addEventListener('click', function () {
     if (!confirm('Remove the demucs server, its dependencies and all downloaded models?')) return;
     serverOp('/server/uninstall', 'Uninstalling server');
