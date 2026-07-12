@@ -325,31 +325,93 @@ def install_server(config_dir: Path, progress_cb: ProgressCB = None) -> dict:
     server_dir(config_dir).mkdir(parents=True, exist_ok=True)
     cache_dir(config_dir).mkdir(parents=True, exist_ok=True)
     target = pylibs_dir(config_dir)
-    target.mkdir(parents=True, exist_ok=True)
 
     download_source(config_dir, progress_cb)
 
+    # Start from a clean tree. `pip --target` does not treat the target as a real
+    # environment: it can't see what's already there when resolving, so re-installing
+    # over a previous (possibly inconsistent) tree just layers conflicts. Wheels come
+    # from pip's HTTP cache, so this is cheap to redo.
+    if target.exists():
+        _emit(progress_cb, "Clearing previous dependency tree…", 0.09, "Preparing")
+        shutil.rmtree(target, ignore_errors=True)
+    target.mkdir(parents=True, exist_ok=True)
+
     req = src_dir(config_dir) / "requirements.txt"
-    tgt = ["--target", str(target), "--upgrade", "--upgrade-strategy", "only-if-needed"]
-    # Each step is its own pip transaction, sharing the plugin's streaming installer
-    # (progress bar + actionable failure hints). Run with the app's own interpreter:
-    # pip --target needs neither venv nor ensurepip, so this works on the packaged
-    # Windows embeddable Python as well as the macOS/Linux standalone builds.
+    tgt = ["--target", str(target)]
+
+    # ONE resolve for everything that has dependencies. Splitting these across
+    # separate pip transactions is what broke the install: each transaction resolves
+    # on its own, so a later step upgraded numpy to 2.5 while numba (pulled in via
+    # torchcrepe -> resampy in an earlier step) requires numpy <= 2.4 - producing a
+    # tree that only failed at server start with "Numba needs NumPy 2.4 or less".
+    # Resolving together lets pip honour every constraint at once.
+    #
+    # demucs is the one exception and MUST stay --no-deps: its metadata pins
+    # torchaudio<2.1 (whisperx needs ~2.8) and drags in diffq, a C-extension with no
+    # wheels. It adds no transitive deps that way, so it can't perturb the resolve.
     steps: list[tuple[str, list[str], int]] = [
-        ("server requirements", tgt + ["-r", str(req)], 9),
-        # --no-deps is load-bearing: it keeps demucs from dragging in diffq (no
-        # wheel, needs a C++ compiler) and from downgrading torchaudio under whisperx.
+        ("server dependencies",
+         tgt + ["-r", str(req), *_DEMUCS_EXTRAS], 9 + len(_DEMUCS_EXTRAS)),
         ("demucs (no-deps)", tgt + ["--no-deps", "demucs"], 1),
-        ("demucs runtime deps", tgt + list(_DEMUCS_EXTRAS), len(_DEMUCS_EXTRAS)),
     ]
-    n = len(steps)
+    n = len(steps) + 1  # + the verify step
     for i, (label, args, count) in enumerate(steps):
         engine_install.stream_pip(sys.executable, args, label, progress_cb,
                                   base=0.12 + (i / n) * 0.86, span=0.86 / n, pkg_count=count)
 
     write_launcher(config_dir)
+    verify_install(config_dir, progress_cb)
+
     _emit(progress_cb, "Server installed.", 1.0, "Done")
     return server_status(config_dir)
+
+
+# Modules the server imports at start-up. Importing them here turns a broken
+# dependency resolve into a clear install-time error instead of a traceback the
+# first time the user hits Start.
+_VERIFY_IMPORTS = ("fastapi", "uvicorn", "torch", "soundfile",
+                   "torchcrepe", "demucs", "audio_separator")
+
+
+def verify_install(config_dir: Path, progress_cb: ProgressCB = None) -> None:
+    """Import-check the freshly installed tree.
+
+    Catches incompatible-pin breakage (e.g. numba vs numpy) at install time, with
+    the offending import named, rather than letting the server die on first start.
+    """
+    _emit(progress_cb, "Verifying the installed dependencies…", 0.96, "Verifying")
+    code = (
+        "import sys\n"
+        f"sys.path.insert(0, {str(pylibs_dir(config_dir))!r})\n"
+        f"mods = {list(_VERIFY_IMPORTS)!r}\n"
+        "bad = []\n"
+        "for m in mods:\n"
+        "    try:\n"
+        "        __import__(m)\n"
+        "    except Exception as e:\n"
+        "        bad.append('%s: %s' % (m, e))\n"
+        "print('VERIFY_FAILED:' + ' | '.join(bad) if bad else 'VERIFY_OK')\n"
+    )
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                          text=True, env=_server_env(config_dir), timeout=600)
+    out = (proc.stdout or "") + (proc.stderr or "")
+    if "VERIFY_OK" in out:
+        _emit(progress_cb, "Dependencies verified.", 0.99, "Verifying")
+        return
+
+    detail = ""
+    for line in out.splitlines():
+        if line.startswith("VERIFY_FAILED:"):
+            detail = line.split(":", 1)[1].strip()
+            break
+    if not detail:
+        detail = out.strip()[-400:]
+    raise RuntimeError(
+        "the server's dependencies installed but don't import cleanly - "
+        f"{detail}. Try 'Uninstall server' and install again; if it persists this is "
+        "a dependency-pin conflict worth reporting."
+    )
 
 
 def uninstall_server(config_dir: Path) -> dict:
