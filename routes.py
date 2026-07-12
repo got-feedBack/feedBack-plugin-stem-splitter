@@ -586,8 +586,12 @@ def setup(app: FastAPI, context: dict) -> None:
 
     @app.post(f"{P}/server/install")
     def post_server_install():
-        mgr.run_server_op("install", lambda cb: demucs_server.install_server(
-            mgr.config_dir, progress_cb=cb))
+        # One click = a server that actually works: dependencies AND model weights.
+        # Installing without the weights leaves a server that can't split until a
+        # second action, which is a confusing half-state.
+        port, device = _server_opts()
+        mgr.run_server_op("install", lambda cb: demucs_server.setup_server(
+            mgr.config_dir, port=port, device=device, progress_cb=cb))
         return {"ok": True, "started": "install"}
 
     @app.post(f"{P}/server/start")

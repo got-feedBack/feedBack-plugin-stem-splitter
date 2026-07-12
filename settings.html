@@ -89,8 +89,9 @@
 
   <h3 style="margin-top:1.75rem">Local demucs server</h3>
   <p class="ss-muted">Run got-feedBack's demucs/whisperx server on this machine. Once it's running the
-    plugin uses it automatically. Starting it is cheap — the big model download only happens when you
-    click <em>Prepare models</em>.</p>
+    plugin uses it automatically. <em>Install server + models</em> does the whole setup in one go
+    (dependencies, then the model weights) — it's the only thing that downloads anything. After that,
+    launching the app just loads the models from disk; it never downloads and never blocks startup.</p>
   <div class="ss-statusbar" id="ss-srv-chips"><span class="ss-chip off">Checking…</span></div>
   <p class="ss-note" id="ss-srv-note"></p>
 
@@ -114,11 +115,10 @@
   </div>
 
   <div class="row" style="margin-top:.6rem">
-    <button class="ss-btn" id="ss-srv-install" style="background:#2563eb;color:#fff;border:0;border-radius:7px;padding:.45rem .85rem;font-weight:600;cursor:pointer">Install server</button>
+    <button class="ss-btn" id="ss-srv-install" style="background:#2563eb;color:#fff;border:0;border-radius:7px;padding:.45rem .85rem;font-weight:600;cursor:pointer">Install server + models (~5 GB)</button>
     <button class="ss-btn" id="ss-srv-start" style="background:#16a34a;color:#fff;border:0;border-radius:7px;padding:.45rem .85rem;font-weight:600;cursor:pointer">Start</button>
     <button class="ss-btn" id="ss-srv-stop" style="background:rgba(148,163,184,.2);color:#e2e8f0;border:0;border-radius:7px;padding:.45rem .85rem;cursor:pointer">Stop</button>
     <button class="ss-btn" id="ss-srv-test" style="background:rgba(148,163,184,.2);color:#e2e8f0;border:0;border-radius:7px;padding:.45rem .85rem;cursor:pointer">Test status</button>
-    <button class="ss-btn" id="ss-srv-prepare" style="background:rgba(148,163,184,.2);color:#e2e8f0;border:0;border-radius:7px;padding:.45rem .85rem;cursor:pointer">Prepare models (~2 GB)</button>
     <button class="ss-btn" id="ss-srv-uninstall" style="background:#b91c1c;color:#fff;border:0;border-radius:7px;padding:.45rem .85rem;cursor:pointer">Uninstall server</button>
   </div>
 
@@ -343,7 +343,7 @@
   });
   // ── managed demucs server ──────────────────────────────────────────────────
   var SERVER_BTNS = ['ss-srv-install', 'ss-srv-start', 'ss-srv-stop', 'ss-srv-test',
-                     'ss-srv-prepare', 'ss-srv-uninstall'];
+                     'ss-srv-uninstall'];
   var serverManageable = true;   // false when the backend says it can't manage a server here
   function setServerButtons(disabled) {
     var d = disabled || !serverManageable;   // never re-enable an unsupported section
@@ -477,18 +477,15 @@
   }
 
   $('ss-srv-install').addEventListener('click', function () {
-    if (!confirm('Download and install the demucs server? This installs a few GB of Python packages.')) return;
-    serverOp('/server/install', 'Installing server');
+    if (!confirm('Set up the demucs server?\n\nThis downloads its Python dependencies '
+                 + '(~3 GB) and the model weights (~2 GB), then starts it. One time.')) return;
+    serverOp('/server/install', 'Setting up server');
   });
   $('ss-srv-start').addEventListener('click', function () { serverOp('/server/start', 'Starting server'); });
   $('ss-srv-stop').addEventListener('click', function () { serverOp('/server/stop', 'Stopping server'); });
   $('ss-srv-uninstall').addEventListener('click', function () {
     if (!confirm('Remove the demucs server, its dependencies and all downloaded models?')) return;
     serverOp('/server/uninstall', 'Uninstalling server');
-  });
-  $('ss-srv-prepare').addEventListener('click', function () {
-    if (!confirm('Download the model weights (~2 GB, one time)? The server will restart and warm up.')) return;
-    serverOp('/server/prepare_models', 'Preparing models');
   });
   $('ss-srv-test').addEventListener('click', function () {
     setServerButtons(true);

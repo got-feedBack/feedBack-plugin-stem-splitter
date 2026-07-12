@@ -523,6 +523,38 @@ def verify_install(config_dir: Path, progress_cb: ProgressCB = None) -> None:
     )
 
 
+def _scaled(progress_cb: ProgressCB, base: float, span: float) -> ProgressCB:
+    """Re-map a sub-step's 0..1 progress into a slice of the overall bar."""
+    if progress_cb is None:
+        return None
+
+    def cb(ev: dict) -> None:
+        pct = base + max(0.0, min(1.0, ev.get("pct", 0.0))) * span
+        progress_cb({**ev, "pct": max(0.0, min(1.0, pct))})
+    return cb
+
+
+def setup_server(config_dir: Path, port: int = DEFAULT_PORT, device: str = "",
+                 model: str = DEFAULT_MODEL, progress_cb: ProgressCB = None) -> dict:
+    """One-click setup: install the server AND download its models.
+
+    This is what the "Install server" button runs. Installing without the weights
+    leaves you with a server that can't actually split until a second, separate
+    action - so do the whole job in one explicit click, under one progress stream.
+    Still explicit: nothing here runs unless the user asks for it.
+    """
+    _emit(progress_cb, "Setting up the demucs server (dependencies, then models)…",
+          0.0, "Setting up")
+
+    # Dependencies take the bulk of the wall-clock, models the rest.
+    install_server(config_dir, progress_cb=_scaled(progress_cb, 0.0, 0.55))
+    prepare_models(config_dir, port=port, device=device, model=model,
+                   progress_cb=_scaled(progress_cb, 0.55, 0.45))
+
+    _emit(progress_cb, "Server installed, running and warmed up.", 1.0, "Done")
+    return server_status(config_dir)
+
+
 def uninstall_server(config_dir: Path) -> dict:
     """Stop the server and delete its source, dependency tree and downloaded weights."""
     try:
