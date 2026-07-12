@@ -98,9 +98,34 @@ def models_dir(config_dir: Path) -> Path:
 
 
 def _dir_size(p: Path) -> int:
+    """Best-effort byte total. Never raises — it's a display number.
+
+    This walks trees we do NOT own: external_caches() sizes the shared
+    ~/.cache/huggingface and ~/.cache/torch, and the engine dir is walked while an
+    install or uninstall may be running alongside. Files vanish mid-walk, and a cache
+    dir can hold something we can't stat. An OSError escaping here would 500
+    /engine_status and take the settings UI with it, over a number in a tooltip.
+    """
     if not p.exists():
         return 0
-    return sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
+    total = 0
+    try:
+        walk = p.rglob("*")
+        while True:
+            try:
+                f = next(walk)
+            except StopIteration:
+                break
+            except OSError:
+                continue   # unreadable subdir - skip it, keep walking
+            try:
+                if f.is_file():
+                    total += f.stat().st_size
+            except OSError:
+                continue   # vanished mid-walk, or not ours to stat
+    except OSError:
+        pass
+    return total
 
 
 def _installed_dist(edir: Path, module: str) -> bool:
