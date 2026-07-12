@@ -115,6 +115,11 @@ class JobManager:
             "local_server_device": "",   # "" = auto | cpu | cuda
             # None = decide at install time from whether an NVIDIA GPU is present.
             "local_server_gpu": None,
+            # Advanced: "" = use the built-in defaults. The ref pins which server
+            # revision gets installed; the CUDA tag picks the torch build (which one
+            # works is driver-dependent, so it has to be overridable).
+            "local_server_ref": "",
+            "local_server_cuda_tag": "",
         }
         try:
             data = json.loads(self.settings_file.read_text(encoding="utf-8"))
@@ -636,10 +641,17 @@ def setup(app: FastAPI, context: dict) -> None:
         # second action, which is a confusing half-state.
         port, device = _server_opts()
         gpu = _want_gpu(body)
+        st = mgr.read_settings()
+        # Advanced overrides; blank means "use the default".
+        ref = str((body or {}).get("ref") or st.get("local_server_ref") or "") or None
+        cuda_tag = str((body or {}).get("cuda_tag") or st.get("local_server_cuda_tag") or "") or None
         if not mgr.run_server_op("install", lambda cb: demucs_server.setup_server(
-                mgr.config_dir, port=port, device=device, gpu=gpu, progress_cb=cb)):
+                mgr.config_dir, port=port, device=device, gpu=gpu,
+                ref=ref, cuda_tag=cuda_tag, progress_cb=cb)):
             return _busy()
-        return {"ok": True, "started": "install", "gpu": gpu}
+        return {"ok": True, "started": "install", "gpu": gpu,
+                "ref": ref or demucs_server.DEFAULT_SOURCE_REF,
+                "cuda_tag": cuda_tag or demucs_server.DEFAULT_CUDA_TAG}
 
     @app.post(f"{P}/server/start")
     def post_server_start():

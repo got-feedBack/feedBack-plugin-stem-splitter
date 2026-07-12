@@ -62,7 +62,10 @@ SOURCE_REPO = "got-feedBack/feedBack-demucs-server"
 # Ref to install from. Resolved to an immutable commit SHA before download, so an
 # install is reproducible and we can report exactly what's on disk - a bare branch
 # zip is a moving target (the same click could install different code next week).
-SOURCE_REF = os.environ.get("STEM_SPLITTER_SERVER_REF", "main")
+# Default ref. Overridable per-install from the settings' Advanced section (and by
+# env for headless/CI use). Resolved to an immutable commit before download.
+DEFAULT_SOURCE_REF = os.environ.get("STEM_SPLITTER_SERVER_REF", "main")
+SOURCE_REF = DEFAULT_SOURCE_REF   # back-compat alias
 # The only files the server actually needs to run.
 SOURCE_FILES = ("server.py", "run_demucs.py", "run_roformer.py", "requirements.txt")
 
@@ -87,8 +90,16 @@ _DEMUCS_EXTRAS = ["einops", "julius", "lameenc", "openunmix", "pyyaml", "tqdm", 
 # No CUDA Toolkit install is needed: the wheels bundle the CUDA runtime. Only a
 # recent-enough NVIDIA driver is required.
 TORCH_VERSION = os.environ.get("STEM_SPLITTER_TORCH_VERSION", "2.8.0")
-CUDA_TAG = os.environ.get("STEM_SPLITTER_CUDA_TAG", "cu128")
-CUDA_INDEX = f"https://download.pytorch.org/whl/{CUDA_TAG}"
+DEFAULT_CUDA_TAG = os.environ.get("STEM_SPLITTER_CUDA_TAG", "cu128")
+CUDA_TAG = DEFAULT_CUDA_TAG   # back-compat alias
+# Builds PyTorch actually publishes. cu128 needs a recent driver; cu126/cu121 are the
+# fallbacks for older ones. Offered in the Advanced section because "which CUDA build
+# works" is driver-dependent and we can't reliably guess it.
+CUDA_TAGS = ["cu128", "cu126", "cu121"]
+
+
+def cuda_index(tag: str) -> str:
+    return f"https://download.pytorch.org/whl/{tag}"
 
 _gpu_memo: dict = {"t": 0.0, "val": None}
 _GPU_TTL = 60.0
@@ -367,7 +378,8 @@ def _resolve_commit(ref: str) -> str | None:
     return None
 
 
-def download_source(config_dir: Path, progress_cb: ProgressCB = None) -> None:
+def download_source(config_dir: Path, ref: str | None = None,
+                    progress_cb: ProgressCB = None) -> None:
     """Fetch the server source from GitHub (no `git` required) and extract the
     handful of files it needs.
 
@@ -379,11 +391,12 @@ def download_source(config_dir: Path, progress_cb: ProgressCB = None) -> None:
     sdir = src_dir(config_dir)
     sdir.mkdir(parents=True, exist_ok=True)
 
-    commit = _resolve_commit(SOURCE_REF)
-    archive = commit or SOURCE_REF
+    ref = (ref or DEFAULT_SOURCE_REF).strip() or DEFAULT_SOURCE_REF
+    commit = _resolve_commit(ref)
+    archive = commit or ref
     url = f"https://codeload.github.com/{SOURCE_REPO}/zip/{archive}"
     _emit(progress_cb,
-          f"Downloading server source {SOURCE_REF}"
+          f"Downloading server source {ref}"
           + (f" @ {commit[:8]}" if commit else " (unpinned - could not resolve a commit)"),
           0.02, "Downloading source")
 
@@ -406,7 +419,7 @@ def download_source(config_dir: Path, progress_cb: ProgressCB = None) -> None:
 
     try:
         (server_dir(config_dir) / "source.json").write_text(
-            json.dumps({"repo": SOURCE_REPO, "ref": SOURCE_REF, "commit": commit,
+            json.dumps({"repo": SOURCE_REPO, "ref": ref, "commit": commit,
                         "installed_at": time.time()}, indent=2), encoding="utf-8")
     except OSError as e:
         log.warning("stem_splitter: could not record installed source revision: %s", e)
@@ -498,7 +511,8 @@ def patch_driver_scripts(config_dir: Path) -> list[str]:
     return patched
 
 
-def install_server(config_dir: Path, gpu: bool = False,
+def install_server(config_dir: Path, gpu: bool = False, ref: str | None = None,
+                   cuda_tag: str | None = None,
                    progress_cb: ProgressCB = None) -> dict:
     """Download the source and install the server's dependencies (pip --target).
 
@@ -512,7 +526,7 @@ def install_server(config_dir: Path, gpu: bool = False,
     cache_dir(config_dir).mkdir(parents=True, exist_ok=True)
     target = pylibs_dir(config_dir)
 
-    download_source(config_dir, progress_cb)
+    download_source(config_dir, ref=ref, progress_cb=progress_cb)
 
     # Start from a clean tree. `pip --target` does not treat the target as a real
     # environment: it can't see what's already there when resolving, so re-installing
@@ -531,15 +545,16 @@ def install_server(config_dir: Path, gpu: bool = False,
     # (pip --target doesn't treat the target as an environment), which is exactly how
     # the numpy/numba conflict got in. The +cuXXX local tag only exists on PyTorch's
     # index, so pinning it forces the CUDA wheel instead of PyPI's CPU default.
+    tag = (cuda_tag or DEFAULT_CUDA_TAG).strip() or DEFAULT_CUDA_TAG
     gpu_args: list[str] = []
     if gpu:
         gpu_args = [
-            f"torch=={TORCH_VERSION}+{CUDA_TAG}",
-            f"torchaudio=={TORCH_VERSION}+{CUDA_TAG}",
-            "--extra-index-url", CUDA_INDEX,
+            f"torch=={TORCH_VERSION}+{tag}",
+            f"torchaudio=={TORCH_VERSION}+{tag}",
+            "--extra-index-url", cuda_index(tag),
         ]
         _emit(progress_cb,
-              f"GPU build requested: torch {TORCH_VERSION}+{CUDA_TAG} "
+              f"GPU build requested: torch {TORCH_VERSION}+{tag} "
               f"(~2.5 GB; no CUDA Toolkit needed, the wheel bundles the runtime)",
               0.10, "Preparing")
 
@@ -568,7 +583,8 @@ def install_server(config_dir: Path, gpu: bool = False,
     try:
         (server_dir(config_dir) / "install.json").write_text(json.dumps({
             "gpu": bool(gpu),
-            "torch": f"{TORCH_VERSION}+{CUDA_TAG}" if gpu else "cpu",
+            "torch": f"{TORCH_VERSION}+{tag}" if gpu else "cpu",
+            "cuda_tag": tag if gpu else None,
             "installed_at": time.time(),
         }, indent=2), encoding="utf-8")
     except OSError as e:
@@ -579,7 +595,7 @@ def install_server(config_dir: Path, gpu: bool = False,
     if patched:
         _emit(progress_cb, f"Bootstrapped {', '.join(patched)} to see the dependency tree.",
               0.95, "Preparing")
-    verify_install(config_dir, gpu=gpu, progress_cb=progress_cb)
+    verify_install(config_dir, gpu=gpu, cuda_tag=tag, progress_cb=progress_cb)
 
     _emit(progress_cb, "Server installed.", 1.0, "Done")
     return server_status(config_dir)
@@ -592,7 +608,7 @@ _VERIFY_IMPORTS = ("fastapi", "uvicorn", "torch", "soundfile",
                    "torchcrepe", "demucs", "audio_separator")
 
 
-def verify_install(config_dir: Path, gpu: bool = False,
+def verify_install(config_dir: Path, gpu: bool = False, cuda_tag: str | None = None,
                    progress_cb: ProgressCB = None) -> None:
     """Import-check the freshly installed tree.
 
@@ -629,7 +645,7 @@ def verify_install(config_dir: Path, gpu: bool = False,
     out = (proc.stdout or "") + (proc.stderr or "")
     if "VERIFY_OK" in out:
         if gpu:
-            _verify_cuda(config_dir, progress_cb)
+            _verify_cuda(config_dir, cuda_tag=cuda_tag, progress_cb=progress_cb)
         _emit(progress_cb, "Dependencies verified.", 0.99, "Verifying")
         return
 
@@ -660,6 +676,7 @@ def _scaled(progress_cb: ProgressCB, base: float, span: float) -> ProgressCB:
 
 def setup_server(config_dir: Path, port: int = DEFAULT_PORT, device: str = "",
                  model: str = DEFAULT_MODEL, gpu: bool = False,
+                 ref: str | None = None, cuda_tag: str | None = None,
                  progress_cb: ProgressCB = None) -> dict:
     """One-click setup: install the server AND download its models.
 
@@ -672,7 +689,8 @@ def setup_server(config_dir: Path, port: int = DEFAULT_PORT, device: str = "",
           0.0, "Setting up")
 
     # Dependencies take the bulk of the wall-clock, models the rest.
-    install_server(config_dir, gpu=gpu, progress_cb=_scaled(progress_cb, 0.0, 0.55))
+    install_server(config_dir, gpu=gpu, ref=ref, cuda_tag=cuda_tag,
+                   progress_cb=_scaled(progress_cb, 0.0, 0.55))
     prepare_models(config_dir, port=port, device=device, model=model,
                    progress_cb=_scaled(progress_cb, 0.55, 0.45))
 
@@ -915,7 +933,8 @@ def start_server(config_dir: Path, port: int = DEFAULT_PORT, device: str = "",
     raise RuntimeError(f"server did not answer /health on {url} within 20s")
 
 
-def _verify_cuda(config_dir: Path, progress_cb: ProgressCB = None) -> None:
+def _verify_cuda(config_dir: Path, cuda_tag: str | None = None,
+                 progress_cb: ProgressCB = None) -> None:
     """A GPU install that silently landed a CPU wheel is the whole bug we're fixing -
     so prove torch actually sees CUDA rather than trusting the pin."""
     code = (
@@ -934,7 +953,8 @@ def _verify_cuda(config_dir: Path, progress_cb: ProgressCB = None) -> None:
         raise RuntimeError(
             "a GPU build was requested but the installed torch has no CUDA support "
             f"(torch.version.cuda is None). The CPU wheel was resolved instead. Try a "
-            f"different CUDA build via STEM_SPLITTER_CUDA_TAG (current: {CUDA_TAG})."
+            f"different CUDA build in Advanced (tried: {cuda_tag or DEFAULT_CUDA_TAG}; "
+            f"options: {', '.join(CUDA_TAGS)})."
         )
     if avail.strip() != "True":
         _emit(progress_cb,
@@ -1166,6 +1186,9 @@ def server_status(config_dir: Path) -> dict:
         # A machine with a GPU but a CPU-only torch is the case worth surfacing.
         "gpu_detected": detect_nvidia_gpu(),
         "gpu_build": bool(install_info(config_dir).get("gpu")),
+        "install_info": install_info(config_dir),   # {gpu, torch, cuda_tag}
+        "defaults": {"ref": DEFAULT_SOURCE_REF, "cuda_tag": DEFAULT_CUDA_TAG,
+                     "cuda_tags": CUDA_TAGS, "repo": SOURCE_REPO},
         "manageable": manageable,
         "manage_reason": manage_reason,
         # Non-blocking note (e.g. "you're in a container") shown alongside the controls.

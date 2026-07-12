@@ -75,6 +75,24 @@
   margin-left: auto; font-size: .72rem; font-weight: 500; color: #94a3b8;
 }
 #ss-settings .ss-section p:first-of-type { margin-top: 0; }
+
+/* Advanced: collapsed by default — these are escape hatches, not everyday knobs. */
+#ss-settings .ss-adv {
+  margin-top: .9rem; border-top: 1px solid rgba(148,163,184,.15); padding-top: .6rem;
+}
+#ss-settings .ss-adv > summary {
+  cursor: pointer; font-size: .8rem; font-weight: 600; color: #94a3b8;
+  list-style: none; user-select: none;
+}
+#ss-settings .ss-adv > summary::-webkit-details-marker { display: none; }
+#ss-settings .ss-adv > summary::before { content: '▸ '; }
+#ss-settings .ss-adv[open] > summary::before { content: '▾ '; }
+#ss-settings .ss-adv > summary:hover { color: #cbd5e1; }
+#ss-settings .ss-adv .ss-adv-body { padding-top: .6rem; }
+#ss-settings code.ss-mono {
+  font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: rgba(148,163,184,.12); padding: .1rem .35rem; border-radius: 4px;
+}
 </style>
 
 <div class="stem-splitter-settings" id="ss-settings">
@@ -172,6 +190,27 @@
     <button class="ss-actionbtn grey" id="ss-srv-uninstall">Uninstall server</button>
   </div>
 
+  <details class="ss-adv" id="ss-srv-adv">
+    <summary>Advanced — pin a server revision / CUDA build</summary>
+    <div class="ss-adv-body">
+      <p class="ss-note" style="margin-top:0">Only needed if you're testing a specific server revision,
+        or if the default CUDA build doesn't match your driver. Changing these takes effect on the
+        <strong>next install</strong> — use <em>Uninstall server</em>, then install again.</p>
+
+      <div class="row">
+        <div>
+          <label for="ss-srv-ref">Server revision (branch, tag or commit)</label>
+          <input type="text" id="ss-srv-ref" placeholder="main" style="width:16rem">
+        </div>
+        <div>
+          <label for="ss-srv-cuda">CUDA build</label>
+          <select id="ss-srv-cuda"></select>
+        </div>
+      </div>
+      <p class="ss-note" id="ss-srv-adv-note"></p>
+    </div>
+  </details>
+
   <div id="ss-srv-progress" style="display:none;margin-top:.75rem">
     <div class="ss-row" style="justify-content:space-between">
       <strong id="ss-srv-phase" style="font-size:.85rem">Starting…</strong>
@@ -236,6 +275,8 @@
         $('ss-srv-gpu').checked = !!s.local_server_gpu;
         gpuTouched = true;
       }
+      $('ss-srv-ref').value = s.local_server_ref || '';
+      advCudaWanted = s.local_server_cuda_tag || '';
       // /config carries only the cheap install map now; the full status
       // (with the expensive cache-size walk) comes from /engine_status.
       renderStatus(null);
@@ -293,6 +334,8 @@
       local_server_autostart: $('ss-srv-autostart').checked,
       local_server_use_globally: $('ss-srv-global').checked,
       local_server_gpu: $('ss-srv-gpu').checked,
+      local_server_ref: $('ss-srv-ref').value.trim(),
+      local_server_cuda_tag: $('ss-srv-cuda').value,
     };
     j('/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
       .then(function () { $('ss-set-saved').textContent = 'Saved.'; setTimeout(function () { $('ss-set-saved').textContent = ''; }, 2000); });
@@ -443,6 +486,37 @@
 
   var lastServerStatus = null;
   var gpuTouched = false;   // did the user set the GPU box themselves?
+  var advCudaWanted = '';   // saved CUDA override, applied once the options exist
+
+  // Advanced is rendered from the backend's defaults, so the UI never hardcodes the
+  // ref or the list of CUDA builds.
+  function renderAdvanced(st) {
+    var sel = $('ss-srv-cuda'), note = $('ss-srv-adv-note');
+    if (!sel || !st || !st.defaults) return;
+    var d = st.defaults;
+
+    if (!sel.options.length) {
+      var opts = ['<option value="">Default (' + esc(d.cuda_tag) + ')</option>'];
+      (d.cuda_tags || []).forEach(function (t) {
+        opts.push('<option value="' + esc(t) + '">' + esc(t) + '</option>');
+      });
+      sel.innerHTML = opts.join('');
+      sel.value = advCudaWanted || '';
+    }
+    $('ss-srv-ref').placeholder = d.ref || 'main';
+
+    // Show what's actually on disk, so "pinned" isn't a claim you have to trust.
+    var bits = [];
+    var src = st.source || {}, inst = st.install_info || {};
+    if (src.commit) {
+      bits.push('installed: ' + esc(d.repo) + ' @ ' + esc(String(src.ref || '')) +
+                ' (' + esc(String(src.commit).slice(0, 8)) + ')');
+    }
+    if (inst.torch) bits.push('torch: ' + esc(inst.torch));
+    note.innerHTML = bits.length
+      ? bits.join(' · ')
+      : 'Nothing installed yet — these apply to the next install.';
+  }
 
   // The toggle's colour tracks the SERVER's state (red = down, green = up); its label
   // says what a click will do. Previously Start was always green and Stop always grey,
@@ -581,6 +655,7 @@
     bar.innerHTML = chips.join('');
     renderToggle(st);
     renderInstallBtn(st);
+    renderAdvanced(st);
 
     var notes = [];
     if (st.advisory) notes.push('⚠ ' + st.advisory);
