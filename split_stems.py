@@ -291,15 +291,21 @@ def _run_remote(mix: Path, out_dir: Path, model: str, server_url: str,
             log.warning("stem_splitter: stem URL %s is off-origin from %s - "
                         "downloading without the API key", url, server_url)
         sr = requests.get(url, headers=dl_headers, timeout=180)
-        if sr.status_code == 200:
-            # Trust the URL's own extension: roformer emits .flac, demucs .wav.
-            # (Hardcoding .wav mislabels flac stems.) Strip BOTH the query and any
-            # fragment first - ".flac#frag" would otherwise not match _AUDIO_EXTS and
-            # silently fall back to .wav.
-            clean = str(url).split("?", 1)[0].split("#", 1)[0]
-            suffix = Path(clean).suffix.lower()
-            ext = suffix if suffix in _AUDIO_EXTS else ".wav"
-            (result_dir / f"{_sanitize(name)}{ext}").write_bytes(sr.content)
+        # Skipping a failed download silently produced a pak that LOOKS split but is
+        # missing stems, and the job still reported success. Fail loudly instead so the
+        # user can retry.
+        if sr.status_code != 200:
+            raise RuntimeError(
+                f"stem download failed for '{name}': HTTP {sr.status_code} from {url}"
+            )
+        # Trust the URL's own extension: roformer emits .flac, demucs .wav.
+        # (Hardcoding .wav mislabels flac stems.) Strip BOTH the query and any
+        # fragment first - ".flac#frag" would otherwise not match _AUDIO_EXTS and
+        # silently fall back to .wav.
+        clean = str(url).split("?", 1)[0].split("#", 1)[0]
+        suffix = Path(clean).suffix.lower()
+        ext = suffix if suffix in _AUDIO_EXTS else ".wav"
+        (result_dir / f"{_sanitize(name)}{ext}").write_bytes(sr.content)
     return result_dir
 
 

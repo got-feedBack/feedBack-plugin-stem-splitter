@@ -799,6 +799,22 @@ def _server_env(config_dir: Path) -> dict:
     return env
 
 
+def _as_port(value, default: int | None = None) -> int | None:
+    """Coerce a persisted port to a usable int, else `default`.
+
+    The state file is JSON on disk: a truncated write or a hand-edit can leave
+    ``"port": "abc"``. A bare ``int()`` on that raises straight out of
+    ``server_status()`` / ``is_running()`` — i.e. out of /config, engine resolution
+    and every lifecycle route — 500ing the settings UI with no way for the user to
+    recover short of deleting the file by hand.
+    """
+    try:
+        p = int(value)
+    except (TypeError, ValueError):
+        return default
+    return p if 1 <= p <= 65535 else default
+
+
 def is_running(config_dir: Path, port: int | None = None) -> tuple[bool, int | None]:
     """(running, port). True if we own a live child, or if a previously-recorded
     port still answers /health (an orphan from a crashed app).
@@ -814,14 +830,16 @@ def is_running(config_dir: Path, port: int | None = None) -> tuple[bool, int | N
         p = _proc
     if p is not None and p.poll() is None:
         st = _read_state(config_dir)
-        return True, st.get("port", port)
+        return True, _as_port(st.get("port"), port)
 
     st = _read_state(config_dir)
-    known = st.get("port")   # NOT `port or ...`: only probe a port we actually started
+    # NOT `port or ...`: only probe a port we actually started. A garbage value in the
+    # state file means we have nothing trustworthy to probe -> not running.
+    known = _as_port(st.get("port"))
     if not known:
         return False, None
 
-    key = (str(config_dir), int(known))
+    key = (str(config_dir), known)
     now = time.monotonic()
     with _running_lock:
         hit = _running_memo.get(key)
@@ -1217,9 +1235,9 @@ def _model_ready(warmup: dict, model: str) -> bool:
 
 def server_status(config_dir: Path) -> dict:
     st = _read_state(config_dir)
-    port = int(st.get("port") or DEFAULT_PORT)
+    port = _as_port(st.get("port"), DEFAULT_PORT)
     running, live_port = is_running(config_dir, port)
-    port = int(live_port or port)
+    port = _as_port(live_port, port)
     url = url_for(port)
 
     health: dict = {}
