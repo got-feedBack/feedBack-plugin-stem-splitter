@@ -82,10 +82,16 @@
   <p class="ss-subtitle">Split stems and transcribe lyrics — using a server, or on this machine.</p>
 
   <section class="ss-section engines">
-    <h3>Engines <span class="ss-h-note">applies to the server AND the in-app engine</span></h3>
-    <p class="ss-note">“Server” means the <em>managed local demucs server</em> below whenever it's
-      running, otherwise whatever <code>demucs_server_url</code> points at. “In-app” runs the models
-      inside feedBack itself.</p>
+    <h3>Engines <span class="ss-h-note">which engine runs the work</span></h3>
+  <p class="ss-muted">Chooses <em>where</em> splitting and lyric transcription happen. Leave both on
+    <strong>Auto</strong> and it does the right thing: use the server below if it's running, otherwise
+    fall back to the in-app engine if you installed one.</p>
+  <p class="ss-note"><strong>“Server”</strong> = the managed local demucs server below whenever it's
+    running, otherwise whatever the app's <code>demucs_server_url</code> points at — so the same option
+    covers both. <strong>“In-app”</strong> = the models run inside the feedBack process itself.<br>
+    These settings apply to <em>both</em>: “Split model” is sent to the server <em>and</em> used by the
+    in-app audio-separator; “WhisperX model” is the one exception — only the in-app transcriber uses it,
+    the server has its own.</p>
 
   <label for="ss-set-split">Split engine</label>
   <select id="ss-set-split">
@@ -124,34 +130,16 @@
     <span id="ss-set-saved" class="ss-muted"></span></div>
   </section>
 
-  <section class="ss-section local">
-    <h3>Local engine <span class="ss-h-note">runs inside the app — opt-in download</span></h3>
-  <div class="ss-statusbar" id="ss-engine-chips"><span class="ss-chip off">Checking…</span></div>
-  <p class="ss-note" id="ss-engine-note"></p>
-  <div class="row">
-    <button class="ss-btn" id="ss-dl-all" style="background:#2563eb;color:#fff;border:0;border-radius:7px;padding:.45rem .85rem;font-weight:600;cursor:pointer">Download local engine + models (~2 GB+)</button>
-    <button class="ss-btn" id="ss-dl-as" style="background:rgba(148,163,184,.2);color:#e2e8f0;border:0;border-radius:7px;padding:.45rem .85rem;cursor:pointer">audio-separator only</button>
-    <button class="ss-btn" id="ss-dl-demucs" style="background:rgba(148,163,184,.2);color:#e2e8f0;border:0;border-radius:7px;padding:.45rem .85rem;cursor:pointer">demucs only</button>
-    <button class="ss-btn" id="ss-dl-wx" style="background:rgba(148,163,184,.2);color:#e2e8f0;border:0;border-radius:7px;padding:.45rem .85rem;cursor:pointer">whisperx only</button>
-    <button class="ss-btn" id="ss-uninstall" style="background:#b91c1c;color:#fff;border:0;border-radius:7px;padding:.45rem .85rem;cursor:pointer">Uninstall</button>
-  </div>
-  <div id="ss-install-progress" style="display:none;margin-top:.75rem">
-    <div class="ss-row" style="justify-content:space-between">
-      <strong id="ss-install-phase" style="font-size:.85rem">Starting…</strong>
-      <span id="ss-install-pct" class="ss-muted">0%</span>
-    </div>
-    <div class="ss-bar" style="width:100%;margin:.35rem 0"><i id="ss-install-fill" style="width:0%"></i></div>
-    <pre class="ss-log" id="ss-install-log" style="height:240px;max-height:240px;overflow:auto;margin:0;padding:.6rem;background:#0b1220;color:#94a3b8;border:1px solid rgba(148,163,184,.2);border-radius:6px;font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;word-break:break-word"></pre>
-  </div>
-
-  </section>
-
   <section class="ss-section server">
-    <h3>Local demucs server <span class="ss-h-note">a real server, managed for you</span></h3>
-  <p class="ss-muted">Run got-feedBack's demucs/whisperx server on this machine. Once it's running the
-    plugin uses it automatically. <em>Install server + models</em> does the whole setup in one go
-    (dependencies, then the model weights) — it's the only thing that downloads anything. After that,
-    launching the app just loads the models from disk; it never downloads and never blocks startup.</p>
+    <h3>Local demucs server <span class="ss-h-note">recommended — start here</span></h3>
+  <p class="ss-muted"><strong>The easiest way to get splitting working.</strong> Runs got-feedBack's real
+    demucs/whisperx server on this machine and manages it for you. <em>Install server + models</em> does
+    the whole setup in one click (dependencies, then the model weights) and starts it.</p>
+  <p class="ss-note">Once it's running, the plugin uses it automatically — nothing else to configure.
+    It can use your <strong>GPU</strong> (big speed-up: seconds instead of minutes), it runs in its own
+    process so it can't destabilise the app, and <em>Uninstall server</em> removes every byte it
+    downloaded. This is the only thing here that downloads anything; app startup never downloads and
+    is never blocked by it.</p>
   <div class="ss-statusbar" id="ss-srv-chips"><span class="ss-chip off">Checking…</span></div>
   <p class="ss-note" id="ss-srv-note"></p>
 
@@ -192,6 +180,34 @@
     <div class="ss-bar" style="width:100%;margin:.35rem 0"><i id="ss-srv-fill" style="width:0%"></i></div>
     <pre class="ss-log" id="ss-srv-log" style="height:240px;max-height:240px;overflow:auto;margin:0;padding:.6rem;background:#0b1220;color:#94a3b8;border:1px solid rgba(148,163,184,.2);border-radius:6px;font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;word-break:break-word"></pre>
   </div>
+  </section>
+
+  <section class="ss-section local">
+    <h3>Local engine <span class="ss-h-note">alternative — no server</span></h3>
+  <p class="ss-muted">Runs the models <strong>inside the feedBack process</strong> instead of talking to
+    a server. You don't need this if you're using the server above — it's a separate, second download.</p>
+  <p class="ss-note">Worth knowing: it's <strong>CPU-only</strong> (no CUDA install path, so it's slower
+    than the server on an NVIDIA machine), it loads multi-GB models into the app's own process, and its
+    weights land in the shared <code>~/.cache</code> — so <em>Uninstall</em> can't reclaim them all.
+    Prefer the server unless you specifically want to avoid running one.</p>
+  <div class="ss-statusbar" id="ss-engine-chips"><span class="ss-chip off">Checking…</span></div>
+  <p class="ss-note" id="ss-engine-note"></p>
+  <div class="row">
+    <button class="ss-btn" id="ss-dl-all" style="background:#2563eb;color:#fff;border:0;border-radius:7px;padding:.45rem .85rem;font-weight:600;cursor:pointer">Download local engine + models (~2 GB+)</button>
+    <button class="ss-btn" id="ss-dl-as" style="background:rgba(148,163,184,.2);color:#e2e8f0;border:0;border-radius:7px;padding:.45rem .85rem;cursor:pointer">audio-separator only</button>
+    <button class="ss-btn" id="ss-dl-demucs" style="background:rgba(148,163,184,.2);color:#e2e8f0;border:0;border-radius:7px;padding:.45rem .85rem;cursor:pointer">demucs only</button>
+    <button class="ss-btn" id="ss-dl-wx" style="background:rgba(148,163,184,.2);color:#e2e8f0;border:0;border-radius:7px;padding:.45rem .85rem;cursor:pointer">whisperx only</button>
+    <button class="ss-btn" id="ss-uninstall" style="background:#b91c1c;color:#fff;border:0;border-radius:7px;padding:.45rem .85rem;cursor:pointer">Uninstall</button>
+  </div>
+  <div id="ss-install-progress" style="display:none;margin-top:.75rem">
+    <div class="ss-row" style="justify-content:space-between">
+      <strong id="ss-install-phase" style="font-size:.85rem">Starting…</strong>
+      <span id="ss-install-pct" class="ss-muted">0%</span>
+    </div>
+    <div class="ss-bar" style="width:100%;margin:.35rem 0"><i id="ss-install-fill" style="width:0%"></i></div>
+    <pre class="ss-log" id="ss-install-log" style="height:240px;max-height:240px;overflow:auto;margin:0;padding:.6rem;background:#0b1220;color:#94a3b8;border:1px solid rgba(148,163,184,.2);border-radius:6px;font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;word-break:break-word"></pre>
+  </div>
+
   </section>
 </div>
 
