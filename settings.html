@@ -726,15 +726,25 @@
       body: JSON.stringify(body),
     }).then(function (r) { return r.json(); });
   }
+  var lastSyncedUrl = null;   // what we last wrote, so a poll doesn't rewrite it
   function syncGlobalUrl(st) {
     if (!$('ss-srv-global').checked || !st) return;
     if (st.running && st.url) {
-      appSettings({ demucs_server_url: st.url }).catch(function () {});
+      // renderServerStatus runs on every poll (every 5s while models warm), so writing
+      // unconditionally meant hammering the app's settings file - and its lock - with
+      // an identical value. Only write on an actual change.
+      if (st.url === lastSyncedUrl) return;
+      lastSyncedUrl = st.url;
+      appSettings({ demucs_server_url: st.url }).catch(function () { lastSyncedUrl = null; });
     } else {
       // Only clear it if it still points at OUR local server — never clobber a
       // remote URL the user set in the meantime.
+      if (lastSyncedUrl === null) return;   // nothing of ours to clear
+      var mine = lastSyncedUrl;
+      lastSyncedUrl = null;
       fetch('/api/settings').then(function (r) { return r.json(); }).then(function (cur) {
-        var mine = 'http://127.0.0.1:' + (st.port || 7865);
+        // Only clear it if it still points at OUR server - never clobber a remote URL
+        // the user set in the meantime.
         if (cur && cur.demucs_server_url === mine) appSettings({ demucs_server_url: '' });
       }).catch(function () {});
     }

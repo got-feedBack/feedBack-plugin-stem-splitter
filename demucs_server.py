@@ -200,6 +200,22 @@ _disk_lock = threading.Lock()
 _DISK_TTL = 30.0  # seconds
 
 
+def _dir_size(p: Path) -> int:
+    """Own it rather than importing engine_install's private helper - this module
+    fully controls how it sizes its own tree, and shouldn't break if that one is
+    refactored."""
+    if not p.exists():
+        return 0
+    total = 0
+    for f in p.rglob("*"):
+        try:
+            if f.is_file():
+                total += f.stat().st_size
+        except OSError:
+            continue   # vanished mid-walk (an install/uninstall running alongside)
+    return total
+
+
 def _server_disk_bytes(config_dir: Path) -> int:
     key = str(config_dir)
     now = time.monotonic()
@@ -207,7 +223,7 @@ def _server_disk_bytes(config_dir: Path) -> int:
         hit = _disk_memo.get(key)
         if hit and now - hit[0] < _DISK_TTL:
             return hit[1]
-    size = engine_install._dir_size(server_dir(config_dir))
+    size = _dir_size(server_dir(config_dir))
     with _disk_lock:
         _disk_memo[key] = (now, size)
     return size
