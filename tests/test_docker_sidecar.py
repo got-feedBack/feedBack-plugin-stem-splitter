@@ -114,6 +114,39 @@ class DockerHostParsing(unittest.TestCase):
             self.assertIsNone(ds.docker_host())
 
 
+class ImageRefParsing(unittest.TestCase):
+    """A naive rpartition(':') gets two perfectly valid forms wrong, and both are forms a
+    real deployment would use: a private registry (host:port) and a digest pin."""
+
+    def test_normal_tagged_ref(self):
+        self.assertEqual(ds.split_ref("ghcr.io/got-feedback/feedback-demucs-server:latest"),
+                         ("ghcr.io/got-feedback/feedback-demucs-server", "latest"))
+
+    def test_no_tag_defaults_to_latest(self):
+        self.assertEqual(ds.split_ref("busybox"), ("busybox", "latest"))
+
+    def test_registry_with_a_port_and_no_tag(self):
+        # The colon belongs to the PORT. rpartition would have given
+        # ("registry.local", "5000/repo") and the pull would fail bizarrely.
+        self.assertEqual(ds.split_ref("registry.local:5000/repo"),
+                         ("registry.local:5000/repo", "latest"))
+
+    def test_registry_with_a_port_and_a_tag(self):
+        self.assertEqual(ds.split_ref("registry.local:5000/repo:v2"),
+                         ("registry.local:5000/repo", "v2"))
+
+    def test_digest_pin(self):
+        # What a security-conscious deployment sets STEM_SPLITTER_SIDECAR_IMAGE to.
+        self.assertEqual(ds.split_ref("repo@sha256:abc123"), ("repo", "sha256:abc123"))
+
+    def test_digest_pin_with_registry(self):
+        self.assertEqual(ds.split_ref("ghcr.io/o/r@sha256:deadbeef"),
+                         ("ghcr.io/o/r", "sha256:deadbeef"))
+
+    def test_local_tag(self):
+        self.assertEqual(ds.split_ref("demucs-permfix:test"), ("demucs-permfix", "test"))
+
+
 class GpuRuntimeDetection(unittest.TestCase):
     """`" ".join(a_string)` spaces out every character, so the DefaultRuntime check used to
     be dead code — it could never match, silently hiding the GPU option."""

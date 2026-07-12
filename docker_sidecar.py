@@ -350,11 +350,33 @@ def image_exists(image: str) -> bool:
     return status == 200
 
 
+def split_ref(image: str) -> tuple[str, str]:
+    """Split an image reference into (name, tag-or-digest) the way Docker does.
+
+    A naive ``rpartition(":")`` gets two perfectly valid forms wrong:
+
+      * ``registry.local:5000/repo``  — the colon belongs to the REGISTRY PORT, not a tag.
+        Splitting on it yields name=``registry.local`` tag=``5000/repo``, and the pull fails
+        with something baffling. Anyone running a private registry hits this immediately.
+      * ``repo@sha256:abc…``          — a digest pin, which is exactly what a
+        security-conscious deployment would set STEM_SPLITTER_SIDECAR_IMAGE to. The ``:``
+        inside the digest gets treated as a tag separator.
+
+    The rule Docker uses: a colon is a tag separator only if it appears AFTER the last
+    slash (i.e. it's in the final path component, not in a ``host:port``).
+    """
+    if "@" in image:                      # digest pin wins; it can contain ':'
+        name, _, digest = image.partition("@")
+        return name, digest
+    colon = image.rfind(":")
+    if colon > image.rfind("/"):          # the colon is in the last path component -> a tag
+        return image[:colon], image[colon + 1:]
+    return image, "latest"
+
+
 def pull_image(image: str = DEFAULT_IMAGE, progress_cb: ProgressCB = None) -> None:
     """Pull the image. ~4.8 GB compressed — an explicit-click operation, never implicit."""
-    ref, _, tag = image.rpartition(":")
-    if not ref:                       # no tag given
-        ref, tag = image, "latest"
+    ref, tag = split_ref(image)
     q = urllib.parse.urlencode({"fromImage": ref, "tag": tag})
 
     # Docker reports progress PER LAYER, and a layer is downloaded and then extracted.
@@ -434,7 +456,6 @@ def _assert_port_is_ours(port: int, progress_cb: ProgressCB = None) -> None:
     name, and cannot run a managed local server in the first place.)
     """
     import json as _json
-    import urllib.error
     import urllib.request
 
     try:
