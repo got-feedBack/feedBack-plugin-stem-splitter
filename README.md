@@ -13,6 +13,10 @@ Three ways to run, picked in the plugin's **Settings**:
   for you. One click: **Install server + models (~5 GB)** downloads its dependencies
   and the model weights, then starts it. While it's running the plugin uses it
   automatically. See [Local demucs server](#local-demucs-server) below.
+- **Docker container** — if you run feedBack in Docker, the plugin can't install a server
+  on your host (a container can't start a process outside itself). Instead it gives you a
+  **compose snippet** to paste, or — if you've already mounted the Docker socket — starts
+  the server as a **sibling container** in one click. See [Docker](#docker) below.
 - **Remote** — posts audio to a demucs/whisperx server you already run
   (`demucs_server_url` in the app settings). No local dependencies. Split model
   defaults to **`bs_roformer_sw`**.
@@ -103,17 +107,66 @@ CUDA build with `STEM_SPLITTER_CUDA_TAG` (e.g. `cu126`) if `cu128` doesn't suit 
 
 Needs `pip` and a writable config dir — no `venv` (the packaged Windows app bundles the
 embeddable Python, which has none). If the server can't be managed on your setup, the
-section disables itself and explains why. In Docker the plugin and server share the
-container, so it works, but it's usually CPU-only — running the demucs-server container
-separately and pointing `demucs_server_url` at it is often the better option.
+section disables itself and explains why.
+
+**Running feedBack in Docker?** This in-process install still works (the plugin and server
+share the container), but it's usually CPU-only and it fattens your config volume. Use the
+Docker section instead — see below.
+
+## Docker
+
+A containerized feedBack **cannot install the server on its host.** That's a namespace
+boundary, not a missing feature: a process can only fork children into its *own*
+namespaces, so there is no way for code inside a container to start something outside it.
+
+So Settings offers Docker users the two things that *are* possible. The card only appears
+when you're in a container or a Docker daemon is reachable.
+
+### 1. Compose service — recommended
+
+Copy the generated service into the `docker-compose.yml` you already have, then
+`docker compose up -d`. That's it — the plugin finds the server automatically.
+
+This needs no daemon access and grants nobody root on your host, which is why it's the one
+we recommend.
+
+### 2. One-click — only if you've already mounted the Docker socket
+
+If `/var/run/docker.sock` is mounted into the feedBack container (Portainer users often do
+this), the plugin can pull the image and start the server as a **sibling container** for
+you: a real container on the real host, with real GPU access, and no Python on the host.
+
+> **The Docker socket is root-equivalent on the host.** The plugin never mounts it, never
+> asks you to, and never enables it — it only *uses* one you have already chosen to expose.
+> If that's not a trade you want, use the compose snippet; the result is identical.
+
+### GPU in Docker
+
+Needs an NVIDIA driver **and** `nvidia-container-toolkit` on the **host**, and Linux or
+Windows/WSL2. **macOS cannot pass a GPU into a container at all** — Docker there is a Linux
+VM with no GPU passthrough, so it's always CPU.
+
+The plugin only offers the GPU option when the *daemon* reports an `nvidia` runtime;
+otherwise it says why rather than ticking a box that silently runs on CPU.
+
+### Notes
+
+- The container is published on **port 7866**, not 7865 — 7865 is the managed *local*
+  server's port, and you may legitimately run both. (On Windows that collision does not
+  even fail: both bind, and requests silently go to the wrong server. Hence the separation.)
+- Model weights live in a **named volume** and survive Stop, restarts, and container
+  removal — stopping the server does not cost you a 1.5 GB re-download.
+- Memory: a `bs_roformer_sw` split peaks around **6 GB**. Docker Desktop's default VM may be
+  smaller than that; if the container dies mid-split and restarts, raise its memory limit.
 
 ## Surfaces
 
 - A **Stem Splitter** nav screen: job queue/dashboard, batch actions, missing lists.
 - Per-song **Split stems** / **Transcribe lyrics** actions on the v3 song cards
   (registered via `libraryCardActions`).
-- A **Settings** panel: engine selection, the local engine installer, and the managed
-  demucs server.
+- A **Settings** panel: engine selection, the managed demucs server, the local engine
+  installer, and — in Docker, or wherever a Docker daemon is reachable — the container
+  card (compose snippet + one-click).
 
 Target Host: feedBack desktop with the v3 UI (`window.feedBack.uiVersion === 'v3'`).
 
