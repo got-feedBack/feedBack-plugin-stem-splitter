@@ -149,7 +149,7 @@
   </section>
 
   <section class="ss-section server">
-    <h3>Local demucs server <span class="ss-h-note">recommended — start here</span></h3>
+    <h3>Local demucs server <span class="ss-h-note" id="ss-srv-saved">recommended — start here</span></h3>
   <p class="ss-muted"><strong>The easiest way to get splitting working.</strong> Runs got-feedBack's real
     demucs/whisperx server on this machine and manages it for you. <em>Install server + models</em> does
     the whole setup in one click (dependencies, then the model weights) and starts it.</p>
@@ -329,14 +329,8 @@
       remote_model: $('ss-set-remote-model').value,
       whisperx_model: $('ss-set-wx-model').value,
       language: $('ss-set-lang').value,
-      local_server_port: parseInt($('ss-srv-port').value, 10) || 7865,
-      local_server_device: $('ss-srv-device').value,
-      local_server_autostart: $('ss-srv-autostart').checked,
-      local_server_use_globally: $('ss-srv-global').checked,
-      local_server_gpu: $('ss-srv-gpu').checked,
-      local_server_ref: $('ss-srv-ref').value.trim(),
-      local_server_cuda_tag: $('ss-srv-cuda').value,
     };
+    // The server card saves itself (see saveServerSettings) - don't duplicate its keys here.
     j('/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
       .then(function () { $('ss-set-saved').textContent = 'Saved.'; setTimeout(function () { $('ss-set-saved').textContent = ''; }, 2000); });
   }
@@ -469,6 +463,47 @@
     }).finally(function () { setEngineButtons(false); });
   });
   // ── managed demucs server ──────────────────────────────────────────────────
+  // These controls sit in their own card, away from the Engines "Save" button, so a
+  // user reasonably expects them to stick on their own. They used to be dropped on
+  // reload unless you happened to press a Save button in a different section.
+  var srvSaveTimer = null;
+  var SRV_FIELDS = ['ss-srv-autostart', 'ss-srv-global', 'ss-srv-gpu',
+                    'ss-srv-port', 'ss-srv-device', 'ss-srv-ref', 'ss-srv-cuda'];
+
+  function saveServerSettings() {
+    // POST /config merges only the keys present, so a partial body is safe.
+    var body = {
+      local_server_port: parseInt($('ss-srv-port').value, 10) || 7865,
+      local_server_device: $('ss-srv-device').value,
+      local_server_autostart: $('ss-srv-autostart').checked,
+      local_server_use_globally: $('ss-srv-global').checked,
+      local_server_gpu: $('ss-srv-gpu').checked,
+      local_server_ref: $('ss-srv-ref').value.trim(),
+      local_server_cuda_tag: $('ss-srv-cuda').value,
+    };
+    return j('/config', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }).then(function () {
+      var el = $('ss-srv-saved');
+      if (!el) return;
+      var prev = el.textContent;
+      el.textContent = 'Saved ✓';
+      setTimeout(function () { el.textContent = prev; }, 1500);
+    }).catch(function () {});
+  }
+
+  function queueServerSave() {
+    if (srvSaveTimer) clearTimeout(srvSaveTimer);
+    srvSaveTimer = setTimeout(function () { srvSaveTimer = null; saveServerSettings(); }, 400);
+  }
+
+  SRV_FIELDS.forEach(function (id) {
+    var el = $(id);
+    if (!el) return;
+    el.addEventListener('change', queueServerSave);
+    if (el.tagName === 'INPUT' && el.type === 'text') el.addEventListener('input', queueServerSave);
+  });
   var SERVER_BTNS = ['ss-srv-install', 'ss-srv-toggle', 'ss-srv-test', 'ss-srv-uninstall'];
   var serverManageable = true;   // false when the backend says it can't manage a server here
   var serverBusy = false;        // an install/start/stop/prepare is in flight
