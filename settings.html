@@ -731,7 +731,27 @@
       body: JSON.stringify(body),
     }).then(function (r) { return r.json(); });
   }
-  var lastSyncedUrl = null;   // what we last wrote, so a poll doesn't rewrite it
+  // What we last wrote into the app's demucs_server_url, PERSISTED.
+  //
+  // It has to survive a reload. The clear-on-untoggle path may only clear a value it
+  // knows it wrote (otherwise it would clobber a remote URL the user set), and an
+  // in-memory-only record forced it to guess "the server's current url" instead. That
+  // guess is wrong precisely when it matters: the port is user-configurable, so after
+  // changing it (or reinstalling on a different port) the CURRENT url no longer equals
+  // the one we wrote, and the stale value would be left pointing the whole app at a
+  // server that is no longer there — with no way to clear it from the UI.
+  var SYNCED_KEY = 'stem_splitter.global_url';
+  function loadSyncedUrl() {
+    try { return window.localStorage.getItem(SYNCED_KEY) || null; } catch (e) { return null; }
+  }
+  function saveSyncedUrl(url) {
+    try {
+      if (url) window.localStorage.setItem(SYNCED_KEY, url);
+      else window.localStorage.removeItem(SYNCED_KEY);
+    } catch (e) { /* private mode / quota - degrades to in-memory only */ }
+  }
+  var lastSyncedUrl = loadSyncedUrl();   // what we last wrote, so a poll doesn't rewrite it
+
   function syncGlobalUrl(st) {
     if (!st) return;
     // Turning the toggle OFF has to UNDO the write, not just stop making new ones —
@@ -742,24 +762,30 @@
       // unconditionally meant hammering the app's settings file - and its lock - with
       // an identical value. Only write on an actual change.
       if (st.url === lastSyncedUrl) return;
+      // The url CHANGED (e.g. the user moved the port) while we own the global setting:
+      // clear the old one first, or it leaks — nothing else remembers it.
+      if (lastSyncedUrl) clearGlobalUrl(st, lastSyncedUrl);
       lastSyncedUrl = st.url;
+      saveSyncedUrl(st.url);
       clearedUrl = null;
-      appSettings({ demucs_server_url: st.url }).catch(function () { lastSyncedUrl = null; });
+      appSettings({ demucs_server_url: st.url }).catch(function () {
+        lastSyncedUrl = null; saveSyncedUrl(null);
+      });
     } else {
       clearGlobalUrl(st);
     }
   }
 
-  // Clear the app-level demucs_server_url — but ONLY if it still points at our local
-  // server, so we never clobber a remote URL the user set in the meantime.
-  // `lastSyncedUrl` is in-memory, so after a reload we have no record of having written
-  // it; fall back to the server's own URL, which is the only value we would ever have
-  // written anyway.
+  // Clear the app-level demucs_server_url — but ONLY if it still points at the URL WE
+  // wrote, so we never clobber a remote URL the user set in the meantime.
   var clearedUrl = null;      // don't re-clear the same URL on every 5s poll
-  function clearGlobalUrl(st) {
-    var mine = lastSyncedUrl || (st && st.url) || null;
+  function clearGlobalUrl(st, explicitUrl) {
+    // Prefer the persisted record of what we actually wrote. Fall back to the server's
+    // current url only when we have no record at all (first run, or localStorage
+    // unavailable) — it is a guess, and a wrong one once the port has changed.
+    var mine = explicitUrl || lastSyncedUrl || loadSyncedUrl() || (st && st.url) || null;
     if (!mine || mine === clearedUrl) return;
-    lastSyncedUrl = null;
+    if (!explicitUrl) { lastSyncedUrl = null; saveSyncedUrl(null); }
     clearedUrl = mine;
     fetch('/api/settings').then(function (r) { return r.json(); }).then(function (cur) {
       if (cur && cur.demucs_server_url === mine) appSettings({ demucs_server_url: '' });

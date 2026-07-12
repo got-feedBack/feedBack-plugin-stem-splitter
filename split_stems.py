@@ -106,6 +106,30 @@ def _normalize_stem_id(raw_name: str) -> str | None:
     return None
 
 
+def _origin(url: str) -> tuple[str, str, int | None] | None:
+    """(scheme, host, port) with the DEFAULT port made explicit, or None if unparseable.
+
+    Comparing raw netlocs is wrong: `https://h` and `https://h:443` are the same origin
+    but different strings, so a server that hands back an explicit default port would
+    have its own download URL treated as third-party and the API key withheld — breaking
+    an authenticated download for no reason. Normalize instead of string-matching.
+
+    Uses .hostname (not .netloc), which also strips any `user:pass@` — so
+    `http://good.example.com@evil.com/` correctly resolves to host `evil.com`.
+    """
+    from urllib.parse import urlsplit
+    try:
+        s = urlsplit(str(url))
+        port = s.port                       # raises ValueError on a bad port
+    except ValueError:
+        return None
+    scheme = (s.scheme or "").lower()
+    host = (s.hostname or "").lower()
+    if port is None:
+        port = {"http": 80, "https": 443}.get(scheme)
+    return (scheme, host, port)
+
+
 def _same_origin(url: str, server_url: str) -> bool:
     """Is `url` on the same scheme+host+port as the configured server?
 
@@ -126,7 +150,8 @@ def _same_origin(url: str, server_url: str) -> bool:
     #                                onto server_url, so they aren't ours either.
     if not a.scheme and not a.netloc:
         return str(url).startswith("/") and not str(url).startswith("//")
-    return (a.scheme, a.netloc) == (b.scheme, b.netloc)
+    oa, ob = _origin(url), _origin(server_url)
+    return oa is not None and ob is not None and oa == ob
 
 
 def _module_cmd(engine_dir: str | None, module: str, argv: list[str]) -> list[str]:

@@ -81,6 +81,40 @@ class SameOriginRefuses(unittest.TestCase):
             self.assertFalse(ss._same_origin(url, SERVER), url)
 
 
+class DefaultPortsAreTheSameOrigin(unittest.TestCase):
+    """`https://h` and `https://h:443` are the SAME origin, but different netloc strings.
+
+    Comparing raw netlocs meant a server that returned its own download URL with an
+    explicit default port had that URL treated as third-party — the key was withheld and
+    the authenticated download broke, for no reason.
+    """
+
+    def test_https_explicit_443(self):
+        s = "https://split.example.com"
+        self.assertTrue(ss._same_origin("https://split.example.com:443/download/x/v.flac", s))
+
+    def test_https_server_declared_with_443(self):
+        s = "https://split.example.com:443"
+        self.assertTrue(ss._same_origin("https://split.example.com/download/x/v.flac", s))
+
+    def test_http_explicit_80(self):
+        self.assertTrue(ss._same_origin("http://h.example.com:80/x", "http://h.example.com"))
+
+    def test_host_case_is_insensitive(self):
+        self.assertTrue(ss._same_origin("http://H.Example.COM/x", "http://h.example.com"))
+
+    def test_default_port_does_not_bridge_schemes(self):
+        # 443 is https' default, NOT http's - these are still different origins.
+        self.assertFalse(ss._same_origin("http://h.example.com:443/x", "https://h.example.com"))
+
+    def test_a_real_different_port_still_differs(self):
+        self.assertFalse(ss._same_origin("http://127.0.0.1:9999/x", SERVER))
+
+    def test_bad_port_is_not_ours(self):
+        # urlsplit raises on a non-numeric port; must not blow up, must not authenticate.
+        self.assertFalse(ss._same_origin("http://127.0.0.1:notaport/x", SERVER))
+
+
 class SameOriginServerUrlForms(unittest.TestCase):
     def test_https_server(self):
         s = "https://split.example.com"
