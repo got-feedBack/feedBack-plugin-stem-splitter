@@ -78,9 +78,20 @@
         toast('Cancelled', 'Models are needed before this can run.');
         return res;
       }
-      state.pendingAfterSetup.push({ kind: kind, body: body });
+      // Keep a handle on THIS entry: if the prepare_models request is refused or
+      // fails we have to remove exactly the job we just queued. pop() would remove
+      // whatever is last, which is the wrong one if another enqueue landed while our
+      // request was in flight.
+      var entry = { kind: kind, body: body };
+      state.pendingAfterSetup.push(entry);
       savePending();
       connectWS();
+
+      function dropEntry() {
+        var i = state.pendingAfterSetup.indexOf(entry);
+        if (i !== -1) state.pendingAfterSetup.splice(i, 1);
+        savePending();
+      }
       // Several songs can hit needs_setup at once (a batch, or rapid clicks).
       // Only ever kick off ONE model download — the rest just queue behind it.
       if (state.preparingModels) {
@@ -95,8 +106,7 @@
         // that op never started. So undo the optimism and say why.
         if (r && r.ok === false) {
           state.preparingModels = false;
-          state.pendingAfterSetup.pop();   // this job won't be flushed by anything
-          savePending();
+          dropEntry();   // remove exactly the job we queued, not whatever is last
           toast('Server busy', (r.message || 'Another server operation is running.')
                                + ' Try again when it finishes.', 'warn');
           return res;
@@ -105,8 +115,7 @@
         return res;
       }).catch(function (e) {
         state.preparingModels = false;
-        state.pendingAfterSetup.pop();
-        savePending();
+        dropEntry();
         toast('Could not start model download', String(e), 'warn');
         return res;
       });

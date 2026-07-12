@@ -117,12 +117,15 @@ def _same_origin(url: str, server_url: str) -> bool:
         a, b = urlparse(str(url)), urlparse(server_url)
     except ValueError:
         return False
-    # Only a URL with NEITHER scheme nor netloc is truly relative (i.e. one we
-    # rewrote onto server_url ourselves). Testing netloc alone is not enough:
-    # "https:evil.com/steal" parses as scheme=https, netloc='' - it is NOT relative,
-    # and treating it as such would hand the API key to evil.com.
+    # "Relative" means exactly one thing here: an absolute PATH that the caller
+    # rewrites onto server_url (it only does that for a leading "/"). Anything else is
+    # not ours, and the key must not ride along:
+    #   * "https:evil.com/steal"  -> scheme set, netloc empty. NOT relative.
+    #   * "//evil.com/steal"      -> netloc set (scheme inherited). NOT relative.
+    #   * "::::" / "download/x"   -> no scheme, no netloc, but we never rewrite these
+    #                                onto server_url, so they aren't ours either.
     if not a.scheme and not a.netloc:
-        return True
+        return str(url).startswith("/") and not str(url).startswith("//")
     return (a.scheme, a.netloc) == (b.scheme, b.netloc)
 
 
