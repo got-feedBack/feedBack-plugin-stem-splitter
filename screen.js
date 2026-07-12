@@ -88,11 +88,25 @@
         return res;
       }
       state.preparingModels = true;
-      return api('/server/prepare_models', { method: 'POST' }).then(function () {
+      return api('/server/prepare_models', { method: 'POST' }).then(function (r) {
+        // The backend serialises server ops, so this can be REFUSED if one is already
+        // running. Swallowing that would leave preparingModels stuck true and strand
+        // the pending queue forever — reconcile only settles a prepare_models op, and
+        // that op never started. So undo the optimism and say why.
+        if (r && r.ok === false) {
+          state.preparingModels = false;
+          state.pendingAfterSetup.pop();   // this job won't be flushed by anything
+          savePending();
+          toast('Server busy', (r.message || 'Another server operation is running.')
+                               + ' Try again when it finishes.', 'warn');
+          return res;
+        }
         toast('Downloading models', 'This is a one-time ~2 GB download.');
         return res;
       }).catch(function (e) {
         state.preparingModels = false;
+        state.pendingAfterSetup.pop();
+        savePending();
         toast('Could not start model download', String(e), 'warn');
         return res;
       });

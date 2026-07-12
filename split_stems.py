@@ -207,6 +207,10 @@ def _run_remote(mix: Path, out_dir: Path, model: str, server_url: str,
             )
         if resp.status_code != 503:
             break
+        if attempt == _BUSY_RETRIES - 1:
+            # Last attempt: don't sleep (nobody is going to retry after it) and don't
+            # close the response - the error path below needs to read resp.text.
+            break
         # We're going to retry: release the connection back to the pool instead of
         # holding it open across the backoff (a batch split would otherwise pin one
         # connection per in-flight retry).

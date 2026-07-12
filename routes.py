@@ -28,6 +28,20 @@ INSTRUMENT_STEM_IDS = ["guitar", "bass", "drums", "vocals", "other", "piano"]
 _BROADCAST_MIN_INTERVAL = 0.15  # s — throttle progress spam
 
 
+def _as_port(value) -> int:
+    """Port from settings, tolerant of a hand-edited or corrupted file.
+
+    A bare int() here would raise on a bad value and take out engine resolution and
+    every managed-server endpoint with it - leaving the user no way to fix the setting
+    through the very UI that's now broken.
+    """
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        return demucs_server.DEFAULT_PORT
+    return port if 1 <= port <= 65535 else demucs_server.DEFAULT_PORT
+
+
 class JobCanceled(Exception):
     """Raised by a job's cancel checkpoint so an in-flight split/transcribe
     unwinds cleanly and the worker marks it ``canceled`` (not ``failed``)."""
@@ -154,9 +168,9 @@ class JobManager:
     def local_server_url(self) -> str | None:
         """URL of the plugin-managed local server, if it's actually running."""
         s = self.read_settings()
-        port = int(s.get("local_server_port") or demucs_server.DEFAULT_PORT)
+        port = _as_port(s.get("local_server_port"))
         running, live_port = demucs_server.is_running(self.config_dir, port)
-        return demucs_server.url_for(int(live_port or port)) if running else None
+        return demucs_server.url_for(_as_port(live_port or port)) if running else None
 
     def _server_url(self) -> str | None:
         """Split server URL (demucs/roformer).
@@ -597,7 +611,7 @@ def setup(app: FastAPI, context: dict) -> None:
     # ── managed demucs server ────────────────────────────────────────────────
     def _server_opts() -> tuple[int, str]:
         s = mgr.read_settings()
-        port = int(s.get("local_server_port") or demucs_server.DEFAULT_PORT)
+        port = _as_port(s.get("local_server_port"))
         device = str(s.get("local_server_device") or "")
         return port, device
 
