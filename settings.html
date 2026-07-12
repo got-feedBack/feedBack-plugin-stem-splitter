@@ -477,10 +477,15 @@
       local_server_device: $('ss-srv-device').value,
       local_server_autostart: $('ss-srv-autostart').checked,
       local_server_use_globally: $('ss-srv-global').checked,
-      local_server_gpu: $('ss-srv-gpu').checked,
       local_server_ref: $('ss-srv-ref').value.trim(),
       local_server_cuda_tag: $('ss-srv-cuda').value,
     };
+    // local_server_gpu is TRI-state: null means "auto-detect at install time", and
+    // renderServerStatus pre-checks the box for a detected GPU without the user asking.
+    // Sending the checkbox unconditionally would launder that hint into an explicit
+    // `true` the first time ANY other field on this card is touched, permanently
+    // disabling auto-detection. Only send it once the user has actually set it.
+    if (gpuTouched) body.local_server_gpu = $('ss-srv-gpu').checked;
     return j('/config', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
@@ -728,26 +733,37 @@
   }
   var lastSyncedUrl = null;   // what we last wrote, so a poll doesn't rewrite it
   function syncGlobalUrl(st) {
-    if (!$('ss-srv-global').checked || !st) return;
+    if (!st) return;
+    // Turning the toggle OFF has to UNDO the write, not just stop making new ones —
+    // bailing out here left the whole app still pointed at our local server.
+    if (!$('ss-srv-global').checked) return clearGlobalUrl(st);
     if (st.running && st.url) {
       // renderServerStatus runs on every poll (every 5s while models warm), so writing
       // unconditionally meant hammering the app's settings file - and its lock - with
       // an identical value. Only write on an actual change.
       if (st.url === lastSyncedUrl) return;
       lastSyncedUrl = st.url;
+      clearedUrl = null;
       appSettings({ demucs_server_url: st.url }).catch(function () { lastSyncedUrl = null; });
     } else {
-      // Only clear it if it still points at OUR local server — never clobber a
-      // remote URL the user set in the meantime.
-      if (lastSyncedUrl === null) return;   // nothing of ours to clear
-      var mine = lastSyncedUrl;
-      lastSyncedUrl = null;
-      fetch('/api/settings').then(function (r) { return r.json(); }).then(function (cur) {
-        // Only clear it if it still points at OUR server - never clobber a remote URL
-        // the user set in the meantime.
-        if (cur && cur.demucs_server_url === mine) appSettings({ demucs_server_url: '' });
-      }).catch(function () {});
+      clearGlobalUrl(st);
     }
+  }
+
+  // Clear the app-level demucs_server_url — but ONLY if it still points at our local
+  // server, so we never clobber a remote URL the user set in the meantime.
+  // `lastSyncedUrl` is in-memory, so after a reload we have no record of having written
+  // it; fall back to the server's own URL, which is the only value we would ever have
+  // written anyway.
+  var clearedUrl = null;      // don't re-clear the same URL on every 5s poll
+  function clearGlobalUrl(st) {
+    var mine = lastSyncedUrl || (st && st.url) || null;
+    if (!mine || mine === clearedUrl) return;
+    lastSyncedUrl = null;
+    clearedUrl = mine;
+    fetch('/api/settings').then(function (r) { return r.json(); }).then(function (cur) {
+      if (cur && cur.demucs_server_url === mine) appSettings({ demucs_server_url: '' });
+    }).catch(function () {});
   }
 
   function serverOpBody(path, label, body) {
@@ -773,6 +789,7 @@
   }
 
   $('ss-srv-gpu').addEventListener('change', function () { gpuTouched = true; });
+  $('ss-srv-global').addEventListener('change', function () { syncGlobalUrl(lastServerStatus); });
 
   function serverOp(path, label) {
     setServerButtons(true);

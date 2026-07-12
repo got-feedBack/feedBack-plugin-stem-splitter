@@ -35,10 +35,22 @@
       state.pendingAfterSetup = Array.isArray(arr) ? arr : [];
     } catch (e) { state.pendingAfterSetup = []; }
   }
+  var warnedPersist = false;
   function savePending() {
     try {
       window.localStorage.setItem(PENDING_KEY, JSON.stringify(state.pendingAfterSetup));
-    } catch (e) {}
+    } catch (e) {
+      // The queue IS the "starts automatically after the download, even across a
+      // reload" promise. If it can't be persisted (quota, storage disabled), the jobs
+      // still run in this page life — but say so rather than quietly breaking the
+      // promise. QuotaExceeded on a big batch is the realistic case.
+      console.warn('[stem_splitter] could not persist pending queue', e);
+      if (warnedPersist) return;   // savePending runs on every enqueue - warn once
+      warnedPersist = true;
+      toast('Queue not saved',
+            'These jobs will still start when the download finishes, but they '
+            + 'will be lost if you reload the page first.', 'warn');
+    }
   }
 
   function $(id) { return document.getElementById(id); }
