@@ -592,6 +592,19 @@ def install_server(config_dir: Path, gpu: bool = False, ref: str | None = None,
     if target.exists():
         _emit(progress_cb, "Clearing previous dependency tree…", 0.09, "Preparing")
         shutil.rmtree(target, ignore_errors=True)
+        # ignore_errors hides the failure, not the consequence: a locked .pyd (a server
+        # still running, AV, an indexer) leaves a PARTIAL tree, and pip --target can't
+        # see what's already there when it resolves — so the install "succeeds" onto a
+        # half-deleted tree and produces a subtly broken environment that fails much
+        # later, somewhere unrelated. Fail here, where the cause is still legible.
+        leftovers = list(target.iterdir()) if target.is_dir() else []
+        if leftovers:
+            raise RuntimeError(
+                f"Could not clear the existing dependency tree at {target} — "
+                f"{len(leftovers)} item(s) remain (e.g. {leftovers[0].name}). Something "
+                "is holding files open. Stop the server (and close any app that loaded "
+                "it), then try again; if it persists, delete that folder by hand."
+            )
     target.mkdir(parents=True, exist_ok=True)
 
     req = src_dir(config_dir) / "requirements.txt"

@@ -120,5 +120,37 @@ class GetAuthed(unittest.TestCase):
         self.assertEqual(len(calls), 1)
 
 
+class RedactUrl(unittest.TestCase):
+    """The URLs we refuse to authenticate to are attacker- or third-party-chosen, and a
+    redirect target is very often pre-signed. Logging one verbatim would write someone's
+    credential into the app log - the same leak we just refused to make over the wire."""
+
+    def test_strips_signed_query(self):
+        u = ("https://s3.example.com/bucket/vocals.flac"
+             "?X-Amz-Signature=deadbeef&X-Amz-Credential=AKIA")
+        r = ss._redact_url(u)
+        self.assertEqual(r, "https://s3.example.com/bucket/vocals.flac?…")
+        self.assertNotIn("deadbeef", r)
+        self.assertNotIn("AKIA", r)
+
+    def test_strips_bare_token(self):
+        r = ss._redact_url("http://evil.example.com/steal?token=hunter2")
+        self.assertNotIn("hunter2", r)
+
+    def test_strips_fragment(self):
+        self.assertEqual(ss._redact_url("http://h/x.flac#frag"), "http://h/x.flac")
+
+    def test_keeps_scheme_host_path(self):
+        self.assertEqual(ss._redact_url("http://127.0.0.1:7865/download/a/vocals.flac"),
+                         "http://127.0.0.1:7865/download/a/vocals.flac")
+
+    def test_relative_url(self):
+        self.assertEqual(ss._redact_url("/download/a/v.flac?t=1"), "/download/a/v.flac?…")
+
+    def test_garbage_never_raises(self):
+        for u in ("", "::::", "http://[", None):
+            ss._redact_url(u)   # must not raise - it's on a logging path
+
+
 if __name__ == "__main__":
     unittest.main()

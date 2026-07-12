@@ -178,6 +178,24 @@ _MAX_REDIRECTS = 5
 _REDIRECT_CODES = (301, 302, 303, 307, 308)
 
 
+def _redact_url(url: str) -> str:
+    """scheme://host/path — drop the query and fragment before logging.
+
+    The URLs we refuse to authenticate to are attacker- or third-party-chosen, and a
+    redirect target is very often a PRE-SIGNED url (S3 &X-Amz-Signature=…, a bare
+    ?token=…). Logging one verbatim writes someone's credential into the app log, which
+    is exactly the leak we just refused to commit over the wire.
+    """
+    from urllib.parse import urlparse
+    try:
+        u = urlparse(str(url))
+    except ValueError:
+        return "<unparseable url>"
+    if not u.scheme and not u.netloc:
+        return (u.path or "") + ("?…" if u.query else "")
+    return f"{u.scheme}://{u.netloc}{u.path}" + ("?…" if u.query else "")
+
+
 def _get_authed(url: str, server_url: str, headers: dict | None, timeout: float):
     """GET `url`, following redirects BY HAND so the API key can never ride off-origin.
 
@@ -201,7 +219,7 @@ def _get_authed(url: str, server_url: str, headers: dict | None, timeout: float)
         hop_headers = headers if _same_origin(url, server_url) else None
         if headers and hop_headers is None:
             log.warning("stem_splitter: %s is off-origin from %s - requesting without "
-                        "the API key", url, server_url)
+                        "the API key", _redact_url(url), server_url)
         resp = requests.get(url, headers=hop_headers, timeout=timeout,
                             allow_redirects=False)
         location = resp.headers.get("location") if resp.status_code in _REDIRECT_CODES \
@@ -339,7 +357,10 @@ def _run_remote(mix: Path, out_dir: Path, model: str, server_url: str,
         # user can retry.
         if sr.status_code != 200:
             raise RuntimeError(
-                f"stem download failed for '{name}': HTTP {sr.status_code} from {url}"
+                # Redacted: this url can be a pre-signed one, and the message lands in
+                # the job error, the UI and the log.
+                f"stem download failed for '{name}': HTTP {sr.status_code} from "
+                f"{_redact_url(final_url)}"
             )
         # Trust the URL's own extension: roformer emits .flac, demucs .wav.
         # (Hardcoding .wav mislabels flac stems.) Use the FINAL url - a redirect is
