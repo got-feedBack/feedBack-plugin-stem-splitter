@@ -6,18 +6,29 @@ detection driven by the library index.
 
 ## Engines
 
-Two ways to run, picked in the plugin's **Settings**:
+Three ways to run, picked in the plugin's **Settings**:
 
-- **Remote (default, lightweight)** — posts audio to a got-feedBack demucs/whisperx
-  server (`demucs_server_url` in the app settings). No local dependencies. Split model
+- **Managed local server (easiest)** — the plugin can install and run
+  [`got-feedBack/feedBack-demucs-server`](https://github.com/got-feedBack/feedBack-demucs-server)
+  for you. One click: **Install server + models (~5 GB)** downloads its dependencies
+  and the model weights, then starts it. While it's running the plugin uses it
+  automatically. See [Local demucs server](#local-demucs-server) below.
+- **Remote** — posts audio to a demucs/whisperx server you already run
+  (`demucs_server_url` in the app settings). No local dependencies. Split model
   defaults to **`bs_roformer_sw`**.
-- **Local (opt-in)** — runs the models on this machine. The heavy libraries
-  (~2 GB+: `torch`, `demucs` / `audio-separator`, `whisperx`) are **not** installed
-  until you click **Download local engine + models** in Settings. Nothing is
-  downloaded on install or app launch — only on that explicit action.
+- **Local engine (in-process, opt-in)** — runs the models inside the app instead of
+  a server. The heavy libraries (`torch`, `demucs` / `audio-separator`, `whisperx`)
+  are **not** installed until you click **Download local engine + models**.
 
-Precedence in "Auto": use the remote server if one is configured, else the local
-engine if installed, else the action is offered with a prompt to download the engine.
+Precedence in "Auto": the managed local server if it's running, else a configured
+remote server, else the in-process local engine if installed. If none is available,
+the action tells you so rather than failing silently.
+
+> **Nothing heavy is ever downloaded implicitly.** No dependency and no model weight
+> is fetched on plugin install, on app launch, or as a side effect of anything else —
+> only when you explicitly click one of the download buttons. If you ask for a split
+> before the models exist, the plugin **asks first** instead of stalling on a hidden
+> multi-GB fetch.
 
 > **Engines all yield 6 stems.** `bs_roformer_sw` is a **6-stem** BS-Roformer-SW
 > model (`vocals`/`drums`/`bass`/`guitar`/`piano`/`other`), used by both the remote
@@ -40,12 +51,48 @@ always uses `demucs_server_url`.
 - **Transcribe lyrics** — isolates a vocal stem (splitting first if needed), runs
   WhisperX, writes `lyrics.json` + manifest `lyrics` / `lyrics_source`, reindexes.
 
+## Local demucs server
+
+Settings → **Local demucs server** manages a real
+[feedBack-demucs-server](https://github.com/got-feedBack/feedBack-demucs-server) on this
+machine, so you don't have to stand one up yourself.
+
+| Control | What it does |
+|---|---|
+| **Install server + models (~5 GB)** | Downloads the server source, installs its Python dependencies, downloads the model weights, and starts it. The **only** thing that downloads anything. |
+| **Start** / **Stop** | Runs it / kills it (and its worker processes). |
+| **Test status** | Probes `/health` — device, GPU, per-model warmup state. |
+| **Uninstall server** | Removes the source, its dependencies **and its downloaded weights**. |
+
+Status is shown as colored chips (running, models downloaded, per-model warmup), which
+update live while the weights are downloading.
+
+**Start with the app** (on by default, no-op until the server is installed) starts it
+in the background on launch. This never slows startup and never downloads:
+
+- weights already on disk → start **with warmup** (a RAM load — the server comes up
+  warm, so the first split is fast)
+- weights absent → start with `--skip-warmup`, so launching can't trigger the ~5 GB fetch
+
+**Use for the whole app** additionally writes the local URL into the app's
+`demucs_server_url`, so other parts of the app use it too. Without it, only this plugin
+does (and your own `demucs_server_url` is left untouched).
+
+### Requirements
+
+Needs `pip` and a writable config dir — no `venv` (the packaged Windows app bundles the
+embeddable Python, which has none). If the server can't be managed on your setup, the
+section disables itself and explains why. In Docker the plugin and server share the
+container, so it works, but it's usually CPU-only — running the demucs-server container
+separately and pointing `demucs_server_url` at it is often the better option.
+
 ## Surfaces
 
-- A **Stem Splitter** nav screen: job queue/dashboard, batch actions, missing lists,
-  engine settings + installer.
+- A **Stem Splitter** nav screen: job queue/dashboard, batch actions, missing lists.
 - Per-song **Split stems** / **Transcribe lyrics** actions on the v3 song cards
   (registered via `libraryCardActions`).
+- A **Settings** panel: engine selection, the local engine installer, and the managed
+  demucs server.
 
 Target Host: feedBack desktop with the v3 UI (`window.feedBack.uiVersion === 'v3'`).
 
