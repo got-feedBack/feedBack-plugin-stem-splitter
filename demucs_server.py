@@ -569,6 +569,8 @@ def start_server(config_dir: Path, port: int = DEFAULT_PORT, device: str = "",
         _proc = proc
     _write_state(config_dir, {"pid": proc.pid, "port": port, "started_at": time.time()})
 
+    tail: list[str] = []
+
     def _reader() -> None:
         try:
             assert proc.stdout is not None
@@ -576,6 +578,9 @@ def start_server(config_dir: Path, port: int = DEFAULT_PORT, device: str = "",
                 line = raw.rstrip()
                 if not line:
                     continue
+                tail.append(line)
+                if len(tail) > 60:
+                    tail.pop(0)
                 low = line.lower()
                 phase = "Running"
                 pct = 0.6
@@ -596,7 +601,8 @@ def start_server(config_dir: Path, port: int = DEFAULT_PORT, device: str = "",
     url = url_for(port)
     for _ in range(40):  # ~20s
         if proc.poll() is not None:
-            raise RuntimeError(f"server exited immediately (code {proc.returncode}) - check the log")
+            time.sleep(0.2)  # let the reader drain the last lines
+            raise RuntimeError(_startup_failure_message(proc.returncode, tail))
         ok, _payload = server_health(url, timeout=1.0)
         if ok:
             _emit(progress_cb, f"Server is up at {url}", 1.0, "Running")
@@ -604,6 +610,38 @@ def start_server(config_dir: Path, port: int = DEFAULT_PORT, device: str = "",
         time.sleep(0.5)
 
     raise RuntimeError(f"server did not answer /health on {url} within 20s")
+
+
+def _startup_failure_message(rc: int | None, tail: list[str]) -> str:
+    """Turn an immediate server exit into something actionable.
+
+    The common case by far is a stale or inconsistent dependency tree - e.g. a
+    pylibs/ built by an older installer. Starting the server does NOT reinstall
+    anything, so the user can restart forever and see the same traceback; say
+    plainly that it needs a reinstall.
+    """
+    blob = "\n".join(tail)
+    low = blob.lower()
+    msg = f"the server exited immediately (code {rc})"
+
+    if "importerror" in low or "modulenotfounderror" in low:
+        offender = ""
+        for line in reversed(tail):
+            if line.strip().startswith(("ImportError:", "ModuleNotFoundError:")):
+                offender = line.strip()
+                break
+        return (
+            f"{msg} because its dependencies don't import: {offender or 'ImportError'}. "
+            "This means the installed dependency tree is broken or was built by an older "
+            "installer - starting the server does NOT reinstall it. Click 'Uninstall "
+            "server', then 'Install server' to rebuild it cleanly."
+        )
+
+    if "address already in use" in low or "winerror 10048" in low:
+        return (f"{msg}: that port is already in use. Change the port, or stop whatever "
+                "is already listening on it.")
+
+    return f"{msg}. Last output:\n" + "\n".join(tail[-12:])
 
 
 def _posix_kill_tree(pid: int) -> None:
