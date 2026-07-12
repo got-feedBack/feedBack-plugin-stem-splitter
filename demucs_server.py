@@ -500,6 +500,51 @@ _BOOTSTRAP_TEMPLATE = (
 )
 
 
+def _bootstrap_insert_line(text: str) -> int:
+    """0-based line index at which the sys.path bootstrap may be inserted.
+
+    Must land AFTER three things that are only legal at the top of a module:
+
+      * a shebang / encoding cookie (honoured on physical lines 1-2 only);
+      * the module docstring — both drivers open with one, and pushing it down turns
+        it into a plain expression, silently dropping ``__doc__``;
+      * any ``from __future__ import ...`` — these MUST precede every other statement,
+        so injecting above one is a hard SyntaxError. Neither driver has one today,
+        but a future server revision adding one would break every split with an error
+        pointing at a file the user never wrote.
+
+    Parse the module and insert before the first statement that is none of the above.
+    Falls back to the shebang-only scan if the source doesn't parse (it's not ours to
+    validate — a broken driver should fail on its own terms, not here).
+    """
+    import ast
+
+    lines = text.splitlines(keepends=True)
+    head = 0
+    while head < len(lines) and head < 2 and (
+            lines[head].startswith("#!") or "coding" in lines[head][:40]):
+        head += 1
+
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return head
+
+    for node in tree.body:
+        is_docstring = (isinstance(node, ast.Expr)
+                        and isinstance(node.value, ast.Constant)
+                        and isinstance(node.value.value, str))
+        is_future = isinstance(node, ast.ImportFrom) and node.module == "__future__"
+        if is_docstring or is_future:
+            # Skip past it: end_lineno is 1-based and inclusive, so it doubles as the
+            # 0-based index of the line after.
+            head = max(head, node.end_lineno or head)
+            continue
+        break
+
+    return min(head, len(lines))
+
+
 def patch_driver_scripts(config_dir: Path) -> list[str]:
     """Prepend the pylibs sys.path bootstrap to the server's subprocess drivers.
     Idempotent. Returns the scripts it patched."""
@@ -515,11 +560,7 @@ def patch_driver_scripts(config_dir: Path) -> list[str]:
         if _BOOTSTRAP_MARKER in text:
             continue  # already bootstrapped
         lines = text.splitlines(keepends=True)
-        # Keep a shebang / encoding cookie first (they're only honoured on line 1-2).
-        head = 0
-        while head < len(lines) and head < 2 and (
-                lines[head].startswith("#!") or "coding" in lines[head][:40]):
-            head += 1
+        head = _bootstrap_insert_line(text)
         f.write_text("".join(lines[:head]) + boot + "".join(lines[head:]),
                      encoding="utf-8")
         patched.append(name)

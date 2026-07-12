@@ -232,7 +232,13 @@ def _run_remote(mix: Path, out_dir: Path, model: str, server_url: str,
 
     if resp is None or resp.status_code != 200:
         code = resp.status_code if resp is not None else "no response"
-        body = resp.text[:300] if resp is not None else ""
+        body = ""
+        if resp is not None:
+            body = resp.text[:300]
+            # Read the body first, then hand the connection back to the pool. Raising
+            # with the response still open holds it out of the pool until GC — and a
+            # batch that exhausts the retries on 503 does this once per song.
+            resp.close()
         raise RuntimeError(f"split server error ({code}): {body}")
 
     data = resp.json()
