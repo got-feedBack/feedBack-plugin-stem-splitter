@@ -737,9 +737,19 @@ def setup(app: FastAPI, context: dict) -> None:
         st = docker_sidecar.status()
         # The manual compose service is always offered, socket or not: it needs no trust
         # and no daemon access, and for a Docker user it is the option we RECOMMEND.
+        #
+        # gpu=False DELIBERATELY, even when the daemon reports an nvidia runtime. This is the
+        # path we recommend, so it has to be the one that reliably comes up. A daemon can
+        # advertise the runtime while the host has no usable GPU — no driver, a laptop with
+        # the card disabled, a runtime left configured from another machine — and then
+        # `docker compose up` fails outright on the very command we just told them to run.
+        #
+        # The GPU line ships present-but-commented with its requirements next to it. Opting
+        # IN is one keystroke and fails visibly if the host can't do it; opting OUT of a
+        # broken default means first working out why our snippet didn't start.
         st["compose"] = docker_sidecar.compose_snippet(
             port=st.get("port") or docker_sidecar.DEFAULT_PORT,
-            gpu=bool(st.get("gpu_available")),
+            gpu=False,
         )
         return st
 
