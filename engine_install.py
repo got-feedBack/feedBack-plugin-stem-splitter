@@ -17,6 +17,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -89,6 +90,55 @@ def _installed_dist(edir: Path, module: str) -> bool:
     return any(edir.glob(f"{module.replace('_', '?')}*.dist-info"))
 
 
+# Walking a big HF cache isn't free, and engine_status() is called from the settings
+# panel; memoize briefly so repeated reads don't re-scan it.
+_ext_cache_memo: dict = {"t": 0.0, "val": None}
+
+
+def external_caches(config_dir: Path) -> list[dict]:
+    """Model-weight caches that live OUTSIDE the plugin's models dir.
+
+    The app deliberately pins TORCH_HOME / HF_HOME to the standard shared
+    locations (~/.cache/torch, ~/.cache/huggingface) - see feedback-desktop
+    src/main/python.ts - so in-process engines (whisperx, audio-separator) download
+    their weights there rather than into our models dir.
+
+    We REPORT these so the disk figure isn't silently short, but we never delete
+    them on uninstall: they're the conventional cache and other tools share them.
+    """
+    now = time.monotonic()
+    if _ext_cache_memo["val"] is not None and now - _ext_cache_memo["t"] < 60:
+        return _ext_cache_memo["val"]
+
+    try:
+        mdir = models_dir(config_dir).resolve()
+    except OSError:
+        mdir = models_dir(config_dir)
+    base = Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache"))
+    candidates = [
+        ("torch", Path(os.environ.get("TORCH_HOME") or (base / "torch"))),
+        ("huggingface", Path(os.environ.get("HF_HOME") or (base / "huggingface"))),
+    ]
+
+    out: list[dict] = []
+    for label, p in candidates:
+        try:
+            rp = p.resolve()
+        except OSError:
+            continue
+        if not rp.is_dir():
+            continue
+        if rp == mdir or mdir in rp.parents or rp in mdir.parents:
+            continue  # already inside (or containing) our own models dir
+        size = _dir_size(rp)
+        if size:
+            out.append({"label": label, "path": str(rp), "bytes": size})
+
+    _ext_cache_memo["t"] = now
+    _ext_cache_memo["val"] = out
+    return out
+
+
 def installed_map(config_dir: Path) -> dict:
     """Cheap dir-presence check per engine — no directory-size walk. Use this for
     availability gating (resolve_*); reserve engine_status() for when the byte
@@ -101,6 +151,7 @@ def engine_status(config_dir: Path) -> dict:
     edir = engine_dir(config_dir)
     mdir = models_dir(config_dir)
     installed = installed_map(config_dir)
+    ext = external_caches(config_dir)
     return {
         "engine_dir": str(edir),
         "models_dir": str(mdir),
@@ -108,6 +159,10 @@ def engine_status(config_dir: Path) -> dict:
         "any_installed": any(installed.values()),
         "engine_bytes": _dir_size(edir),
         "models_bytes": _dir_size(mdir),
+        # Weights in the shared ~/.cache locations the app pins. Reported so the
+        # disk total isn't misleading; NOT removed by uninstall (see external_caches).
+        "external_caches": ext,
+        "external_cache_bytes": sum(e["bytes"] for e in ext),
     }
 
 
@@ -374,6 +429,16 @@ def uninstall_engine(config_dir: Path) -> dict:
         except OSError as e:
             log.warning("stem_splitter: engine removed but could not clear a stale "
                         "uninstall marker (%s); startup will retry clearing it", e)
-        status["uninstall"] = {"removed": True, "pending": False,
-                               "message": "Local engine removed."}
+        msg = "Local engine removed."
+        # Be explicit about what we did NOT delete, so the reclaimed-disk figure
+        # isn't a lie. These are the shared standard caches the app pins; other
+        # tools use them, so removing them isn't ours to do.
+        ext = external_caches(config_dir)
+        if ext:
+            gb = sum(e["bytes"] for e in ext) / 1e9
+            where = ", ".join(e["path"] for e in ext)
+            msg += (f" Note: {gb:.2f} GB of model weights also live in shared caches "
+                    f"({where}) and were NOT removed - other tools use them. "
+                    "Delete those manually if you want the space back.")
+        status["uninstall"] = {"removed": True, "pending": False, "message": msg}
     return status

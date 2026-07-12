@@ -135,7 +135,16 @@
     var inst = st.installed || {};
     var parts = Object.keys(inst).map(function (k) { return k + ': ' + (inst[k] ? '✓' : '—'); });
     var gb = (st.engine_bytes + st.models_bytes) / 1e9;
-    $('ss-engine-status').textContent = parts.join('   ') + '   (' + gb.toFixed(2) + ' GB on disk)';
+    var text = parts.join('   ') + '   (' + gb.toFixed(2) + ' GB on disk';
+    // The app pins TORCH_HOME/HF_HOME to the shared ~/.cache dirs, so some weights
+    // land there rather than in our models dir. Say so, since Uninstall won't
+    // reclaim them.
+    if (st.external_cache_bytes) {
+      text += ' + ' + (st.external_cache_bytes / 1e9).toFixed(2) + ' GB in shared caches, not removed by Uninstall';
+    }
+    $('ss-engine-status').textContent = text + ')';
+    $('ss-engine-status').title = (st.external_caches || [])
+      .map(function (c) { return c.label + ': ' + c.path; }).join('\n');
   }
 
   function save() {
