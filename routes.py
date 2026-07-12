@@ -19,27 +19,40 @@ import time
 import uuid
 from pathlib import Path
 
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, Request, WebSocket, WebSocketDisconnect
 
 import demucs_server
+import docker_sidecar
 import engine_install
+
+# Hoisted: ruff B008 rightly objects to Body() being called in an argument
+# default. Both sidecar routes take an optional JSON body.
+_OPT_BODY = Body(None)
 
 INSTRUMENT_STEM_IDS = ["guitar", "bass", "drums", "vocals", "other", "piano"]
 _BROADCAST_MIN_INTERVAL = 0.15  # s — throttle progress spam
 
 
-def _as_port(value) -> int:
+def _as_port(value, default: int | None = None) -> int:
     """Port from settings, tolerant of a hand-edited or corrupted file.
 
     A bare int() here would raise on a bad value and take out engine resolution and
     every managed-server endpoint with it - leaving the user no way to fix the setting
     through the very UI that's now broken.
+
+    `default` MUST be passed by any caller whose port is NOT the managed local server's.
+    It wasn't, and so the sidecar route fell back to the LOCAL SERVER'S port (7865)
+    whenever the body omitted one — which the UI always does — publishing the container
+    onto precisely the port this plugin goes out of its way to avoid. On Windows that
+    collision doesn't even fail: both bind, and requests silently go to the wrong server.
     """
+    if default is None:
+        default = demucs_server.DEFAULT_PORT
     try:
         port = int(value)
     except (TypeError, ValueError):
-        return demucs_server.DEFAULT_PORT
-    return port if 1 <= port <= 65535 else demucs_server.DEFAULT_PORT
+        return default
+    return port if 1 <= port <= 65535 else default
 
 
 class JobCanceled(Exception):
@@ -172,17 +185,42 @@ class JobManager:
         running, live_port = demucs_server.is_running(self.config_dir, port)
         return demucs_server.url_for(_as_port(live_port or port)) if running else None
 
+    def sidecar_url(self) -> str | None:
+        """URL of the managed sibling CONTAINER, if it's running.
+
+        Cheap by design: this sits on the split path, and `status()` short-circuits to a
+        dict as soon as it sees there is no reachable Docker daemon — which is the case
+        for every user who never opted in.
+        """
+        try:
+            st = docker_sidecar.status()
+        except Exception:
+            return None
+        return st.get("url") if st.get("running") else None
+
     def _server_url(self) -> str | None:
         """Split server URL (demucs/roformer).
 
-        The plugin-managed local server wins whenever it's running — that's the
-        "plugin uses it automatically" half of the toggle, and it needs no mutation
-        of the app's config.json (so there's nothing to clean up when it stops).
-        The app's `demucs_server_url` remains the fallback.
+        Precedence, most-specific first:
+
+          1. the plugin-managed local server process (Electron: a real child process);
+          2. the plugin-managed sibling CONTAINER (Docker: what the socket buys us);
+          3. the app's own `demucs_server_url` (a server the user runs themselves).
+
+        1 and 2 are mutually exclusive in practice — a containerized app can't run (1),
+        and an Electron user who has a working (1) has no reason to add (2) — but the
+        order is defined rather than accidental: a local process is closer, cheaper, and
+        already warm.
+
+        None of this mutates the app's config.json, so there is nothing to clean up when
+        any of them stops. The app's `demucs_server_url` remains the fallback.
         """
         local = self.local_server_url()
         if local:
             return local
+        sidecar = self.sidecar_url()
+        if sidecar:
+            return sidecar
         cfg = self._app_config()
         url = cfg.get("demucs_server_url")
         if isinstance(url, str) and url.strip():
@@ -682,6 +720,77 @@ def setup(app: FastAPI, context: dict) -> None:
         if _op_in_flight():
             return _busy()
         return demucs_server.stop_server(mgr.config_dir)
+
+    # ── managed sibling container (Docker socket) ────────────────────────────
+    #
+    # A containerized feedBack cannot start a process on its host - that is a namespace
+    # boundary, not a missing feature. If the user has mounted the Docker socket, we can
+    # instead ask the HOST's daemon to run the published image as a sibling container.
+    #
+    # The socket is root-equivalent on the host. We never mount it, never ask for it, and
+    # only use it if the user already exposed it. Every route below is behind an explicit
+    # click, and the only container we can create is the pinned image with a fixed spec -
+    # no image, command or bind mount is ever taken from the caller.
+
+    @app.get(f"{P}/sidecar_status")
+    def get_sidecar_status():
+        st = docker_sidecar.status()
+        # The manual compose service is always offered, socket or not: it needs no trust
+        # and no daemon access, and for a Docker user it is the option we RECOMMEND.
+        #
+        # gpu=False DELIBERATELY, even when the daemon reports an nvidia runtime. This is the
+        # path we recommend, so it has to be the one that reliably comes up. A daemon can
+        # advertise the runtime while the host has no usable GPU — no driver, a laptop with
+        # the card disabled, a runtime left configured from another machine — and then
+        # `docker compose up` fails outright on the very command we just told them to run.
+        #
+        # The GPU line ships present-but-commented with its requirements next to it. Opting
+        # IN is one keystroke and fails visibly if the host can't do it; opting OUT of a
+        # broken default means first working out why our snippet didn't start.
+        st["compose"] = docker_sidecar.compose_snippet(
+            port=st.get("port") or docker_sidecar.DEFAULT_PORT,
+            gpu=False,
+        )
+        return st
+
+    @app.post(f"{P}/sidecar/up")
+    def post_sidecar_up(body: dict | None = _OPT_BODY):
+        body = body or {}
+        port = _as_port(body.get("port"), docker_sidecar.DEFAULT_PORT)
+        gpu = bool(body.get("gpu"))
+        # cb takes the same {line, pct, phase} dict docker_sidecar already emits.
+        if not mgr.run_server_op("sidecar_up", lambda cb: docker_sidecar.up(
+                port=port, gpu=gpu, progress_cb=cb)):
+            return _busy()
+        return {"ok": True}
+
+    @app.get(f"{P}/sidecar/health")
+    def get_sidecar_health():
+        """Backend proxy for the sidecar's 'Test status' button.
+
+        Takes NO url from the caller, on purpose. A route that health-checks whatever URL
+        it is handed is an SSRF proxy - it would let anything that can reach this endpoint
+        probe hosts and ports behind the app. It resolves the sidecar's own URL itself.
+
+        The proxy is needed because the BROWSER often can't reach the container: inside a
+        compose network its URL is a container NAME, which resolves for the server and not
+        for the page. The server can always reach it.
+        """
+        st = docker_sidecar.status()
+        url = st.get("url")
+        if not url:
+            return {"ok": False, "url": None, "health": {},
+                    "message": "the demucs container is not running"}
+        ok, payload = demucs_server.server_health(url, timeout=4.0)
+        return {"ok": ok, "url": url, "health": payload}
+
+    @app.post(f"{P}/sidecar/down")
+    def post_sidecar_down(body: dict | None = _OPT_BODY):
+        body = body or {}
+        remove = bool((body or {}).get("remove"))
+        if _op_in_flight():
+            return _busy()
+        return docker_sidecar.down(remove=remove)
 
     @app.post(f"{P}/server/prepare_models")
     def post_server_prepare_models():

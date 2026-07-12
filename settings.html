@@ -71,6 +71,7 @@
 #ss-settings .ss-section.engines { --ss-accent: #3b82f6; }
 #ss-settings .ss-section.local   { --ss-accent: #a855f7; }
 #ss-settings .ss-section.server  { --ss-accent: #16a34a; }
+#ss-settings .ss-section.docker  { --ss-accent: #0ea5e9; }
 #ss-settings .ss-section > h3 .ss-h-note {
   margin-left: auto; font-size: .72rem; font-weight: 500; color: #94a3b8;
 }
@@ -219,6 +220,59 @@
     <div class="ss-bar" style="width:100%;margin:.35rem 0"><i id="ss-srv-fill" style="width:0%"></i></div>
     <pre class="ss-log" id="ss-srv-log" style="height:240px;max-height:240px;overflow:auto;margin:0;padding:.6rem;background:#0b1220;color:#94a3b8;border:1px solid rgba(148,163,184,.2);border-radius:6px;font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;word-break:break-word"></pre>
   </div>
+  </section>
+
+  <!-- Docker users. Hidden entirely unless we're in a container OR a daemon is reachable,
+       so the overwhelming majority (Electron, no Docker) never see a card that has nothing
+       to say to them. -->
+  <section class="ss-section docker" id="ss-dk-card" style="display:none">
+    <h3>Run the server as a Docker container <span class="ss-h-note" id="ss-dk-h-note"></span></h3>
+    <p class="ss-muted" id="ss-dk-intro">feedBack is running in a container, so it can't install the
+      server on your host — a container can't start a process outside itself. Instead, run the
+      server as its own container alongside this one.</p>
+
+    <div class="ss-row" style="gap:.4rem;flex-wrap:wrap;margin:.5rem 0">
+      <span id="ss-dk-chips"></span>
+    </div>
+
+    <!-- The recommended path: costs nothing, grants nobody root. -->
+    <div id="ss-dk-compose-wrap">
+      <p class="ss-note"><strong>Recommended.</strong> Add this service to the
+        <code>docker-compose.yml</code> you already have, then <code>docker compose up -d</code>.
+        Nothing else to configure — the plugin finds it automatically.</p>
+      <div class="ss-row" style="justify-content:space-between;align-items:center">
+        <span class="ss-muted" style="font-size:.78rem">compose service</span>
+        <button class="ss-btn" id="ss-dk-copy" type="button">Copy</button>
+      </div>
+      <pre class="ss-log" id="ss-dk-compose" style="max-height:210px;overflow:auto;margin:.35rem 0 0;padding:.6rem;background:#0b1220;color:#94a3b8;border:1px solid rgba(148,163,184,.2);border-radius:6px;font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre;word-break:normal"></pre>
+    </div>
+
+    <!-- The one-click path. Only appears if the socket is ALREADY exposed. We never ask the
+         user to mount it: it is root-equivalent on the host, and that is their call, not ours. -->
+    <div id="ss-dk-oneclick" style="display:none;margin-top:1rem;padding-top:.85rem;border-top:1px solid rgba(148,163,184,.18)">
+      <p class="ss-note"><strong>Or let feedBack do it.</strong> You've mounted the Docker socket, so
+        the plugin can pull the image and start the container for you — same result as the compose
+        snippet above, one click.</p>
+      <p class="ss-note warn" id="ss-dk-warn" style="display:none"></p>
+      <div class="ss-row" style="gap:.5rem;flex-wrap:wrap;margin-top:.5rem">
+        <button class="ss-btn" id="ss-dk-up">Start the server container</button>
+        <button class="ss-btn" id="ss-dk-down" style="display:none">Stop</button>
+        <button class="ss-btn" id="ss-dk-test">Test status</button>
+        <label class="ss-row" style="gap:.35rem;font-size:.82rem" id="ss-dk-gpu-wrap">
+          <input type="checkbox" id="ss-dk-gpu"> Use GPU
+        </label>
+      </div>
+      <p class="ss-note" id="ss-dk-gpu-note"></p>
+
+      <div id="ss-dk-progress" style="display:none;margin-top:.75rem">
+        <div class="ss-row" style="justify-content:space-between">
+          <strong id="ss-dk-phase" style="font-size:.85rem">Working…</strong>
+          <span id="ss-dk-pct" class="ss-muted">0%</span>
+        </div>
+        <div class="ss-bar" style="width:100%;margin:.35rem 0"><i id="ss-dk-fill" style="width:0%"></i></div>
+        <pre class="ss-log" id="ss-dk-log" style="height:200px;max-height:200px;overflow:auto;margin:0;padding:.6rem;background:#0b1220;color:#94a3b8;border:1px solid rgba(148,163,184,.2);border-radius:6px;font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;word-break:break-word"></pre>
+      </div>
+    </div>
   </section>
 
   <section class="ss-section local">
@@ -389,6 +443,17 @@
   // Snapshot recovery for a server op that was still running while the page was away.
   function renderServerOp(st) {
     if (!st) return;
+    // The managed server and the Docker sidecar share ONE op mutex and one event stream,
+    // so the SNAPSHOT has to be routed by op exactly as the live events are. Without this,
+    // reloading the page mid-pull draws the container's progress into the local-server
+    // card — a bar moving in a section the user never touched.
+    if (isDk(st.op)) {
+      $('ss-dk-progress').style.display = 'block';
+      setDkBar(st.pct, st.phase || (st.active ? 'Working…' : 'Done'));
+      if (st.error) appendLog($('ss-dk-log'), '✗ ' + st.error);
+      setDkButtons(!!st.active);
+      return;
+    }
     $('ss-srv-progress').style.display = 'block';
     setSrvBar(st.pct, st.phase || (st.active ? st.op : 'Done'));
     if (st.error) appendLog($('ss-srv-log'), '✗ ' + st.error);
@@ -407,20 +472,44 @@
         if (m.install) renderInstall(m.install);   // snapshot recovery
         if (m.server) renderServerOp(m.server);
       } else if (m.type === 'server') {
-        $('ss-srv-progress').style.display = 'block';
-        if (m.line) appendLog($('ss-srv-log'), m.line);
-        setSrvBar(m.pct, m.phase);
-        setServerButtons(true);
+        // The managed server and the Docker sidecar share one op mutex and one event
+        // stream, so route by op — otherwise a container pull would draw its progress
+        // into the local-server card.
+        if (isDk(m.op)) {
+          $('ss-dk-progress').style.display = 'block';
+          if (m.line) appendLog($('ss-dk-log'), m.line);
+          setDkBar(m.pct, m.phase);
+          setDkButtons(true);
+        } else {
+          $('ss-srv-progress').style.display = 'block';
+          if (m.line) appendLog($('ss-srv-log'), m.line);
+          setSrvBar(m.pct, m.phase);
+          setServerButtons(true);
+        }
       } else if (m.type === 'server_done') {
-        appendLog($('ss-srv-log'), '✓ ' + m.op + ' done.');
-        setSrvBar(1, 'Done');
-        setServerButtons(false);
-        if (m.status) renderServerStatus(m.status); else loadServerStatus();
+        if (isDk(m.op)) {
+          appendLog($('ss-dk-log'), '✓ the demucs container is running.');
+          setDkBar(1, 'Running');
+          setDkButtons(false);
+          loadDocker();
+        } else {
+          appendLog($('ss-srv-log'), '✓ ' + m.op + ' done.');
+          setSrvBar(1, 'Done');
+          setServerButtons(false);
+          if (m.status) renderServerStatus(m.status); else loadServerStatus();
+        }
       } else if (m.type === 'server_error') {
-        appendLog($('ss-srv-log'), '✗ ' + m.error);
-        setSrvBar(0, 'Failed');
-        setServerButtons(false);
-        loadServerStatus();
+        if (isDk(m.op)) {
+          appendLog($('ss-dk-log'), '✗ ' + m.error);
+          setDkBar(0, 'Failed');
+          setDkButtons(false);
+          loadDocker();
+        } else {
+          appendLog($('ss-srv-log'), '✗ ' + m.error);
+          setSrvBar(0, 'Failed');
+          setServerButtons(false);
+          loadServerStatus();
+        }
       } else if (m.type === 'install') {
         $('ss-install-progress').style.display = 'block';
         if (m.line) appendLog(log, m.line);
@@ -902,7 +991,166 @@
       .finally(function () { setServerButtons(false); });
   });
 
+  // ── Docker sidecar ────────────────────────────────────────────────────────
+  // Two paths, deliberately unequal in prominence:
+  //   * the compose snippet, always shown — it needs no daemon access and grants nobody
+  //     root on the host, so for a Docker user it is the one we RECOMMEND;
+  //   * the one-click, shown ONLY if the socket is already mounted. We never suggest
+  //     mounting it: it is root-equivalent on the host and that's the user's call.
+  var dkLast = null;
+  function isDk(op) { return typeof op === 'string' && op.indexOf('sidecar') === 0; }
+
+  function dkLog(line) {
+    var el = $('ss-dk-log');
+    el.textContent += line + '\n';
+    el.scrollTop = el.scrollHeight;
+  }
+  function setDkBar(pct, phase) {
+    $('ss-dk-fill').style.width = Math.round((pct || 0) * 100) + '%';
+    $('ss-dk-pct').textContent = Math.round((pct || 0) * 100) + '%';
+    if (phase) $('ss-dk-phase').textContent = phase;
+  }
+  function setDkButtons(busy) {
+    ['ss-dk-up', 'ss-dk-down', 'ss-dk-test'].forEach(function (id) {
+      var el = $(id); if (el) el.disabled = !!busy;
+    });
+  }
+
+  function renderDocker(st) {
+    dkLast = st;
+    var card = $('ss-dk-card');
+    // Show the card only to people it can help: in a container, or a daemon in reach.
+    // Everyone else (the Electron majority) shouldn't see a Docker card at all.
+    if (!st || (!st.in_container && !st.docker)) { card.style.display = 'none'; return; }
+    card.style.display = '';
+
+    $('ss-dk-compose').textContent = st.compose || '';
+
+    var chips = [];
+    if (st.running && st.url) {
+      chips.push(chip('container running', 'ok', { dot: true }));
+      chips.push(chip(st.url, 'info', { title: 'the plugin is using this automatically' }));
+    } else if (st.docker && st.container && st.problem) {
+      // A container that exists but won't run has a reason, and the user can't run
+      // `docker logs` from in here. "not running" alone is a dead end.
+      chips.push(chip(st.container.state || 'not running', 'bad', { dot: true }));
+    } else if (st.docker) {
+      chips.push(chip('docker reachable', 'info'));
+      chips.push(chip('container not running', 'off'));
+    } else {
+      chips.push(chip('no docker socket', 'off', { title: st.reason || '' }));
+    }
+    if (st.docker && st.gpu_available) chips.push(chip('GPU available', 'ok'));
+    $('ss-dk-chips').innerHTML = chips.join(' ');
+
+    $('ss-dk-h-note').textContent = st.running ? 'running — in use' : '';
+
+    // One-click only when a daemon is actually reachable.
+    $('ss-dk-oneclick').style.display = st.docker ? '' : 'none';
+    var problem = (!st.docker && st.reason) || st.problem || '';
+    if (problem) {
+      $('ss-dk-warn').style.display = '';
+      $('ss-dk-warn').textContent = '⚠ ' + problem;
+    } else {
+      $('ss-dk-warn').style.display = 'none';
+    }
+
+    $('ss-dk-up').textContent = st.running ? 'Restart the server container'
+                                           : 'Start the server container';
+    $('ss-dk-down').style.display = st.running ? '' : 'none';
+
+    var gpuWrap = $('ss-dk-gpu-wrap');
+    if (st.docker && !st.gpu_available) {
+      // Don't offer a checkbox that can't do anything — say why instead. Ticking a box
+      // that silently downgrades to CPU is how you get "the GPU option doesn't work".
+      gpuWrap.style.display = 'none';
+      $('ss-dk-gpu-note').textContent = 'No NVIDIA runtime on the Docker daemon — the '
+        + 'container will run on CPU. For GPU, install nvidia-container-toolkit on the '
+        + 'host (Linux or Windows/WSL2; macOS cannot pass a GPU through at all).';
+    } else {
+      gpuWrap.style.display = '';
+      $('ss-dk-gpu-note').textContent = '';
+    }
+  }
+
+  function loadDocker() {
+    return j('/sidecar_status').then(renderDocker).catch(function () {});
+  }
+
+  $('ss-dk-copy').addEventListener('click', function () {
+    var text = ($('ss-dk-compose').textContent || '');
+    var done = function () {
+      var b = $('ss-dk-copy'); var prev = b.textContent;
+      b.textContent = 'Copied ✓';
+      setTimeout(function () { b.textContent = prev; }, 1500);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(done).catch(function () {});
+    } else {
+      // No clipboard API (insecure origin / older webview): select it so Ctrl-C works
+      // rather than leaving the button silently dead.
+      var r = document.createRange(); r.selectNodeContents($('ss-dk-compose'));
+      var sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(r);
+      done();
+    }
+  });
+
+  $('ss-dk-up').addEventListener('click', function () {
+    var gpu = $('ss-dk-gpu').checked && dkLast && dkLast.gpu_available;
+    setDkButtons(true);
+    $('ss-dk-progress').style.display = 'block';
+    $('ss-dk-log').textContent = 'Starting the demucs container…\n';
+    setDkBar(0.02, 'Pulling image');
+    connectWS();   // progress arrives over the shared server-op WS stream
+    j('/sidecar/up', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ gpu: !!gpu }),
+    }).then(function (r) {
+      if (r && r.ok === false && r.busy) {
+        dkLog('… ' + (r.message || 'another server operation is running'));
+        setDkBar(0, 'Busy');
+        setDkButtons(false);
+      }
+    }).catch(function (e) {
+      dkLog('✗ ' + e);
+      setDkBar(0, 'Failed');
+      setDkButtons(false);
+    });
+  });
+
+  $('ss-dk-down').addEventListener('click', function () {
+    setDkButtons(true);
+    j('/sidecar/down', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ remove: false }),   // keep the model cache volume
+    }).then(renderDocker).catch(function () {})
+      .finally(function () { setDkButtons(false); });
+  });
+
+  $('ss-dk-test').addEventListener('click', function () {
+    setDkButtons(true);
+    $('ss-dk-progress').style.display = 'block';
+    $('ss-dk-log').textContent = '';
+    loadDocker().then(function () {
+      var st = dkLast || {};
+      if (!st.running || !st.url) {
+        dkLog('✗ the container is not running');
+        setDkBar(0, 'Not running');
+        return;
+      }
+      // Health goes through the SAME backend proxy the managed server uses: the browser
+      // may not be able to reach the container's URL (inside a compose network it is a
+      // container name), but the server always can.
+      return j('/sidecar/health').then(function (r) {
+        dkLog((r.ok ? '✓ ' : '✗ ') + st.url + ' → ' + JSON.stringify(r.health));
+        setDkBar(r.ok ? 1 : 0, r.ok ? 'Healthy' : 'No response');
+      });
+    }).catch(function (e) { dkLog('✗ ' + e); })
+      .finally(function () { setDkButtons(false); });
+  });
+
   loadConfig();
+  loadDocker();
   connectWS();  // connect on load so a snapshot recovers any install that finished while away
 })();
 </script>
