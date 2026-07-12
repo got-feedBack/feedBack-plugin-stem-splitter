@@ -534,6 +534,14 @@
     setSrvBar(0.02, label);
     connectWS();
     return j(path, { method: 'POST' }).then(function (res) {
+      // The backend serialises lifecycle ops; if one is already running it says so
+      // rather than racing (which would corrupt the shared subprocess/state file).
+      if (res && res.ok === false && res.busy) {
+        srvLog('… ' + res.message);
+        setSrvBar(0, 'Busy: ' + res.busy);
+        setServerButtons(false);
+        return res;
+      }
       // stop/uninstall answer synchronously with a status; install/start/prepare
       // stream over the WS and unlock on server_done/server_error.
       if (res && typeof res.installed !== 'undefined') {

@@ -121,6 +121,28 @@ def _invalidate_running() -> None:
         _running_memo.clear()
 
 
+# Sizing the server dir means walking pylibs/ + cache/ - several GB once the weights
+# land. server_status() is polled every 5s by the settings page while models download,
+# so recomputing it each time would be a continuous disk scan for a number that barely
+# moves. Memoize it (and let the caller skip it entirely).
+_disk_memo: dict[str, tuple[float, int]] = {}
+_disk_lock = threading.Lock()
+_DISK_TTL = 30.0  # seconds
+
+
+def _server_disk_bytes(config_dir: Path) -> int:
+    key = str(config_dir)
+    now = time.monotonic()
+    with _disk_lock:
+        hit = _disk_memo.get(key)
+        if hit and now - hit[0] < _DISK_TTL:
+            return hit[1]
+    size = engine_install._dir_size(server_dir(config_dir))
+    with _disk_lock:
+        _disk_memo[key] = (now, size)
+    return size
+
+
 # ── paths ────────────────────────────────────────────────────────────────────
 
 def server_dir(config_dir: Path) -> Path:
@@ -181,13 +203,24 @@ def in_container() -> bool:
     return False
 
 
+# pip availability can't change for a running interpreter, but can_manage() is on the
+# server_status path - which the settings page polls every 5s while models download.
+# Without this we'd spawn a subprocess on every poll.
+_pip_ok_memo: dict[str, bool] = {}
+
+
 def _python_has_pip(python_exe: str) -> bool:
+    hit = _pip_ok_memo.get(python_exe)
+    if hit is not None:
+        return hit
     try:
         p = subprocess.run([python_exe, "-m", "pip", "--version"],
                            capture_output=True, text=True, timeout=60)
-        return p.returncode == 0
+        ok = p.returncode == 0
     except Exception:
-        return False
+        ok = False
+    _pip_ok_memo[python_exe] = ok
+    return ok
 
 
 def can_manage(config_dir: Path) -> tuple[bool, str]:
@@ -453,6 +486,8 @@ def install_server(config_dir: Path, progress_cb: ProgressCB = None) -> dict:
         engine_install.stream_pip(sys.executable, args, label, progress_cb,
                                   base=0.12 + (i / n) * 0.86, span=0.86 / n, pkg_count=count)
 
+    with _disk_lock:
+        _disk_memo.clear()   # the tree just changed materially
     write_launcher(config_dir)
     patched = patch_driver_scripts(config_dir)
     if patched:
@@ -562,6 +597,8 @@ def uninstall_server(config_dir: Path) -> dict:
     except Exception as e:
         log.warning("stem_splitter: stop before uninstall failed: %s", e)
     shutil.rmtree(server_dir(config_dir), ignore_errors=True)
+    with _disk_lock:
+        _disk_memo.clear()
     try:
         state_file(config_dir).unlink(missing_ok=True)
     except OSError as e:
@@ -1002,7 +1039,7 @@ def server_status(config_dir: Path) -> dict:
         "models_downloaded": models_downloaded(config_dir),
         "models_ready": models_ready,
         "server_dir": str(server_dir(config_dir)),
-        "disk_bytes": engine_install._dir_size(server_dir(config_dir)),
+        "disk_bytes": _server_disk_bytes(config_dir),
         # False on deployments where a plugin-managed server makes no sense
         # (no pip, or a read-only config dir). The UI disables the section.
         "source": source_meta(config_dir),   # {repo, ref, commit} actually installed

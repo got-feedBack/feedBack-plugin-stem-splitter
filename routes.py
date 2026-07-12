@@ -60,6 +60,10 @@ class JobManager:
         # Same idea for the managed demucs-server lifecycle (install / start /
         # prepare-models), so a reconnecting settings page recovers its state.
         self._server: dict | None = None
+        # Only one server lifecycle op (install / start / stop / prepare_models) at a
+        # time - they all mutate the same subprocess, state file and pylibs tree.
+        self._server_op_lock = threading.Lock()
+        self._server_op_active: str | None = None
 
         self._load_jobs()
         self._worker = threading.Thread(target=self._worker_loop, name="stem_splitter-worker", daemon=True)
@@ -432,10 +436,24 @@ class JobManager:
         self._push(msg)
 
     # ── managed demucs server ────────────────────────────────────────────────
-    def run_server_op(self, op: str, fn) -> None:
+    def run_server_op(self, op: str, fn) -> bool:
         """Run a demucs-server lifecycle op (install / start / prepare_models) on a
         daemon thread, streaming progress over the WS. Same contract as the engine
-        install, so the settings page reuses the exact same widgets."""
+        install, so the settings page reuses the exact same widgets.
+
+        Only ONE lifecycle op may run at a time. They mutate shared state (the
+        subprocess handle, the state file, the pylibs tree), so a screen-triggered
+        prepare_models racing a settings-triggered start/stop would corrupt it - and
+        the loser's clear_stream_cb() in `finally` would also cut the winner's log
+        streaming. Returns False if an op is already in flight.
+        """
+        with self._server_op_lock:
+            if self._server_op_active:
+                self.log.info("stem_splitter: refusing %s - %s is already running",
+                              op, self._server_op_active)
+                return False
+            self._server_op_active = op
+
         def _run() -> None:
             def cb(ev: dict) -> None:
                 st = {"active": True, "op": op, "line": ev.get("line", ""),
@@ -455,9 +473,13 @@ class JobManager:
                 # The server's log reader outlives the op. Detach it now so its
                 # ongoing output can't keep pushing progress events (which would
                 # flip the UI back to "active" and re-disable the controls after
-                # we've already reported the op as done).
+                # we've already reported the op as done). Safe to do unconditionally
+                # because the lock guarantees no other op is in flight.
                 demucs_server.clear_stream_cb()
+                with self._server_op_lock:
+                    self._server_op_active = None
         threading.Thread(target=_run, name=f"stem_splitter-server-{op}", daemon=True).start()
+        return True
 
     def needs_server_setup(self) -> dict | None:
         """If the split would go to our managed local server but its weights aren't
@@ -572,6 +594,15 @@ def setup(app: FastAPI, context: dict) -> None:
         device = str(s.get("local_server_device") or "")
         return port, device
 
+    def _busy() -> dict:
+        return {"ok": False, "busy": mgr._server_op_active,
+                "message": f"a server operation ({mgr._server_op_active}) is already "
+                           "running - wait for it to finish"}
+
+    def _op_in_flight() -> bool:
+        with mgr._server_op_lock:
+            return mgr._server_op_active is not None
+
     @app.get(f"{P}/server_status")
     def get_server_status():
         return demucs_server.server_status(mgr.config_dir)
@@ -590,8 +621,9 @@ def setup(app: FastAPI, context: dict) -> None:
         # Installing without the weights leaves a server that can't split until a
         # second action, which is a confusing half-state.
         port, device = _server_opts()
-        mgr.run_server_op("install", lambda cb: demucs_server.setup_server(
-            mgr.config_dir, port=port, device=device, progress_cb=cb))
+        if not mgr.run_server_op("install", lambda cb: demucs_server.setup_server(
+                mgr.config_dir, port=port, device=device, progress_cb=cb)):
+            return _busy()
         return {"ok": True, "started": "install"}
 
     @app.post(f"{P}/server/start")
@@ -599,23 +631,29 @@ def setup(app: FastAPI, context: dict) -> None:
         port, device = _server_opts()
         # warmup=None -> warm up only if the weights are already on disk, so a
         # start can never trigger the big download.
-        mgr.run_server_op("start", lambda cb: demucs_server.start_server(
-            mgr.config_dir, port=port, device=device, warmup=None, progress_cb=cb))
+        if not mgr.run_server_op("start", lambda cb: demucs_server.start_server(
+                mgr.config_dir, port=port, device=device, warmup=None, progress_cb=cb)):
+            return _busy()
         return {"ok": True, "started": "start"}
 
     @app.post(f"{P}/server/stop")
     def post_server_stop():
+        if _op_in_flight():
+            return _busy()
         return demucs_server.stop_server(mgr.config_dir)
 
     @app.post(f"{P}/server/prepare_models")
     def post_server_prepare_models():
         port, device = _server_opts()
-        mgr.run_server_op("prepare_models", lambda cb: demucs_server.prepare_models(
-            mgr.config_dir, port=port, device=device, progress_cb=cb))
+        if not mgr.run_server_op("prepare_models", lambda cb: demucs_server.prepare_models(
+                mgr.config_dir, port=port, device=device, progress_cb=cb)):
+            return _busy()
         return {"ok": True, "started": "prepare_models"}
 
     @app.post(f"{P}/server/uninstall")
     def post_server_uninstall():
+        if _op_in_flight():
+            return _busy()
         return demucs_server.uninstall_server(mgr.config_dir)
 
     # ── jobs ─────────────────────────────────────────────────────────────────
