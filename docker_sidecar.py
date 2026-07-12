@@ -185,9 +185,17 @@ def ping() -> tuple[bool, str]:
     host = docker_host()
     if not host:
         if os.name == "nt":
-            return (False, "Docker Desktop on Windows exposes a named pipe, which this "
-                           "cannot speak. Enable 'Expose daemon on tcp://localhost:2375' "
-                           "in Docker Desktop settings, or use the compose snippet.")
+            # Do NOT tell people to switch on the TCP daemon. It is an UNAUTHENTICATED,
+            # root-equivalent endpoint — anything that can reach localhost can then create
+            # containers and mount the filesystem — and switching it on alone wouldn't even
+            # work here, since docker_host() reads DOCKER_HOST, not the Docker Desktop
+            # setting. Recommending a security downgrade that doesn't function is the worst
+            # of both. The compose path needs none of this.
+            return (False, "One-click setup isn't available on Windows: Docker Desktop "
+                           "exposes a named pipe, which this can't speak. Use the compose "
+                           "service above — it does the same thing. (Advanced: setting "
+                           "DOCKER_HOST to a reachable daemon also works, but exposing the "
+                           "Docker API is root-equivalent on that machine.)")
         # Deliberately NOT "mount the docker socket to enable this". The socket is
         # root-equivalent on the host; suggesting it to get a convenience button is bad
         # advice, and the compose snippet reaches the same end state without it.
@@ -298,7 +306,14 @@ def _container_spec(port: int, gpu: bool, image: str, networks: list[str]) -> di
     host_config: dict = {
         # Publish to the host as well as attaching to our network: an Electron user (not
         # in a container) reaches it on 127.0.0.1, and a human can curl it either way.
-        "PortBindings": {f"{SERVER_PORT}/tcp": [{"HostPort": str(port)}]},
+        #
+        # HostIp=127.0.0.1 is LOAD-BEARING. Docker's default is 0.0.0.0, which would put an
+        # unauthenticated inference server on EVERY interface of the host — visible to the
+        # whole LAN — when nothing here needs more than loopback: Electron reaches it on
+        # localhost, and a containerized feedBack reaches it by container NAME over the
+        # shared network, not through the published port at all.
+        "PortBindings": {f"{SERVER_PORT}/tcp": [{"HostIp": "127.0.0.1",
+                                                 "HostPort": str(port)}]},
         "Binds": [f"{CACHE_VOLUME}:/app/cache"],
         "RestartPolicy": {"Name": "unless-stopped"},
     }
@@ -411,10 +426,23 @@ def _assert_port_is_ours(port: int, progress_cb: ProgressCB = None) -> None:
     See the note at DEFAULT_PORT: on Windows a port collision does NOT fail the bind, and
     the result is a container that looks healthy while every request goes to a different
     server. Silently splitting against the wrong server is far worse than failing to start.
+
+    Only meaningful when we are on the HOST. Inside a container, 127.0.0.1 is *this
+    container*, not the Docker host — the probe could never reach the published port, so it
+    would add ~9s of pointless retries to every start and protect nothing. (There is also
+    nothing to collide with there: a containerized app reaches the sidecar by container
+    name, and cannot run a managed local server in the first place.)
     """
     import json as _json
     import urllib.error
     import urllib.request
+
+    try:
+        from demucs_server import in_container
+        if in_container():
+            return
+    except Exception:
+        pass
 
     url = f"http://127.0.0.1:{port}/health"
     for attempt in range(10):          # the server binds fast, but not instantly
@@ -690,7 +718,11 @@ def compose_snippet(port: int = DEFAULT_PORT, gpu: bool = False) -> str:
         f"    container_name: {CONTAINER_NAME}\n"
         "    restart: unless-stopped\n"
         "    ports:\n"
-        f"      - \"{port}:{SERVER_PORT}\"\n"
+        # 127.0.0.1: — loopback only. A bare "7866:7865" is 0.0.0.0 and would put an
+        # unauthenticated inference server on the whole LAN. feedBack reaches this by
+        # container name over the compose network, so it needs no host exposure at all;
+        # the binding is here only so a human can curl it.
+        f"      - \"127.0.0.1:{port}:{SERVER_PORT}\"\n"
         "    volumes:\n"
         f"      - {CACHE_VOLUME}:/app/cache\n"
         "    environment:\n"
