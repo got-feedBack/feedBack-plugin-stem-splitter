@@ -113,6 +113,8 @@ class JobManager:
             "local_server_autostart": True,
             "local_server_use_globally": False,
             "local_server_device": "",   # "" = auto | cpu | cuda
+            # None = decide at install time from whether an NVIDIA GPU is present.
+            "local_server_gpu": None,
         }
         try:
             data = json.loads(self.settings_file.read_text(encoding="utf-8"))
@@ -594,6 +596,18 @@ def setup(app: FastAPI, context: dict) -> None:
         device = str(s.get("local_server_device") or "")
         return port, device
 
+    def _want_gpu(body: dict | None = None) -> bool:
+        """Whether to install the CUDA torch build. An explicit request wins; the
+        setting is next; otherwise default to GPU when a usable NVIDIA card is here
+        (a CPU-only install on a GPU machine is the wrong default - splits go from
+        seconds to minutes)."""
+        if body and body.get("gpu") is not None:
+            return bool(body["gpu"])
+        s = mgr.read_settings()
+        if s.get("local_server_gpu") is not None:
+            return bool(s["local_server_gpu"])
+        return demucs_server.detect_nvidia_gpu() is not None
+
     def _busy() -> dict:
         return {"ok": False, "busy": mgr._server_op_active,
                 "message": f"a server operation ({mgr._server_op_active}) is already "
@@ -616,15 +630,16 @@ def setup(app: FastAPI, context: dict) -> None:
         return {"ok": ok, "url": url, "health": payload}
 
     @app.post(f"{P}/server/install")
-    def post_server_install():
+    def post_server_install(body: dict | None = None):
         # One click = a server that actually works: dependencies AND model weights.
         # Installing without the weights leaves a server that can't split until a
         # second action, which is a confusing half-state.
         port, device = _server_opts()
+        gpu = _want_gpu(body)
         if not mgr.run_server_op("install", lambda cb: demucs_server.setup_server(
-                mgr.config_dir, port=port, device=device, progress_cb=cb)):
+                mgr.config_dir, port=port, device=device, gpu=gpu, progress_cb=cb)):
             return _busy()
-        return {"ok": True, "started": "install"}
+        return {"ok": True, "started": "install", "gpu": gpu}
 
     @app.post(f"{P}/server/start")
     def post_server_start():

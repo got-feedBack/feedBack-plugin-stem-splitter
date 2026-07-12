@@ -74,6 +74,65 @@ DEFAULT_MODEL = "bs_roformer_sw"   # what the plugin splits with; also makes war
 # is exactly what broke a tester's install). These are demucs' real runtime deps.
 _DEMUCS_EXTRAS = ["einops", "julius", "lameenc", "openunmix", "pyyaml", "tqdm", "dora-search"]
 
+# ── GPU / CUDA ───────────────────────────────────────────────────────────────
+# On Windows (and by default everywhere), `pip install torch` from PyPI gives the
+# CPU-ONLY wheel: torch.version.cuda is None, so the server reports Device: cpu even
+# on a machine with a perfectly good NVIDIA card. CUDA builds live on PyTorch's own
+# index and carry a local version tag (e.g. 2.8.0+cu128).
+#
+# whisperx pins torch ~=2.8, so the CUDA build has to be a 2.8 one, and it must go
+# through the SAME single pip resolve as everything else - otherwise we reintroduce
+# the split-transaction bug that produced the numpy/numba conflict.
+#
+# No CUDA Toolkit install is needed: the wheels bundle the CUDA runtime. Only a
+# recent-enough NVIDIA driver is required.
+TORCH_VERSION = os.environ.get("STEM_SPLITTER_TORCH_VERSION", "2.8.0")
+CUDA_TAG = os.environ.get("STEM_SPLITTER_CUDA_TAG", "cu128")
+CUDA_INDEX = f"https://download.pytorch.org/whl/{CUDA_TAG}"
+
+_gpu_memo: dict = {"t": 0.0, "val": None}
+_GPU_TTL = 60.0
+
+
+def detect_nvidia_gpu() -> dict | None:
+    """{name, driver} if an NVIDIA GPU is usable here, else None.
+
+    Uses nvidia-smi (present whenever the driver is), so it works without torch and
+    before anything is installed - which is what lets the installer offer a GPU build
+    up front.
+    """
+    now = time.monotonic()
+    if _gpu_memo["val"] is not None and now - _gpu_memo["t"] < _GPU_TTL:
+        return _gpu_memo["val"] or None
+
+    gpu = None
+    try:
+        p = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,driver_version",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=15)
+        if p.returncode == 0 and p.stdout.strip():
+            first = p.stdout.strip().splitlines()[0]
+            parts = [x.strip() for x in first.split(",")]
+            if parts and parts[0]:
+                gpu = {"name": parts[0],
+                       "driver": parts[1] if len(parts) > 1 else ""}
+    except Exception:
+        gpu = None   # no driver / not NVIDIA / nvidia-smi absent
+
+    _gpu_memo["t"] = now
+    _gpu_memo["val"] = gpu or {}
+    return gpu
+
+
+def install_info(config_dir: Path) -> dict:
+    """What the last install actually produced (notably: GPU or CPU torch)."""
+    try:
+        data = json.loads((server_dir(config_dir) / "install.json").read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
 # Track a server we started in THIS process, so we can stream its output and reap it.
 _proc: subprocess.Popen | None = None
 _proc_lock = threading.Lock()
@@ -439,7 +498,8 @@ def patch_driver_scripts(config_dir: Path) -> list[str]:
     return patched
 
 
-def install_server(config_dir: Path, progress_cb: ProgressCB = None) -> dict:
+def install_server(config_dir: Path, gpu: bool = False,
+                   progress_cb: ProgressCB = None) -> dict:
     """Download the source and install the server's dependencies (pip --target).
 
     Explicit-only (the "Install server" button). Several GB of wheels.
@@ -466,6 +526,23 @@ def install_server(config_dir: Path, progress_cb: ProgressCB = None) -> dict:
     req = src_dir(config_dir) / "requirements.txt"
     tgt = ["--target", str(target)]
 
+    # GPU: pin the CUDA torch build INTO the same resolve rather than installing it
+    # in a separate pass. A second transaction can't see what the first one pinned
+    # (pip --target doesn't treat the target as an environment), which is exactly how
+    # the numpy/numba conflict got in. The +cuXXX local tag only exists on PyTorch's
+    # index, so pinning it forces the CUDA wheel instead of PyPI's CPU default.
+    gpu_args: list[str] = []
+    if gpu:
+        gpu_args = [
+            f"torch=={TORCH_VERSION}+{CUDA_TAG}",
+            f"torchaudio=={TORCH_VERSION}+{CUDA_TAG}",
+            "--extra-index-url", CUDA_INDEX,
+        ]
+        _emit(progress_cb,
+              f"GPU build requested: torch {TORCH_VERSION}+{CUDA_TAG} "
+              f"(~2.5 GB; no CUDA Toolkit needed, the wheel bundles the runtime)",
+              0.10, "Preparing")
+
     # ONE resolve for everything that has dependencies. Splitting these across
     # separate pip transactions is what broke the install: each transaction resolves
     # on its own, so a later step upgraded numpy to 2.5 while numba (pulled in via
@@ -477,8 +554,8 @@ def install_server(config_dir: Path, progress_cb: ProgressCB = None) -> dict:
     # torchaudio<2.1 (whisperx needs ~2.8) and drags in diffq, a C-extension with no
     # wheels. It adds no transitive deps that way, so it can't perturb the resolve.
     steps: list[tuple[str, list[str], int]] = [
-        ("server dependencies",
-         tgt + ["-r", str(req), *_DEMUCS_EXTRAS], 9 + len(_DEMUCS_EXTRAS)),
+        ("server dependencies" + (" (GPU/CUDA)" if gpu else ""),
+         tgt + ["-r", str(req), *_DEMUCS_EXTRAS, *gpu_args], 9 + len(_DEMUCS_EXTRAS)),
         ("demucs (no-deps)", tgt + ["--no-deps", "demucs"], 1),
     ]
     n = len(steps) + 1  # + the verify step
@@ -488,12 +565,21 @@ def install_server(config_dir: Path, progress_cb: ProgressCB = None) -> dict:
 
     with _disk_lock:
         _disk_memo.clear()   # the tree just changed materially
+    try:
+        (server_dir(config_dir) / "install.json").write_text(json.dumps({
+            "gpu": bool(gpu),
+            "torch": f"{TORCH_VERSION}+{CUDA_TAG}" if gpu else "cpu",
+            "installed_at": time.time(),
+        }, indent=2), encoding="utf-8")
+    except OSError as e:
+        log.warning("stem_splitter: could not record install info: %s", e)
+
     write_launcher(config_dir)
     patched = patch_driver_scripts(config_dir)
     if patched:
         _emit(progress_cb, f"Bootstrapped {', '.join(patched)} to see the dependency tree.",
               0.95, "Preparing")
-    verify_install(config_dir, progress_cb)
+    verify_install(config_dir, gpu=gpu, progress_cb=progress_cb)
 
     _emit(progress_cb, "Server installed.", 1.0, "Done")
     return server_status(config_dir)
@@ -506,7 +592,8 @@ _VERIFY_IMPORTS = ("fastapi", "uvicorn", "torch", "soundfile",
                    "torchcrepe", "demucs", "audio_separator")
 
 
-def verify_install(config_dir: Path, progress_cb: ProgressCB = None) -> None:
+def verify_install(config_dir: Path, gpu: bool = False,
+                   progress_cb: ProgressCB = None) -> None:
     """Import-check the freshly installed tree.
 
     Catches incompatible-pin breakage (e.g. numba vs numpy) at install time, with
@@ -541,6 +628,8 @@ def verify_install(config_dir: Path, progress_cb: ProgressCB = None) -> None:
                           text=True, env=_server_env(config_dir), timeout=600)
     out = (proc.stdout or "") + (proc.stderr or "")
     if "VERIFY_OK" in out:
+        if gpu:
+            _verify_cuda(config_dir, progress_cb)
         _emit(progress_cb, "Dependencies verified.", 0.99, "Verifying")
         return
 
@@ -570,7 +659,8 @@ def _scaled(progress_cb: ProgressCB, base: float, span: float) -> ProgressCB:
 
 
 def setup_server(config_dir: Path, port: int = DEFAULT_PORT, device: str = "",
-                 model: str = DEFAULT_MODEL, progress_cb: ProgressCB = None) -> dict:
+                 model: str = DEFAULT_MODEL, gpu: bool = False,
+                 progress_cb: ProgressCB = None) -> dict:
     """One-click setup: install the server AND download its models.
 
     This is what the "Install server" button runs. Installing without the weights
@@ -582,7 +672,7 @@ def setup_server(config_dir: Path, port: int = DEFAULT_PORT, device: str = "",
           0.0, "Setting up")
 
     # Dependencies take the bulk of the wall-clock, models the rest.
-    install_server(config_dir, progress_cb=_scaled(progress_cb, 0.0, 0.55))
+    install_server(config_dir, gpu=gpu, progress_cb=_scaled(progress_cb, 0.0, 0.55))
     prepare_models(config_dir, port=port, device=device, model=model,
                    progress_cb=_scaled(progress_cb, 0.55, 0.45))
 
@@ -825,6 +915,35 @@ def start_server(config_dir: Path, port: int = DEFAULT_PORT, device: str = "",
     raise RuntimeError(f"server did not answer /health on {url} within 20s")
 
 
+def _verify_cuda(config_dir: Path, progress_cb: ProgressCB = None) -> None:
+    """A GPU install that silently landed a CPU wheel is the whole bug we're fixing -
+    so prove torch actually sees CUDA rather than trusting the pin."""
+    code = (
+        "import sys\n"
+        f"sys.path.insert(0, {str(pylibs_dir(config_dir))!r})\n"
+        "import torch\n"
+        "print('CUDA_BUILD:%s|%s' % (torch.version.cuda, torch.cuda.is_available()))\n"
+    )
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                          text=True, env=_server_env(config_dir), timeout=600)
+    out = (proc.stdout or "") + (proc.stderr or "")
+    line = next((l for l in out.splitlines() if l.startswith("CUDA_BUILD:")), "")
+    built, avail = (line.split(":", 1)[1].split("|") + ["", ""])[:2] if line else ("", "")
+
+    if built in ("", "None"):
+        raise RuntimeError(
+            "a GPU build was requested but the installed torch has no CUDA support "
+            f"(torch.version.cuda is None). The CPU wheel was resolved instead. Try a "
+            f"different CUDA build via STEM_SPLITTER_CUDA_TAG (current: {CUDA_TAG})."
+        )
+    if avail.strip() != "True":
+        _emit(progress_cb,
+              f"torch has CUDA {built} but no GPU is visible right now - the server "
+              "will fall back to CPU. Check the NVIDIA driver.", 0.98, "Verifying")
+        return
+    _emit(progress_cb, f"GPU ready: torch CUDA {built} available.", 0.98, "Verifying")
+
+
 def _startup_failure_message(rc: int | None, tail: list[str]) -> str:
     """Turn an immediate server exit into something actionable.
 
@@ -1043,6 +1162,10 @@ def server_status(config_dir: Path) -> dict:
         # False on deployments where a plugin-managed server makes no sense
         # (no pip, or a read-only config dir). The UI disables the section.
         "source": source_meta(config_dir),   # {repo, ref, commit} actually installed
+        # GPU picture: what hardware is here vs what the install actually built.
+        # A machine with a GPU but a CPU-only torch is the case worth surfacing.
+        "gpu_detected": detect_nvidia_gpu(),
+        "gpu_build": bool(install_info(config_dir).get("gpu")),
         "manageable": manageable,
         "manage_reason": manage_reason,
         # Non-blocking note (e.g. "you're in a container") shown alongside the controls.

@@ -78,6 +78,27 @@ in the background on launch. This never slows startup and never downloads:
 `demucs_server_url`, so other parts of the app use it too. Without it, only this plugin
 does (and your own `demucs_server_url` is left untouched).
 
+### GPU (CUDA)
+
+**Plain `pip install torch` gives the CPU-only wheel** — so a naive install leaves an
+NVIDIA card completely idle and every split runs at CPU speed (minutes instead of
+seconds). The installer therefore:
+
+- **detects an NVIDIA GPU** (via `nvidia-smi`) and ticks **Use GPU (CUDA)** by default
+  when one is present;
+- installs the **CUDA torch build** (`torch==2.8.0+cu128` from PyTorch's index) — pinned
+  *inside the same single pip resolve* as everything else, so it can't reintroduce a
+  conflicting dependency tree;
+- **verifies after installing** that `torch.version.cuda` is actually set and a GPU is
+  visible, rather than trusting the pin.
+
+**No CUDA Toolkit is needed** — the wheels bundle the CUDA runtime; you just need a
+recent NVIDIA driver. The GPU build is a bigger download (~5.5 GB vs ~3 GB).
+
+If you already installed the CPU build on a GPU machine, the status shows
+**"CPU-only build — GPU idle"** and the button offers **Reinstall with GPU**. Override the
+CUDA build with `STEM_SPLITTER_CUDA_TAG` (e.g. `cu126`) if `cu128` doesn't suit your driver.
+
 ### Requirements
 
 Needs `pip` and a writable config dir — no `venv` (the packaged Windows app bundles the

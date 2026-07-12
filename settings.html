@@ -127,6 +127,7 @@
     <div>
       <label><input type="checkbox" id="ss-srv-autostart"> Start with the app</label>
       <label><input type="checkbox" id="ss-srv-global"> Use for the whole app</label>
+      <label><input type="checkbox" id="ss-srv-gpu"> <span id="ss-srv-gpu-label">Use GPU (CUDA)</span></label>
     </div>
   </div>
 
@@ -170,6 +171,10 @@
       $('ss-srv-device').value = s.local_server_device || '';
       $('ss-srv-autostart').checked = !!s.local_server_autostart;
       $('ss-srv-global').checked = !!s.local_server_use_globally;
+      if (s.local_server_gpu !== null && typeof s.local_server_gpu !== 'undefined') {
+        $('ss-srv-gpu').checked = !!s.local_server_gpu;
+        gpuTouched = true;
+      }
       // /config carries only the cheap install map now; the full status
       // (with the expensive cache-size walk) comes from /engine_status.
       renderStatus(null);
@@ -226,6 +231,7 @@
       local_server_device: $('ss-srv-device').value,
       local_server_autostart: $('ss-srv-autostart').checked,
       local_server_use_globally: $('ss-srv-global').checked,
+      local_server_gpu: $('ss-srv-gpu').checked,
     };
     j('/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
       .then(function () { $('ss-set-saved').textContent = 'Saved.'; setTimeout(function () { $('ss-set-saved').textContent = ''; }, 2000); });
@@ -375,6 +381,7 @@
   function srvLog(line) { $('ss-srv-progress').style.display = 'block'; appendLog($('ss-srv-log'), line); }
 
   var lastServerStatus = null;
+  var gpuTouched = false;   // did the user set the GPU box themselves?
 
   // The toggle's colour tracks the SERVER's state (red = down, green = up); its label
   // says what a click will do. Previously Start was always green and Stop always grey,
@@ -392,6 +399,29 @@
     var btn = $('ss-srv-install'), label = $('ss-srv-install-label');
     if (!btn || !label) return;
     if (!st) { btn.disabled = true; return; }
+
+    // Only offer the GPU build when there's actually an NVIDIA card to use it, and
+    // default it on in that case - a CPU install on a GPU box is minutes vs seconds.
+    var gpuBox = $('ss-srv-gpu'), gpuLabel = $('ss-srv-gpu-label');
+    var g = st.gpu_detected;
+    if (g) {
+      gpuBox.disabled = false;
+      gpuLabel.textContent = 'Use GPU (CUDA) - ' + g.name;
+      if (!gpuTouched && !st.installed) gpuBox.checked = true;
+    } else {
+      gpuBox.disabled = true;
+      gpuBox.checked = false;
+      gpuLabel.textContent = 'Use GPU (CUDA) - no NVIDIA GPU detected';
+    }
+
+    // A GPU box running a CPU-only install: offer the rebuild rather than greying out.
+    if (st.installed && g && !st.gpu_build && gpuBox.checked) {
+      setBtnTone('ss-srv-install', 'amber');
+      label.textContent = 'Reinstall with GPU (~5.5 GB)';
+      btn.disabled = serverBusy || !serverManageable;
+      btn.title = 'torch is the CPU-only build; rebuild it against CUDA to use ' + g.name;
+      return;
+    }
 
     if (!st.installed) {
       setBtnTone('ss-srv-install', 'blue');
@@ -463,6 +493,18 @@
 
     chips.push(st.models_downloaded ? chip('Models downloaded', 'ok')
                                     : chip('Models not downloaded', 'warn'));
+
+    // The case worth shouting about: a GPU is sitting right there, but the install
+    // built CPU-only torch, so every split runs at CPU speed for no reason.
+    var g = st.gpu_detected;
+    if (st.installed && g && !st.gpu_build) {
+      chips.push(chip('CPU-only build - GPU idle', 'warn',
+                      { title: g.name + ' detected. Reinstall with GPU to use it.' }));
+    } else if (st.installed && st.gpu_build) {
+      chips.push(chip('GPU build' + (g ? ' - ' + g.name : ''), 'ok'));
+    } else if (!st.installed && g) {
+      chips.push(chip('GPU available - ' + g.name, 'info'));
+    }
     if (st.running && st.models_ready) chips.push(chip('Warm · ready to split', 'ok'));
 
     // Per-model warmup detail (pending / downloading / ready / failed).
@@ -526,6 +568,30 @@
       }).catch(function () {});
     }
   }
+
+  function serverOpBody(path, label, body) {
+    setServerButtons(true);
+    $('ss-srv-progress').style.display = 'block';
+    $('ss-srv-log').textContent = label + '…\n';
+    setSrvBar(0.02, label);
+    connectWS();
+    return j(path, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                     body: JSON.stringify(body || {}) })
+      .then(function (res) {
+        if (res && res.ok === false && res.busy) {
+          srvLog('… ' + res.message);
+          setSrvBar(0, 'Busy: ' + res.busy);
+          setServerButtons(false);
+        }
+        return res;
+      }).catch(function (err) {
+        srvLog('✗ ' + label + ' failed: ' + err);
+        setSrvBar(0, 'Failed');
+        setServerButtons(false);
+      });
+  }
+
+  $('ss-srv-gpu').addEventListener('change', function () { gpuTouched = true; });
 
   function serverOp(path, label) {
     setServerButtons(true);
