@@ -1,5 +1,31 @@
 <!-- Stem Splitter settings — injected into the app Settings panel. Scoped under
      .stem-splitter-settings. Nothing heavy loads until the user clicks Download. -->
+<style>
+/* Scoped to the plugin's settings root. Inlined on purpose: the plugin's
+   stylesheet (assets/plugin.css) is only loaded on the plugin SCREEN, not in the
+   app's Settings panel, so status styling has to live here. */
+#ss-settings .ss-statusbar {
+  display: flex; flex-wrap: wrap; gap: .4rem; align-items: center;
+  margin: .5rem 0 .75rem;
+}
+#ss-settings .ss-chip {
+  display: inline-flex; align-items: center; gap: .35rem;
+  padding: .22rem .6rem; border-radius: 999px;
+  font-size: .78rem; font-weight: 600; line-height: 1.2;
+  border: 1px solid transparent; white-space: nowrap;
+}
+#ss-settings .ss-chip.ok   { background: rgba(34,197,94,.16);  color: #4ade80; border-color: rgba(34,197,94,.35); }
+#ss-settings .ss-chip.warn { background: rgba(234,179,8,.16);  color: #facc15; border-color: rgba(234,179,8,.35); }
+#ss-settings .ss-chip.bad  { background: rgba(239,68,68,.16);  color: #f87171; border-color: rgba(239,68,68,.35); }
+#ss-settings .ss-chip.info { background: rgba(59,130,246,.16); color: #93c5fd; border-color: rgba(59,130,246,.35); }
+#ss-settings .ss-chip.off  { background: rgba(148,163,184,.12); color: #94a3b8; border-color: rgba(148,163,184,.25); }
+#ss-settings .ss-chip .dot { width: .5rem; height: .5rem; border-radius: 50%; background: currentColor; }
+#ss-settings .ss-chip.live .dot { animation: ss-pulse 1.4s ease-in-out infinite; }
+@keyframes ss-pulse { 0%,100% { opacity: 1 } 50% { opacity: .25 } }
+#ss-settings .ss-note { font-size: .78rem; color: #94a3b8; margin: .1rem 0 .6rem; }
+#ss-settings .ss-note.warn { color: #facc15; }
+</style>
+
 <div class="stem-splitter-settings" id="ss-settings">
   <h3>Stem Splitter</h3>
   <p class="ss-muted">Pick how splitting and lyric transcription run. Remote uses the
@@ -43,7 +69,8 @@
     <span id="ss-set-saved" class="ss-muted"></span></div>
 
   <h3 style="margin-top:1.75rem">Local engine (opt-in download)</h3>
-  <p class="ss-muted" id="ss-engine-status">Checking…</p>
+  <div class="ss-statusbar" id="ss-engine-chips"><span class="ss-chip off">Checking…</span></div>
+  <p class="ss-note" id="ss-engine-note"></p>
   <div class="row">
     <button class="ss-btn" id="ss-dl-all" style="background:#2563eb;color:#fff;border:0;border-radius:7px;padding:.45rem .85rem;font-weight:600;cursor:pointer">Download local engine + models (~2 GB+)</button>
     <button class="ss-btn" id="ss-dl-as" style="background:rgba(148,163,184,.2);color:#e2e8f0;border:0;border-radius:7px;padding:.45rem .85rem;cursor:pointer">audio-separator only</button>
@@ -64,7 +91,8 @@
   <p class="ss-muted">Run got-feedBack's demucs/whisperx server on this machine. Once it's running the
     plugin uses it automatically. Starting it is cheap — the big model download only happens when you
     click <em>Prepare models</em>.</p>
-  <p class="ss-muted" id="ss-srv-status">Checking…</p>
+  <div class="ss-statusbar" id="ss-srv-chips"><span class="ss-chip off">Checking…</span></div>
+  <p class="ss-note" id="ss-srv-note"></p>
 
   <div class="row">
     <div>
@@ -130,21 +158,42 @@
     loadServerStatus();
   }
 
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+    });
+  }
+  // tone: ok | warn | bad | info | off. `live` adds a pulsing dot.
+  function chip(label, tone, opts) {
+    opts = opts || {};
+    return '<span class="ss-chip ' + tone + (opts.live ? ' live' : '') + '"'
+      + (opts.title ? ' title="' + esc(opts.title) + '"' : '') + '>'
+      + (opts.dot ? '<i class="dot"></i>' : '') + esc(label) + '</span>';
+  }
+  function gb(bytes) { return ((bytes || 0) / 1e9).toFixed(2) + ' GB'; }
+
   function renderStatus(st) {
     if (!st) { j('/engine_status').then(renderStatus); return; }
     var inst = st.installed || {};
-    var parts = Object.keys(inst).map(function (k) { return k + ': ' + (inst[k] ? '✓' : '—'); });
-    var gb = (st.engine_bytes + st.models_bytes) / 1e9;
-    var text = parts.join('   ') + '   (' + gb.toFixed(2) + ' GB on disk';
+    var chips = Object.keys(inst).map(function (k) {
+      return inst[k] ? chip(k + ' ✓', 'ok') : chip(k + ' —', 'off');
+    });
+    var onDisk = (st.engine_bytes || 0) + (st.models_bytes || 0);
+    chips.push(chip(gb(onDisk) + ' on disk', onDisk ? 'info' : 'off'));
+    $('ss-engine-chips').innerHTML = chips.join('');
+
     // The app pins TORCH_HOME/HF_HOME to the shared ~/.cache dirs, so some weights
-    // land there rather than in our models dir. Say so, since Uninstall won't
-    // reclaim them.
+    // land there rather than in our models dir. Say so — Uninstall won't reclaim them.
+    var note = $('ss-engine-note');
     if (st.external_cache_bytes) {
-      text += ' + ' + (st.external_cache_bytes / 1e9).toFixed(2) + ' GB in shared caches, not removed by Uninstall';
+      note.textContent = '⚠ ' + gb(st.external_cache_bytes)
+        + ' of model weights also live in shared caches and are NOT removed by Uninstall — '
+        + (st.external_caches || []).map(function (c) { return c.path; }).join(', ');
+      note.className = 'ss-note warn';
+    } else {
+      note.textContent = '';
+      note.className = 'ss-note';
     }
-    $('ss-engine-status').textContent = text + ')';
-    $('ss-engine-status').title = (st.external_caches || [])
-      .map(function (c) { return c.label + ': ' + c.path; }).join('\n');
   }
 
   function save() {
@@ -306,47 +355,79 @@
   function srvLog(line) { $('ss-srv-progress').style.display = 'block'; appendLog($('ss-srv-log'), line); }
 
   var lastServerStatus = null;
+  var WARMUP_TONE = { ready: 'ok', skipped: 'ok', downloading: 'warn',
+                      pending: 'off', failed: 'bad', evicted: 'off' };
+
   function renderServerStatus(st) {
     lastServerStatus = st || null;
-    var el = $('ss-srv-status');
-    if (!st) { el.textContent = 'Status unavailable.'; return; }
+    var bar = $('ss-srv-chips'), note = $('ss-srv-note');
+    if (!st) { bar.innerHTML = chip('Status unavailable', 'bad'); return; }
 
-    // Deployments where a plugin-managed server can't work (the app running in a
-    // Python with no pip, a read-only config dir): disable the section and say why, rather
-    // than letting the user start an install that cannot succeed.
+    // Deployments where a managed server can't work (no pip, read-only config dir):
+    // disable the section and say why, rather than letting the user start an install
+    // that cannot succeed.
     if (st.manageable === false) {
       serverManageable = false;
-      el.textContent = 'Unavailable here — ' + (st.manage_reason || '');
-      el.style.color = '#facc15';
+      bar.innerHTML = chip('Unavailable here', 'bad', { dot: true });
+      note.textContent = st.manage_reason || '';
+      note.className = 'ss-note warn';
       setServerButtons(true);
       return;
     }
     serverManageable = true;
-    el.style.color = '';
 
-    var bits = [];
+    var chips = [];
     if (!st.installed) {
-      bits.push('Not installed');
+      chips.push(chip('Not installed', 'off', { dot: true }));
     } else if (st.running) {
+      chips.push(chip('Running · :' + st.port, 'ok', { dot: true, live: true }));
       var h = st.health || {};
-      bits.push('Running on port ' + st.port);
-      if (h.device) bits.push(h.device + (h.gpu ? ' (GPU)' : ''));
-      var wu = h.warmup || {};
-      var wuBits = Object.keys(wu).map(function (k) { return k + ':' + wu[k]; });
-      if (wuBits.length) bits.push('warmup ' + wuBits.join(' '));
+      if (h.device) chips.push(chip(h.device.toUpperCase() + (h.gpu ? ' · GPU' : ''),
+                                    h.gpu ? 'ok' : 'info'));
     } else {
-      bits.push('Installed, not running');
+      chips.push(chip('Installed · stopped', 'warn', { dot: true }));
     }
-    bits.push(st.models_downloaded ? 'models downloaded' : 'models NOT downloaded');
-    if (st.disk_bytes) bits.push((st.disk_bytes / 1e9).toFixed(2) + ' GB on disk');
-    el.textContent = bits.join(' · ');
-    if (st.advisory) { el.textContent += '  ⚠ ' + st.advisory; el.style.color = '#facc15'; }
+
+    chips.push(st.models_downloaded ? chip('Models downloaded', 'ok')
+                                    : chip('Models not downloaded', 'warn'));
+    if (st.running && st.models_ready) chips.push(chip('Warm · ready to split', 'ok'));
+
+    // Per-model warmup detail (pending / downloading / ready / failed).
+    var wu = (st.health || {}).warmup || {};
+    Object.keys(wu).forEach(function (k) {
+      var v = wu[k];
+      if (typeof v !== 'string') return;
+      chips.push(chip(k + ': ' + v, WARMUP_TONE[v] || 'off',
+                      { live: v === 'downloading' , dot: v === 'downloading' }));
+    });
+
+    if (st.disk_bytes) chips.push(chip(gb(st.disk_bytes) + ' on disk', 'info'));
+    bar.innerHTML = chips.join('');
+
+    var notes = [];
+    if (st.advisory) notes.push('⚠ ' + st.advisory);
+    if (st.source && st.source.commit) {
+      notes.push('source: ' + st.source.ref + ' @ ' + String(st.source.commit).slice(0, 8));
+    }
+    note.textContent = notes.join('   ');
+    note.className = st.advisory ? 'ss-note warn' : 'ss-note';
+
     syncGlobalUrl(st);
   }
 
   function loadServerStatus() {
     return j('/server_status').then(renderServerStatus).catch(function () {});
   }
+
+  // Poll while the server is up but not yet warm, so the per-model warmup chips
+  // tick from pending -> downloading -> ready on their own. Idle otherwise (and
+  // stops entirely once everything is ready) so we're not hammering /health.
+  setInterval(function () {
+    var st = lastServerStatus;
+    if (!serverManageable || !st) return;
+    var busy = st.running && !st.models_ready;
+    if (busy) loadServerStatus();
+  }, 5000);
 
   // "Use for the whole app": mirror the running local URL into the app's own
   // demucs_server_url via the app's writer (it holds the settings lock + does an
