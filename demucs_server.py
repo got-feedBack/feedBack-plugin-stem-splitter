@@ -88,9 +88,96 @@ def venv_python(config_dir: Path) -> Path:
     return v / "Scripts" / "python.exe" if os.name == "nt" else v / "bin" / "python"
 
 
+def _base_python() -> str:
+    """The interpreter to build the venv with.
+
+    NOT ``sys.executable``: the app may be running under a *copied* python.exe
+    (feedBack's Windows setup keeps a `python3.exe` shim that is a bare copy of
+    `C:\\Python313\\python.exe`). venv clones that copy, and the clone can't find
+    the base install, so `ensurepip` dies with exit 103 and venv creation fails.
+
+    ``sys.base_prefix`` still points at the real installation in that case, so
+    resolve the interpreter from there and fall back to sys.executable only if
+    that doesn't pan out.
+    """
+    base = Path(sys.base_prefix)
+    candidates = ([base / "python.exe"] if os.name == "nt"
+                  else [base / "bin" / "python3", base / "bin" / "python"])
+    for c in candidates:
+        if c.is_file():
+            return str(c)
+    return sys.executable
+
+
 def installed(config_dir: Path) -> bool:
     """Source fetched AND a venv interpreter exists."""
     return (src_dir(config_dir) / "server.py").is_file() and venv_python(config_dir).is_file()
+
+
+# ── can we manage a server in this deployment at all? ────────────────────────
+
+def in_container() -> bool:
+    """Are we inside Docker/Podman/k8s?
+
+    The app also ships as a container. Standing a demucs server up *inside* that
+    container is the wrong answer: the image doesn't carry the deps, the disk is
+    ephemeral, and 127.0.0.1 isn't the host anyway. Those users should run the
+    demucs-server container and point `demucs_server_url` at it.
+    """
+    if os.environ.get("container") or Path("/.dockerenv").exists():
+        return True
+    try:
+        cg = Path("/proc/1/cgroup")
+        if cg.exists():
+            txt = cg.read_text(errors="ignore")
+            if any(m in txt for m in ("docker", "containerd", "kubepods", "podman")):
+                return True
+    except OSError:
+        pass
+    return False
+
+
+def _python_has_venv(python_exe: str) -> bool:
+    try:
+        p = subprocess.run([python_exe, "-m", "venv", "--help"],
+                           capture_output=True, text=True, timeout=30)
+        return p.returncode == 0
+    except Exception:
+        return False
+
+
+def can_manage(config_dir: Path) -> tuple[bool, str]:
+    """Can this deployment run a plugin-managed local server?
+
+    Returns (ok, reason). The UI disables the whole section and shows `reason`
+    when this is False, instead of letting the user kick off an install that
+    cannot possibly work here.
+    """
+    if in_container():
+        return (False,
+                "The app is running in a container. Run the demucs server as its own "
+                "container (see got-feedBack/feedBack-demucs-server) and set "
+                "'demucs_server_url' to point at it - a server started inside this "
+                "container would not survive or be reachable.")
+
+    base = _base_python()
+    if not _python_has_venv(base):
+        return (False,
+                f"This build's Python ({base}) has no usable 'venv' module, so the "
+                "server's isolated environment can't be created. Install a standard "
+                "Python 3.10+ and restart, or run the demucs server separately and "
+                "set 'demucs_server_url'.")
+
+    try:
+        Path(config_dir).mkdir(parents=True, exist_ok=True)
+        probe = Path(config_dir) / ".stem_splitter_write_probe"
+        probe.write_text("1", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+    except OSError as e:
+        return (False, f"The config directory isn't writable ({e}), so the server "
+                       "can't be installed here.")
+
+    return (True, "")
 
 
 def models_downloaded(config_dir: Path) -> bool:
@@ -146,11 +233,66 @@ def download_source(config_dir: Path, progress_cb: ProgressCB = None) -> None:
     _emit(progress_cb, f"Source ready ({len(got)} files).", 0.08, "Downloading source")
 
 
+def _create_venv(config_dir: Path, progress_cb: ProgressCB = None) -> None:
+    """Create the server's venv, tolerating a broken ``ensurepip``.
+
+    Some interpreters (notably a copied python.exe) can create the venv but fail
+    ``ensurepip`` with exit 103. In that case build the venv WITHOUT pip and
+    bootstrap pip into it from the parent interpreter's own pip, which works fine.
+    """
+    vdir = venv_dir(config_dir)
+    base = _base_python()
+    _emit(progress_cb, f"Creating virtual environment (using {base})…", 0.10, "venv")
+
+    proc = subprocess.run([base, "-m", "venv", str(vdir)], capture_output=True, text=True)
+    if proc.returncode == 0 and venv_python(config_dir).is_file():
+        return
+
+    err = (proc.stderr or proc.stdout or "").strip()
+    _emit(progress_cb, f"venv with pip failed ({err[:160]}); retrying without pip…",
+          0.10, "venv")
+
+    shutil.rmtree(vdir, ignore_errors=True)
+    proc = subprocess.run([base, "-m", "venv", "--without-pip", str(vdir)],
+                          capture_output=True, text=True)
+    if proc.returncode != 0 or not venv_python(config_dir).is_file():
+        raise RuntimeError(
+            "failed to create the server's virtualenv: "
+            f"{(proc.stderr or proc.stdout or err)[:300]}"
+        )
+
+    # Bootstrap pip into the fresh venv.
+    vpy = str(venv_python(config_dir))
+    boot = subprocess.run([vpy, "-m", "ensurepip", "--upgrade", "--default-pip"],
+                          capture_output=True, text=True)
+    if boot.returncode != 0:
+        _emit(progress_cb, "ensurepip unavailable; bootstrapping pip via get-pip…",
+              0.11, "venv")
+        import requests
+        gp = server_dir(config_dir) / "get-pip.py"
+        r = requests.get("https://bootstrap.pypa.io/get-pip.py", timeout=60)
+        if r.status_code != 200:
+            raise RuntimeError(f"could not download get-pip.py ({r.status_code})")
+        gp.write_bytes(r.content)
+        boot = subprocess.run([vpy, str(gp)], capture_output=True, text=True)
+        gp.unlink(missing_ok=True)
+        if boot.returncode != 0:
+            raise RuntimeError(
+                "could not bootstrap pip into the server venv: "
+                f"{(boot.stderr or boot.stdout)[:300]}"
+            )
+    _emit(progress_cb, "Virtual environment ready.", 0.12, "venv")
+
+
 def install_server(config_dir: Path, progress_cb: ProgressCB = None) -> dict:
     """Download the source, create a venv, and install the server's dependencies.
 
     Explicit-only (the "Install server" button). Several GB of wheels.
     """
+    ok, reason = can_manage(config_dir)
+    if not ok:
+        raise RuntimeError(reason)
+
     server_dir(config_dir).mkdir(parents=True, exist_ok=True)
     cache_dir(config_dir).mkdir(parents=True, exist_ok=True)
 
@@ -158,11 +300,8 @@ def install_server(config_dir: Path, progress_cb: ProgressCB = None) -> dict:
 
     vpy = venv_python(config_dir)
     if not vpy.is_file():
-        _emit(progress_cb, "Creating virtual environment…", 0.10, "venv")
-        proc = subprocess.run([sys.executable, "-m", "venv", str(venv_dir(config_dir))],
-                              capture_output=True, text=True)
-        if proc.returncode != 0:
-            raise RuntimeError(f"failed to create venv: {(proc.stderr or proc.stdout)[:300]}")
+        _create_venv(config_dir, progress_cb)
+        vpy = venv_python(config_dir)
     if not vpy.is_file():
         raise RuntimeError(f"venv python not found at {vpy}")
 
@@ -462,6 +601,7 @@ def server_status(config_dir: Path) -> dict:
         if ok:
             models_ready = _model_ready(health.get("warmup") or {}, DEFAULT_MODEL)
 
+    manageable, manage_reason = can_manage(config_dir)
     return {
         "installed": installed(config_dir),
         "running": running,
@@ -473,4 +613,8 @@ def server_status(config_dir: Path) -> dict:
         "models_ready": models_ready,
         "server_dir": str(server_dir(config_dir)),
         "disk_bytes": engine_install._dir_size(server_dir(config_dir)),
+        # False on deployments where a plugin-managed server makes no sense
+        # (Docker) or can't be built (no venv). The UI disables the section.
+        "manageable": manageable,
+        "manage_reason": manage_reason,
     }

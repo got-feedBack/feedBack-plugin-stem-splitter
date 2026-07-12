@@ -284,8 +284,10 @@
   // ── managed demucs server ──────────────────────────────────────────────────
   var SERVER_BTNS = ['ss-srv-install', 'ss-srv-start', 'ss-srv-stop', 'ss-srv-test',
                      'ss-srv-prepare', 'ss-srv-uninstall'];
+  var serverManageable = true;   // set false on Docker / no-venv deployments
   function setServerButtons(disabled) {
-    SERVER_BTNS.forEach(function (id) { var el = $(id); if (el) el.disabled = disabled; });
+    var d = disabled || !serverManageable;   // never re-enable an unsupported section
+    SERVER_BTNS.forEach(function (id) { var el = $(id); if (el) el.disabled = d; });
   }
   function setSrvBar(pct, phase) {
     $('ss-srv-fill').style.width = Math.round((pct || 0) * 100) + '%';
@@ -299,6 +301,20 @@
     lastServerStatus = st || null;
     var el = $('ss-srv-status');
     if (!st) { el.textContent = 'Status unavailable.'; return; }
+
+    // Deployments where a plugin-managed server can't work (the app running in a
+    // container; a Python with no venv): disable the section and say why, rather
+    // than letting the user start an install that cannot succeed.
+    if (st.manageable === false) {
+      serverManageable = false;
+      el.textContent = 'Unavailable here — ' + (st.manage_reason || '');
+      el.style.color = '#facc15';
+      setServerButtons(true);
+      return;
+    }
+    serverManageable = true;
+    el.style.color = '';
+
     var bits = [];
     if (!st.installed) {
       bits.push('Not installed');

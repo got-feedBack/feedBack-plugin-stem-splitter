@@ -746,6 +746,10 @@ def setup(app: FastAPI, context: dict) -> None:
             s = mgr.read_settings()
             if not s.get("local_server_autostart"):
                 return
+            manageable, reason = demucs_server.can_manage(mgr.config_dir)
+            if not manageable:
+                log.info("stem_splitter: not auto-starting a local server here (%s)", reason)
+                return
             if not demucs_server.installed(mgr.config_dir):
                 return  # nothing installed -> nothing to start
             port, device = _server_opts()
