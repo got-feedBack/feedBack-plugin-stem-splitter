@@ -106,6 +106,27 @@ def _normalize_stem_id(raw_name: str) -> str | None:
     return None
 
 
+def _module_cmd(engine_dir: str | None, module: str, argv: list[str]) -> list[str]:
+    """Build a command that runs ``python -m <module>`` in a subprocess that can
+    actually SEE the plugin's engine packages.
+
+    A plain ``-m demucs`` cannot: the engine is a ``pip --target`` tree that we add
+    to *this* process's ``sys.path``, and a child does not inherit sys.path. Setting
+    ``PYTHONPATH`` doesn't fix it either — the packaged Windows app bundles the
+    python.org embeddable distribution, which runs in isolated ``._pth`` mode where
+    **PYTHONPATH is ignored**. So inject the path in-process via ``-c``, which works
+    on every platform, packaged or dev.
+    """
+    code = (
+        "import sys, runpy\n"
+        "e = sys.argv.pop(1)\n"
+        "if e:\n"
+        "    sys.path.insert(0, e)\n"
+        "runpy.run_module(%r, run_name='__main__', alter_sys=True)\n" % module
+    )
+    return [sys.executable, "-c", code, engine_dir or "", *argv]
+
+
 def _prepend_engine_path(engine_dir: str | None) -> None:
     """Make an opt-in-installed engine importable (pip --target dir)."""
     if engine_dir and engine_dir not in sys.path:
@@ -283,11 +304,18 @@ def _run_demucs_local(mix: Path, out_dir: Path, model: str, engine_dir: str | No
     # them — otherwise they land in ~/.cache/torch and leak past an uninstall.
     env = dict(os.environ)
     if models_dir:
-        env.setdefault("TORCH_HOME", models_dir)
+        # Assign, don't setdefault: the packaged app already exports TORCH_HOME for
+        # itself, so setdefault would be a no-op there and demucs' weights would land
+        # in the app's cache — where engine_status can't see them and Uninstall can't
+        # reclaim them. This env is the subprocess's only, so the app is unaffected.
+        env["TORCH_HOME"] = models_dir
     # Subprocess keeps torch out of the server process and isolates crashes.
     # Popen + poll (not subprocess.run) so a cancel can terminate it mid-run;
     # output drains to a temp file to avoid a full-PIPE deadlock.
-    cmd = [sys.executable, "-m", "demucs", "-n", model, "-o", str(result_dir), str(mix)]
+    # NB: -m demucs alone would fail — the child can't see the pip --target engine
+    # tree (see _module_cmd).
+    cmd = _module_cmd(engine_dir, "demucs",
+                      ["-n", model, "-o", str(result_dir), str(mix)])
     with tempfile.TemporaryFile() as logf:  # binary — child writes raw bytes to the fd
         proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, env=env)
         try:
