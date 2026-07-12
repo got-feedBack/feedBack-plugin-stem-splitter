@@ -76,7 +76,11 @@ DEFAULT_MODEL = "bs_roformer_sw"   # what the plugin splits with; also makes war
 # demucs must be installed --no-deps: it pins torchaudio<2.1 while whisperx needs
 # ~2.8, and its full dep set drags in `diffq` (see below). These are its real
 # runtime deps.
-_DEMUCS_EXTRAS = ["einops", "julius", "lameenc", "openunmix", "pyyaml", "tqdm", "dora-search"]
+# sphn is new in demucs 4.1 and `demucs/api.py` imports it at module top level, so a
+# --no-deps install without it leaves demucs.api dead (and pip prints a dependency-
+# conflict ERROR on every install, which is how real conflicts get lost in the noise).
+_DEMUCS_EXTRAS = ["einops", "julius", "lameenc", "openunmix", "pyyaml", "tqdm",
+                  "dora-search", "sphn"]
 
 # audio-separator must be --no-deps too, for a subtler reason. Its metadata says:
 #
