@@ -16,12 +16,26 @@ Nothing here runs on plugin load, and nothing large is EVER downloaded implicitl
 
 Layout under ``{config_dir}/demucs-server/``::
 
-    src/      server.py, run_demucs.py, run_roformer.py, requirements.txt
-    .venv/    the server's own interpreter (its torch/whisperx pins conflict with
-              the plugin's `pip --target engine/` tree, so it gets its own)
+    src/      server.py, run_demucs.py, run_roformer.py, requirements.txt, _launch.py
+    pylibs/   the server's dependencies (pip --target)
     cache/    SLOPSMITH_DEMUCS_CACHE + TORCH_HOME + HF_HOME all point here, so the
               weights are ours to detect and ours to delete on uninstall (instead
               of being orphaned in ~/.cache).
+
+**Why ``pip --target`` and not a venv.** The packaged app bundles its own Python,
+and on Windows that is the python.org *embeddable* distribution, which ships **no
+``venv`` and no ``ensurepip``** (see feedback-desktop/scripts/build-windows.sh -
+it has to bootstrap pip with get-pip.py for exactly this reason). So
+``python -m venv`` is guaranteed to fail on packaged Windows. ``pip install
+--target`` needs neither module and works identically on Windows, macOS and Linux,
+packaged or dev - it's the same approach the core plugin loader and this plugin's
+own engine installer already use.
+
+The deps still land in their own tree, isolated from the app's site-packages, and
+the server is launched through a generated ``_launch.py`` that prepends that tree
+to ``sys.path``. That in-process injection matters: packaged Windows runs in
+isolated ``._pth`` mode where **PYTHONPATH is ignored**, so wiring the deps in via
+the environment would silently not work.
 """
 from __future__ import annotations
 
@@ -71,8 +85,14 @@ def src_dir(config_dir: Path) -> Path:
     return server_dir(config_dir) / "src"
 
 
-def venv_dir(config_dir: Path) -> Path:
-    return server_dir(config_dir) / ".venv"
+def pylibs_dir(config_dir: Path) -> Path:
+    """The server's dependency tree (pip --target). Portable across every packaged
+    platform, unlike a venv (see the module docstring)."""
+    return server_dir(config_dir) / "pylibs"
+
+
+def launcher_path(config_dir: Path) -> Path:
+    return src_dir(config_dir) / "_launch.py"
 
 
 def cache_dir(config_dir: Path) -> Path:
@@ -83,35 +103,13 @@ def state_file(config_dir: Path) -> Path:
     return Path(config_dir) / "stem_splitter_server.json"
 
 
-def venv_python(config_dir: Path) -> Path:
-    v = venv_dir(config_dir)
-    return v / "Scripts" / "python.exe" if os.name == "nt" else v / "bin" / "python"
-
-
-def _base_python() -> str:
-    """The interpreter to build the venv with.
-
-    NOT ``sys.executable``: the app may be running under a *copied* python.exe
-    (feedBack's Windows setup keeps a `python3.exe` shim that is a bare copy of
-    `C:\\Python313\\python.exe`). venv clones that copy, and the clone can't find
-    the base install, so `ensurepip` dies with exit 103 and venv creation fails.
-
-    ``sys.base_prefix`` still points at the real installation in that case, so
-    resolve the interpreter from there and fall back to sys.executable only if
-    that doesn't pan out.
-    """
-    base = Path(sys.base_prefix)
-    candidates = ([base / "python.exe"] if os.name == "nt"
-                  else [base / "bin" / "python3", base / "bin" / "python"])
-    for c in candidates:
-        if c.is_file():
-            return str(c)
-    return sys.executable
-
-
 def installed(config_dir: Path) -> bool:
-    """Source fetched AND a venv interpreter exists."""
-    return (src_dir(config_dir) / "server.py").is_file() and venv_python(config_dir).is_file()
+    """Source fetched AND the dependency tree is populated."""
+    if not (src_dir(config_dir) / "server.py").is_file():
+        return False
+    p = pylibs_dir(config_dir)
+    # uvicorn is the one import the server can't start without.
+    return p.is_dir() and (any(p.glob("uvicorn")) or any(p.glob("uvicorn-*.dist-info")))
 
 
 # ── can we manage a server in this deployment at all? ────────────────────────
@@ -119,10 +117,10 @@ def installed(config_dir: Path) -> bool:
 def in_container() -> bool:
     """Are we inside Docker/Podman/k8s?
 
-    The app also ships as a container. Standing a demucs server up *inside* that
-    container is the wrong answer: the image doesn't carry the deps, the disk is
-    ephemeral, and 127.0.0.1 isn't the host anyway. Those users should run the
-    demucs-server container and point `demucs_server_url` at it.
+    Not a blocker - the plugin and the server would share the container, so
+    127.0.0.1 still resolves and a writable CONFIG_DIR volume persists. It's just
+    worth telling the user, since the app container usually has no GPU (CPU-only
+    separation is slow) and an unmounted config dir would be ephemeral.
     """
     if os.environ.get("container") or Path("/.dockerenv").exists():
         return True
@@ -137,36 +135,28 @@ def in_container() -> bool:
     return False
 
 
-def _python_has_venv(python_exe: str) -> bool:
+def _python_has_pip(python_exe: str) -> bool:
     try:
-        p = subprocess.run([python_exe, "-m", "venv", "--help"],
-                           capture_output=True, text=True, timeout=30)
+        p = subprocess.run([python_exe, "-m", "pip", "--version"],
+                           capture_output=True, text=True, timeout=60)
         return p.returncode == 0
     except Exception:
         return False
 
 
 def can_manage(config_dir: Path) -> tuple[bool, str]:
-    """Can this deployment run a plugin-managed local server?
+    """Can this deployment install and run a managed local server?
 
-    Returns (ok, reason). The UI disables the whole section and shows `reason`
-    when this is False, instead of letting the user kick off an install that
-    cannot possibly work here.
+    Deliberately does NOT require ``venv``: the packaged Windows app bundles the
+    python.org embeddable distribution, which has no venv/ensurepip at all. We only
+    need ``pip`` (present on every packaged platform - the Windows build bootstraps
+    it with get-pip.py) and a writable config dir.
     """
-    if in_container():
+    if not _python_has_pip(sys.executable):
         return (False,
-                "The app is running in a container. Run the demucs server as its own "
-                "container (see got-feedBack/feedBack-demucs-server) and set "
-                "'demucs_server_url' to point at it - a server started inside this "
-                "container would not survive or be reachable.")
-
-    base = _base_python()
-    if not _python_has_venv(base):
-        return (False,
-                f"This build's Python ({base}) has no usable 'venv' module, so the "
-                "server's isolated environment can't be created. Install a standard "
-                "Python 3.10+ and restart, or run the demucs server separately and "
-                "set 'demucs_server_url'.")
+                f"This build's Python ({sys.executable}) has no usable 'pip', so the "
+                "server's dependencies can't be installed. Run the demucs server "
+                "separately and set 'demucs_server_url' instead.")
 
     try:
         Path(config_dir).mkdir(parents=True, exist_ok=True)
@@ -178,6 +168,16 @@ def can_manage(config_dir: Path) -> tuple[bool, str]:
                        "can't be installed here.")
 
     return (True, "")
+
+
+def manage_advisory(config_dir: Path) -> str:
+    """Non-blocking warnings to surface next to the controls."""
+    if in_container():
+        return ("The app is running in a container: the server will run inside it "
+                "too (usually CPU-only, and it needs a persistent CONFIG_DIR "
+                "volume). Running the demucs-server container separately and "
+                "pointing 'demucs_server_url' at it is often the better option.")
+    return ""
 
 
 def models_downloaded(config_dir: Path) -> bool:
@@ -233,55 +233,37 @@ def download_source(config_dir: Path, progress_cb: ProgressCB = None) -> None:
     _emit(progress_cb, f"Source ready ({len(got)} files).", 0.08, "Downloading source")
 
 
-def _create_venv(config_dir: Path, progress_cb: ProgressCB = None) -> None:
-    """Create the server's venv, tolerating a broken ``ensurepip``.
+_LAUNCHER_TEMPLATE = '''\
+# Generated by the Stem Splitter plugin - do not edit.
+#
+# Runs the demucs server with its pip --target dependency tree prepended to
+# sys.path. This is done IN-PROCESS on purpose: the packaged Windows app uses the
+# python.org embeddable distribution, which runs in isolated `._pth` mode where
+# PYTHONPATH is ignored - so injecting the deps via the environment would silently
+# do nothing.
+import os
+import runpy
+import sys
 
-    Some interpreters (notably a copied python.exe) can create the venv but fail
-    ``ensurepip`` with exit 103. In that case build the venv WITHOUT pip and
-    bootstrap pip into it from the parent interpreter's own pip, which works fine.
-    """
-    vdir = venv_dir(config_dir)
-    base = _base_python()
-    _emit(progress_cb, f"Creating virtual environment (using {base})…", 0.10, "venv")
+PYLIBS = {pylibs!r}
+HERE = os.path.dirname(os.path.abspath(__file__))
 
-    proc = subprocess.run([base, "-m", "venv", str(vdir)], capture_output=True, text=True)
-    if proc.returncode == 0 and venv_python(config_dir).is_file():
-        return
+sys.path.insert(0, PYLIBS)     # server's deps win over the app's site-packages
+sys.path.insert(0, HERE)       # so `import run_demucs` etc. resolve
+os.chdir(HERE)
 
-    err = (proc.stderr or proc.stdout or "").strip()
-    _emit(progress_cb, f"venv with pip failed ({err[:160]}); retrying without pip…",
-          0.10, "venv")
+server = os.path.join(HERE, "server.py")
+sys.argv = [server] + sys.argv[1:]
+runpy.run_path(server, run_name="__main__")
+'''
 
-    shutil.rmtree(vdir, ignore_errors=True)
-    proc = subprocess.run([base, "-m", "venv", "--without-pip", str(vdir)],
-                          capture_output=True, text=True)
-    if proc.returncode != 0 or not venv_python(config_dir).is_file():
-        raise RuntimeError(
-            "failed to create the server's virtualenv: "
-            f"{(proc.stderr or proc.stdout or err)[:300]}"
-        )
 
-    # Bootstrap pip into the fresh venv.
-    vpy = str(venv_python(config_dir))
-    boot = subprocess.run([vpy, "-m", "ensurepip", "--upgrade", "--default-pip"],
-                          capture_output=True, text=True)
-    if boot.returncode != 0:
-        _emit(progress_cb, "ensurepip unavailable; bootstrapping pip via get-pip…",
-              0.11, "venv")
-        import requests
-        gp = server_dir(config_dir) / "get-pip.py"
-        r = requests.get("https://bootstrap.pypa.io/get-pip.py", timeout=60)
-        if r.status_code != 200:
-            raise RuntimeError(f"could not download get-pip.py ({r.status_code})")
-        gp.write_bytes(r.content)
-        boot = subprocess.run([vpy, str(gp)], capture_output=True, text=True)
-        gp.unlink(missing_ok=True)
-        if boot.returncode != 0:
-            raise RuntimeError(
-                "could not bootstrap pip into the server venv: "
-                f"{(boot.stderr or boot.stdout)[:300]}"
-            )
-    _emit(progress_cb, "Virtual environment ready.", 0.12, "venv")
+def write_launcher(config_dir: Path) -> Path:
+    lp = launcher_path(config_dir)
+    lp.parent.mkdir(parents=True, exist_ok=True)
+    lp.write_text(_LAUNCHER_TEMPLATE.format(pylibs=str(pylibs_dir(config_dir))),
+                  encoding="utf-8")
+    return lp
 
 
 def install_server(config_dir: Path, progress_cb: ProgressCB = None) -> dict:
@@ -295,32 +277,30 @@ def install_server(config_dir: Path, progress_cb: ProgressCB = None) -> dict:
 
     server_dir(config_dir).mkdir(parents=True, exist_ok=True)
     cache_dir(config_dir).mkdir(parents=True, exist_ok=True)
+    target = pylibs_dir(config_dir)
+    target.mkdir(parents=True, exist_ok=True)
 
     download_source(config_dir, progress_cb)
 
-    vpy = venv_python(config_dir)
-    if not vpy.is_file():
-        _create_venv(config_dir, progress_cb)
-        vpy = venv_python(config_dir)
-    if not vpy.is_file():
-        raise RuntimeError(f"venv python not found at {vpy}")
-
     req = src_dir(config_dir) / "requirements.txt"
-    # Steps run in their own pip transactions, sharing the plugin's streaming
-    # installer (progress bar + actionable failure hints).
+    tgt = ["--target", str(target), "--upgrade", "--upgrade-strategy", "only-if-needed"]
+    # Each step is its own pip transaction, sharing the plugin's streaming installer
+    # (progress bar + actionable failure hints). Run with the app's own interpreter:
+    # pip --target needs neither venv nor ensurepip, so this works on the packaged
+    # Windows embeddable Python as well as the macOS/Linux standalone builds.
     steps: list[tuple[str, list[str], int]] = [
-        ("pip", ["--upgrade", "pip"], 1),
-        ("server requirements", ["-r", str(req)], 9),
+        ("server requirements", tgt + ["-r", str(req)], 9),
         # --no-deps is load-bearing: it keeps demucs from dragging in diffq (no
         # wheel, needs a C++ compiler) and from downgrading torchaudio under whisperx.
-        ("demucs (no-deps)", ["--no-deps", "demucs"], 1),
-        ("demucs runtime deps", list(_DEMUCS_EXTRAS), len(_DEMUCS_EXTRAS)),
+        ("demucs (no-deps)", tgt + ["--no-deps", "demucs"], 1),
+        ("demucs runtime deps", tgt + list(_DEMUCS_EXTRAS), len(_DEMUCS_EXTRAS)),
     ]
     n = len(steps)
     for i, (label, args, count) in enumerate(steps):
-        engine_install.stream_pip(str(vpy), args, label, progress_cb,
+        engine_install.stream_pip(sys.executable, args, label, progress_cb,
                                   base=0.12 + (i / n) * 0.86, span=0.86 / n, pkg_count=count)
 
+    write_launcher(config_dir)
     _emit(progress_cb, "Server installed.", 1.0, "Done")
     return server_status(config_dir)
 
@@ -378,6 +358,12 @@ def _server_env(config_dir: Path) -> dict:
     ffmpeg (a hard prerequisite of the server) is on PATH by reusing the one the
     feedBack app already bundles."""
     env = dict(os.environ)
+    # The app points PYTHONPATH at its own tree (feedback/, feedback/lib), which
+    # would leak its modules - including a *different* server.py - into the demucs
+    # server's import path. The launcher sets up sys.path itself, so drop it.
+    # (PYTHONHOME stays: the bundled interpreter needs it to find its stdlib.)
+    env.pop("PYTHONPATH", None)
+
     cache = cache_dir(config_dir)
     cache.mkdir(parents=True, exist_ok=True)
     env["SLOPSMITH_DEMUCS_CACHE"] = str(cache)
@@ -438,7 +424,11 @@ def start_server(config_dir: Path, port: int = DEFAULT_PORT, device: str = "",
     if warmup is None:
         warmup = models_downloaded(config_dir)
 
-    cmd = [str(venv_python(config_dir)), str(src_dir(config_dir) / "server.py"),
+    # Rewrite the launcher every start: it bakes in the pylibs path, and the config
+    # dir can move between installs/platforms.
+    write_launcher(config_dir)
+
+    cmd = [sys.executable, str(launcher_path(config_dir)),
            "--port", str(port), "--host", "127.0.0.1", "--model", model]
     if device:
         cmd += ["--device", device]
@@ -617,4 +607,6 @@ def server_status(config_dir: Path) -> dict:
         # (Docker) or can't be built (no venv). The UI disables the section.
         "manageable": manageable,
         "manage_reason": manage_reason,
+        # Non-blocking note (e.g. "you're in a container") shown alongside the controls.
+        "advisory": manage_advisory(config_dir),
     }

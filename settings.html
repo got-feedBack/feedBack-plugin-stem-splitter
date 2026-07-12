@@ -331,6 +331,7 @@
     bits.push(st.models_downloaded ? 'models downloaded' : 'models NOT downloaded');
     if (st.disk_bytes) bits.push((st.disk_bytes / 1e9).toFixed(2) + ' GB on disk');
     el.textContent = bits.join(' · ');
+    if (st.advisory) { el.textContent += '  ⚠ ' + st.advisory; el.style.color = '#facc15'; }
     syncGlobalUrl(st);
   }
 
