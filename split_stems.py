@@ -106,6 +106,22 @@ def _normalize_stem_id(raw_name: str) -> str | None:
     return None
 
 
+def _same_origin(url: str, server_url: str) -> bool:
+    """Is `url` on the same scheme+host+port as the configured server?
+
+    Used to decide whether the API key may be attached — never send credentials to
+    a host the server merely *pointed* at.
+    """
+    from urllib.parse import urlparse
+    try:
+        a, b = urlparse(str(url)), urlparse(server_url)
+    except ValueError:
+        return False
+    if not a.netloc:      # relative URL -> already rewritten onto server_url
+        return True
+    return (a.scheme, a.netloc) == (b.scheme, b.netloc)
+
+
 def _module_cmd(engine_dir: str | None, module: str, argv: list[str]) -> list[str]:
     """Build a command that runs ``python -m <module>`` in a subprocess that can
     actually SEE the plugin's engine packages.
@@ -209,8 +225,20 @@ def _run_remote(mix: Path, out_dir: Path, model: str, server_url: str,
             time.sleep(5)
             if cancel_cb:
                 cancel_cb()  # raises to abort a canceled job between polls
-            jr = requests.get(f"{server_url}/jobs/{job_id}",
-                              headers=headers, timeout=30).json()
+            jresp = requests.get(f"{server_url}/jobs/{job_id}",
+                                 headers=headers, timeout=30)
+            if jresp.status_code != 200:
+                # A 404/500/HTML error page would blow up .json() with an opaque
+                # decode error; surface what actually happened instead.
+                raise RuntimeError(
+                    f"split server job poll failed ({jresp.status_code}): "
+                    f"{jresp.text[:200]}")
+            try:
+                jr = jresp.json()
+            except ValueError as e:
+                raise RuntimeError(
+                    f"split server returned a non-JSON job response: {jresp.text[:200]}"
+                ) from e
             status = jr.get("status")
             if status == "complete":
                 stem_urls = jr.get("stems") or {}
@@ -232,7 +260,15 @@ def _run_remote(mix: Path, out_dir: Path, model: str, server_url: str,
     for name, url in stem_urls.items():
         if isinstance(url, str) and url.startswith("/"):
             url = f"{server_url}{url}"
-        sr = requests.get(url, headers=headers, timeout=180)
+        # The stem URLs come from the server's response. Only send the API key when
+        # the URL is still on the configured server's origin: a self-hosted or
+        # compromised server could hand back an absolute URL on a host it controls,
+        # and we must not hand that third party the user's key.
+        dl_headers = headers if _same_origin(url, server_url) else None
+        if headers and dl_headers is None:
+            log.warning("stem_splitter: stem URL %s is off-origin from %s - "
+                        "downloading without the API key", url, server_url)
+        sr = requests.get(url, headers=dl_headers, timeout=180)
         if sr.status_code == 200:
             # Trust the URL's own extension: roformer emits .flac, demucs .wav.
             # (Hardcoding .wav mislabels flac stems.)

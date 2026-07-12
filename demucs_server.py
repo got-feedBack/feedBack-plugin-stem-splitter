@@ -6,7 +6,7 @@ without touching a terminal.
 
 Nothing here runs on plugin load, and nothing large is EVER downloaded implicitly:
 
-* ``install_server()``  — only from the explicit "Install server" button (a venv +
+* ``install_server()``  — only from the explicit "Install server" button (a few GB of
   a few GB of wheels).
 * ``prepare_models()``  — only from the explicit "Prepare models" button (the
   ~2 GB of model weights).
@@ -58,7 +58,11 @@ log = logging.getLogger("feedBack.plugin.stem_splitter")
 
 ProgressCB = Optional[Callable[[dict], None]]
 
-SOURCE_ZIP_URL = "https://codeload.github.com/got-feedBack/feedBack-demucs-server/zip/refs/heads/main"
+SOURCE_REPO = "got-feedBack/feedBack-demucs-server"
+# Ref to install from. Resolved to an immutable commit SHA before download, so an
+# install is reproducible and we can report exactly what's on disk - a bare branch
+# zip is a moving target (the same click could install different code next week).
+SOURCE_REF = os.environ.get("STEM_SPLITTER_SERVER_REF", "main")
 # The only files the server actually needs to run.
 SOURCE_FILES = ("server.py", "run_demucs.py", "run_roformer.py", "requirements.txt")
 
@@ -205,18 +209,53 @@ def _emit(progress_cb: ProgressCB, line: str, pct: float, phase: str) -> None:
         progress_cb({"line": line, "pct": max(0.0, min(1.0, pct)), "phase": phase})
 
 
+def source_meta(config_dir: Path) -> dict:
+    """What source is actually installed (ref + commit)."""
+    try:
+        data = json.loads((server_dir(config_dir) / "source.json").read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _resolve_commit(ref: str) -> str | None:
+    """Resolve a ref to an immutable commit SHA. None if GitHub can't be reached
+    (we then fall back to the branch archive rather than failing the install)."""
+    import requests
+    try:
+        r = requests.get(f"https://api.github.com/repos/{SOURCE_REPO}/commits/{ref}",
+                         headers={"Accept": "application/vnd.github.sha"}, timeout=30)
+        if r.status_code == 200 and r.text.strip():
+            return r.text.strip()
+    except Exception as e:
+        log.warning("stem_splitter: could not resolve %s@%s to a commit: %s",
+                    SOURCE_REPO, ref, e)
+    return None
+
+
 def download_source(config_dir: Path, progress_cb: ProgressCB = None) -> None:
     """Fetch the server source from GitHub (no `git` required) and extract the
-    handful of files it needs."""
+    handful of files it needs.
+
+    Pins to a resolved commit so the install is reproducible and reportable; falls
+    back to the branch archive only if the SHA can't be resolved.
+    """
     import requests
 
     sdir = src_dir(config_dir)
     sdir.mkdir(parents=True, exist_ok=True)
-    _emit(progress_cb, f"Downloading server source from {SOURCE_ZIP_URL}", 0.02, "Downloading source")
 
-    resp = requests.get(SOURCE_ZIP_URL, timeout=120)
+    commit = _resolve_commit(SOURCE_REF)
+    archive = commit or SOURCE_REF
+    url = f"https://codeload.github.com/{SOURCE_REPO}/zip/{archive}"
+    _emit(progress_cb,
+          f"Downloading server source {SOURCE_REF}"
+          + (f" @ {commit[:8]}" if commit else " (unpinned - could not resolve a commit)"),
+          0.02, "Downloading source")
+
+    resp = requests.get(url, timeout=120)
     if resp.status_code != 200:
-        raise RuntimeError(f"failed to download server source ({resp.status_code})")
+        raise RuntimeError(f"failed to download server source ({resp.status_code}) from {url}")
 
     got = []
     with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
@@ -230,6 +269,14 @@ def download_source(config_dir: Path, progress_cb: ProgressCB = None) -> None:
     missing = [f for f in SOURCE_FILES if f not in got]
     if missing:
         raise RuntimeError(f"server source archive is missing {missing}")
+
+    try:
+        (server_dir(config_dir) / "source.json").write_text(
+            json.dumps({"repo": SOURCE_REPO, "ref": SOURCE_REF, "commit": commit,
+                        "installed_at": time.time()}, indent=2), encoding="utf-8")
+    except OSError as e:
+        log.warning("stem_splitter: could not record installed source revision: %s", e)
+
     _emit(progress_cb, f"Source ready ({len(got)} files).", 0.08, "Downloading source")
 
 
@@ -267,7 +314,7 @@ def write_launcher(config_dir: Path) -> Path:
 
 
 def install_server(config_dir: Path, progress_cb: ProgressCB = None) -> dict:
-    """Download the source, create a venv, and install the server's dependencies.
+    """Download the source and install the server's dependencies (pip --target).
 
     Explicit-only (the "Install server" button). Several GB of wheels.
     """
@@ -306,7 +353,7 @@ def install_server(config_dir: Path, progress_cb: ProgressCB = None) -> dict:
 
 
 def uninstall_server(config_dir: Path) -> dict:
-    """Stop the server and delete its source, venv and downloaded weights."""
+    """Stop the server and delete its source, dependency tree and downloaded weights."""
     try:
         stop_server(config_dir)
     except Exception as e:
@@ -440,14 +487,21 @@ def start_server(config_dir: Path, port: int = DEFAULT_PORT, device: str = "",
                        f"({'warming up cached models' if warmup else 'skip-warmup'})…",
           0.05, "Starting")
 
-    creationflags = 0
+    # Put the child in its OWN process group / session. This is load-bearing for
+    # stop_server(): it kills the process *tree* (the server spawns run_demucs.py /
+    # run_roformer.py workers). Without this the child stays in the host app's
+    # process group, and killpg() on POSIX would signal the whole feedBack app -
+    # i.e. Stop would kill the app itself.
+    popen_kwargs: dict = {}
     if os.name == "nt":
-        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        popen_kwargs["start_new_session"] = True  # setsid -> own session + pgid
 
     proc = subprocess.Popen(
         cmd, cwd=str(src_dir(config_dir)), env=_server_env(config_dir),
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, bufsize=1, creationflags=creationflags,
+        text=True, bufsize=1, **popen_kwargs,
     )
     with _proc_lock:
         _proc = proc
@@ -490,6 +544,56 @@ def start_server(config_dir: Path, port: int = DEFAULT_PORT, device: str = "",
     raise RuntimeError(f"server did not answer /health on {url} within 20s")
 
 
+def _posix_kill_tree(pid: int) -> None:
+    """TERM then KILL the server's process group, never our own.
+
+    start_server() puts the child in its own session, so its pgid is its own. The
+    guard below is a hard safety net: if for any reason the child ended up sharing
+    OUR process group, killpg would take down the whole feedBack app - so in that
+    case we only ever signal the single pid.
+    """
+    import signal
+
+    try:
+        pgid = os.getpgid(pid)
+    except OSError:
+        pgid = None
+
+    own_pgid = os.getpgid(0)
+    use_group = pgid is not None and pgid != own_pgid
+    if pgid is not None and pgid == own_pgid:
+        log.warning("stem_splitter: server pid %s shares our process group - "
+                    "signalling the pid only, refusing to killpg ourselves", pid)
+
+    def _sig(sig) -> None:
+        if use_group:
+            os.killpg(pgid, sig)
+        else:
+            os.kill(pid, sig)
+
+    try:
+        _sig(signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except OSError as e:
+        log.warning("stem_splitter: SIGTERM to server failed: %s", e)
+
+    # Give it a moment to shut down cleanly, then insist.
+    for _ in range(20):  # ~2s
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        except OSError:
+            break
+        time.sleep(0.1)
+
+    try:
+        _sig(signal.SIGKILL)
+    except (ProcessLookupError, OSError):
+        pass
+
+
 def stop_server(config_dir: Path) -> dict:
     """Kill the server AND its children (it spawns run_demucs.py / run_roformer.py
     workers - terminating only the parent would orphan them)."""
@@ -509,18 +613,9 @@ def stop_server(config_dir: Path) -> dict:
         try:
             if os.name == "nt":
                 subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)],
-                               capture_output=True, text=True)
+                               capture_output=True, text=True, timeout=30)
             else:
-                import signal
-                try:
-                    os.killpg(os.getpgid(pid), signal.SIGTERM)
-                except Exception:
-                    os.kill(pid, signal.SIGTERM)
-                time.sleep(1.0)
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except Exception:
-                    pass
+                _posix_kill_tree(int(pid))
         except Exception as e:
             log.warning("stem_splitter: failed to kill server pid %s: %s", pid, e)
 
@@ -604,7 +699,8 @@ def server_status(config_dir: Path) -> dict:
         "server_dir": str(server_dir(config_dir)),
         "disk_bytes": engine_install._dir_size(server_dir(config_dir)),
         # False on deployments where a plugin-managed server makes no sense
-        # (Docker) or can't be built (no venv). The UI disables the section.
+        # (no pip, or a read-only config dir). The UI disables the section.
+        "source": source_meta(config_dir),   # {repo, ref, commit} actually installed
         "manageable": manageable,
         "manage_reason": manage_reason,
         # Non-blocking note (e.g. "you're in a container") shown alongside the controls.

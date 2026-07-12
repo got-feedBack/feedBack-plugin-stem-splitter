@@ -293,7 +293,7 @@
   // ── managed demucs server ──────────────────────────────────────────────────
   var SERVER_BTNS = ['ss-srv-install', 'ss-srv-start', 'ss-srv-stop', 'ss-srv-test',
                      'ss-srv-prepare', 'ss-srv-uninstall'];
-  var serverManageable = true;   // set false on Docker / no-venv deployments
+  var serverManageable = true;   // false when the backend says it can't manage a server here
   function setServerButtons(disabled) {
     var d = disabled || !serverManageable;   // never re-enable an unsupported section
     SERVER_BTNS.forEach(function (id) { var el = $(id); if (el) el.disabled = d; });
@@ -312,7 +312,7 @@
     if (!st) { el.textContent = 'Status unavailable.'; return; }
 
     // Deployments where a plugin-managed server can't work (the app running in a
-    // container; a Python with no venv): disable the section and say why, rather
+    // Python with no pip, a read-only config dir): disable the section and say why, rather
     // than letting the user start an install that cannot succeed.
     if (st.manageable === false) {
       serverManageable = false;
@@ -400,7 +400,7 @@
   $('ss-srv-start').addEventListener('click', function () { serverOp('/server/start', 'Starting server'); });
   $('ss-srv-stop').addEventListener('click', function () { serverOp('/server/stop', 'Stopping server'); });
   $('ss-srv-uninstall').addEventListener('click', function () {
-    if (!confirm('Remove the demucs server, its virtualenv and all downloaded models?')) return;
+    if (!confirm('Remove the demucs server, its dependencies and all downloaded models?')) return;
     serverOp('/server/uninstall', 'Uninstalling server');
   });
   $('ss-srv-prepare').addEventListener('click', function () {

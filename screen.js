@@ -21,6 +21,7 @@
     ws: null,
     inited: false,
     pendingAfterSetup: [],   // jobs waiting on a one-time model download
+    preparingModels: false,  // guard: only ever one prepare_models in flight
   };
 
   function $(id) { return document.getElementById(id); }
@@ -62,8 +63,19 @@
       }
       state.pendingAfterSetup.push({ kind: kind, body: body });
       connectWS();
+      // Several songs can hit needs_setup at once (a batch, or rapid clicks).
+      // Only ever kick off ONE model download — the rest just queue behind it.
+      if (state.preparingModels) {
+        toast('Already downloading models', 'This job will start when it finishes.');
+        return res;
+      }
+      state.preparingModels = true;
       return api('/server/prepare_models', { method: 'POST' }).then(function () {
         toast('Downloading models', 'This is a one-time ~2 GB download.');
+        return res;
+      }).catch(function (e) {
+        state.preparingModels = false;
+        toast('Could not start model download', String(e), 'warn');
         return res;
       });
     });
@@ -193,11 +205,13 @@
         toast('Install failed', msg.error, 'warn');
       } else if (msg.type === 'server_done') {
         if (msg.op === 'prepare_models') {
+          state.preparingModels = false;
           toast('Models ready', 'The local server is warmed up.', 'ok');
           flushPendingAfterSetup();
         }
         refreshConfig();
       } else if (msg.type === 'server_error') {
+        state.preparingModels = false;
         toast('Server error', msg.error, 'warn');
         state.pendingAfterSetup.length = 0;   // don't silently retry a failed setup
       }

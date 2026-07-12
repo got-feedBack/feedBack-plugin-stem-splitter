@@ -609,7 +609,7 @@ def setup(app: FastAPI, context: dict) -> None:
         if not names:
             return {"error": "no filename(s) provided"}
         # Warn-and-ask rather than silently stalling on a lazy ~2 GB model fetch.
-        # The client re-POSTs with force_setup once the user has agreed (and the
+        # The client re-POSTs with skip_setup_check once the user has agreed (and the
         # models have been prepared).
         if not body.get("skip_setup_check"):
             needs = mgr.needs_server_setup()
