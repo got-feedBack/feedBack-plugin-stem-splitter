@@ -355,6 +355,57 @@ def write_launcher(config_dir: Path) -> Path:
     return lp
 
 
+# The server does not separate in-process: it shells out to run_demucs.py /
+# run_roformer.py. Those GRANDCHILD processes inherit neither _launch.py's sys.path
+# injection nor (on packaged Windows, isolated ._pth mode) PYTHONPATH - so without
+# this they can't see pylibs/ and die with e.g.
+# "ModuleNotFoundError: No module named 'audio_separator'", which surfaces as
+# "[warmup] bs_roformer_sw: failed: exit 1".
+#
+# Patch the same bootstrap into the top of each driver script. Works everywhere,
+# regardless of how the child is spawned or which env vars survive.
+_DRIVER_SCRIPTS = ("run_demucs.py", "run_roformer.py")
+_BOOTSTRAP_MARKER = "# --- stem_splitter path bootstrap ---"
+_BOOTSTRAP_TEMPLATE = (
+    _BOOTSTRAP_MARKER + "\n"
+    "# Injected by the feedBack stem_splitter plugin: the server spawns this script\n"
+    "# as a subprocess, which inherits neither the launcher's sys.path nor PYTHONPATH\n"
+    "# (ignored by the packaged Windows embeddable Python), so point it at the\n"
+    "# plugin-managed dependency tree explicitly.\n"
+    "import sys as _ss_sys\n"
+    "if {pylibs!r} not in _ss_sys.path:\n"
+    "    _ss_sys.path.insert(0, {pylibs!r})\n"
+    "# --- end stem_splitter path bootstrap ---\n"
+)
+
+
+def patch_driver_scripts(config_dir: Path) -> list[str]:
+    """Prepend the pylibs sys.path bootstrap to the server's subprocess drivers.
+    Idempotent. Returns the scripts it patched."""
+    pylibs = str(pylibs_dir(config_dir))
+    boot = _BOOTSTRAP_TEMPLATE.format(pylibs=pylibs)
+    patched: list[str] = []
+
+    for name in _DRIVER_SCRIPTS:
+        f = src_dir(config_dir) / name
+        if not f.is_file():
+            continue
+        text = f.read_text(encoding="utf-8")
+        if _BOOTSTRAP_MARKER in text:
+            continue  # already bootstrapped
+        lines = text.splitlines(keepends=True)
+        # Keep a shebang / encoding cookie first (they're only honoured on line 1-2).
+        head = 0
+        while head < len(lines) and head < 2 and (
+                lines[head].startswith("#!") or "coding" in lines[head][:40]):
+            head += 1
+        f.write_text("".join(lines[:head]) + boot + "".join(lines[head:]),
+                     encoding="utf-8")
+        patched.append(name)
+
+    return patched
+
+
 def install_server(config_dir: Path, progress_cb: ProgressCB = None) -> dict:
     """Download the source and install the server's dependencies (pip --target).
 
@@ -403,6 +454,10 @@ def install_server(config_dir: Path, progress_cb: ProgressCB = None) -> dict:
                                   base=0.12 + (i / n) * 0.86, span=0.86 / n, pkg_count=count)
 
     write_launcher(config_dir)
+    patched = patch_driver_scripts(config_dir)
+    if patched:
+        _emit(progress_cb, f"Bootstrapped {', '.join(patched)} to see the dependency tree.",
+              0.95, "Preparing")
     verify_install(config_dir, progress_cb)
 
     _emit(progress_cb, "Server installed.", 1.0, "Done")
@@ -423,6 +478,18 @@ def verify_install(config_dir: Path, progress_cb: ProgressCB = None) -> None:
     the offending import named, rather than letting the server die on first start.
     """
     _emit(progress_cb, "Verifying the installed dependencies…", 0.96, "Verifying")
+
+    # The drivers the server shells out to must carry the sys.path bootstrap, or
+    # they'll die with ModuleNotFoundError the first time a split runs (which shows
+    # up only as "[warmup] bs_roformer_sw: failed: exit 1").
+    unpatched = [n for n in _DRIVER_SCRIPTS
+                 if (src_dir(config_dir) / n).is_file()
+                 and _BOOTSTRAP_MARKER not in (src_dir(config_dir) / n).read_text(encoding="utf-8")]
+    if unpatched:
+        raise RuntimeError(
+            f"the server's subprocess drivers ({', '.join(unpatched)}) are missing the "
+            "dependency-path bootstrap - they would fail to import their packages."
+        )
     code = (
         "import sys\n"
         f"sys.path.insert(0, {str(pylibs_dir(config_dir))!r})\n"
@@ -514,6 +581,10 @@ def _server_env(config_dir: Path) -> dict:
     # server's import path. The launcher sets up sys.path itself, so drop it.
     # (PYTHONHOME stays: the bundled interpreter needs it to find its stdlib.)
     env.pop("PYTHONPATH", None)
+    # Point any process the server spawns at the dependency tree. The embeddable
+    # Python ignores this (isolated ._pth mode) - patch_driver_scripts() is what
+    # covers that case - but it's correct everywhere else and costs nothing.
+    env["PYTHONPATH"] = str(pylibs_dir(config_dir))
 
     cache = cache_dir(config_dir)
     cache.mkdir(parents=True, exist_ok=True)
@@ -592,9 +663,11 @@ def start_server(config_dir: Path, port: int = DEFAULT_PORT, device: str = "",
     if warmup is None:
         warmup = models_downloaded(config_dir)
 
-    # Rewrite the launcher every start: it bakes in the pylibs path, and the config
-    # dir can move between installs/platforms.
+    # Rewrite the launcher + re-bootstrap the driver scripts on every start: they
+    # bake in the pylibs path, the config dir can move, and this repairs an install
+    # made before the bootstrap existed without forcing a reinstall.
     write_launcher(config_dir)
+    patch_driver_scripts(config_dir)
 
     cmd = [sys.executable, str(launcher_path(config_dir)),
            "--port", str(port), "--host", "127.0.0.1", "--model", model]
