@@ -656,6 +656,25 @@ def _requirements_without_audio_separator(config_dir: Path) -> Path:
     return out
 
 
+# pip's signature for "this package has no wheel for your interpreter/platform". It
+# prints BOTH of these lines; matching either is enough, and neither appears for a
+# network, index, permission or resolution-conflict failure.
+_NO_WHEEL_SIGNS = ("no matching distribution found",
+                   "could not find a version that satisfies")
+
+
+def _is_no_wheel_error(e: Exception) -> bool:
+    """Did pip fail specifically because no compatible WHEEL exists?
+
+    The distinction is load-bearing: "no wheel" is expected on some interpreters and we
+    carry on without diffq. Anything else (a network blip, a dead index, a bad proxy) is
+    a real failure, and treating it as "no wheel" would silently degrade the install —
+    the user would only find out much later, via a ModuleNotFoundError from a subprocess.
+    """
+    text = (getattr(e, "pip_output", "") or "") + "\n" + str(e)
+    return any(s in text.lower() for s in _NO_WHEEL_SIGNS)
+
+
 def _install_diffq(target: Path, progress_cb: ProgressCB = None,
                    base: float = 0.9, span: float = 0.03) -> None:
     """Best-effort, BINARY-ONLY diffq install (see _DIFFQ_CANDIDATES).
@@ -676,7 +695,12 @@ def _install_diffq(target: Path, progress_cb: ProgressCB = None,
             )
             return
         except RuntimeError as e:
-            log.info("stem_splitter: no %s wheel for this interpreter (%s)", spec, e)
+            if not _is_no_wheel_error(e):
+                # Only "no wheel exists" is tolerable here. Swallowing everything would
+                # turn a transient network/index failure into a silently degraded install
+                # that only shows up much later as a mystery ModuleNotFoundError.
+                raise
+            log.info("stem_splitter: no %s wheel for this interpreter", spec)
 
     _emit(progress_cb,
           "No diffq wheel exists for this Python — skipping it rather than compiling "

@@ -358,11 +358,19 @@ def stream_pip(python_exe: str, pip_args: list[str], label: str, progress_cb: Pr
             "STEM_SPLITTER_PIP_STALL_TIMEOUT (seconds)."
         )
     if rc != 0:
-        hint = _build_failure_hint(label, "\n".join(tail))
+        tail_text = "\n".join(tail)
+        hint = _build_failure_hint(label, tail_text)
         msg = f"pip install failed (exit {rc}) for {label}"
         if hint:
             msg += " - " + hint
-        raise RuntimeError(msg)
+        err = RuntimeError(msg)
+        # Carry pip's own output on the exception. Callers that tolerate a SPECIFIC
+        # failure (see demucs_server._install_diffq, which accepts "no wheel exists" but
+        # must NOT swallow a network error) need to tell the cases apart; the message
+        # alone can't, and a caller that can't tell will silently degrade the install.
+        err.pip_output = tail_text
+        err.returncode = rc
+        raise err
 
     emit(f"Done installing {label}.", 1.0, "Done")
 
