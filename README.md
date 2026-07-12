@@ -24,9 +24,14 @@ Three ways to run, picked in the plugin's **Settings**:
   a server. The heavy libraries (`torch`, `demucs` / `audio-separator`, `whisperx`)
   are **not** installed until you click **Download local engine + models**.
 
-Precedence in "Auto": the managed local server if it's running, else a configured
-remote server, else the in-process local engine if installed. If none is available,
-the action tells you so rather than failing silently.
+Precedence in "Auto", most-specific first: the **managed local server** if it's running,
+else the **managed sibling container** if it's running, else a **configured remote server**
+(`demucs_server_url`), else the **in-process local engine** if installed. If none is
+available, the action tells you so rather than failing silently.
+
+(The first two are mutually exclusive in practice — a containerized app can't run a local
+server process, and someone with a working local server has no reason to add a container —
+but the order is defined rather than accidental: a local process is closer and cheaper.)
 
 > **Nothing heavy is ever downloaded implicitly.** No dependency and no model weight
 > is fetched on plugin install, on app launch, or as a side effect of anything else —

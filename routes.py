@@ -25,22 +25,34 @@ import demucs_server
 import docker_sidecar
 import engine_install
 
+# Hoisted: ruff B008 rightly objects to Body() being called in an argument
+# default. Both sidecar routes take an optional JSON body.
+_OPT_BODY = Body(None)
+
 INSTRUMENT_STEM_IDS = ["guitar", "bass", "drums", "vocals", "other", "piano"]
 _BROADCAST_MIN_INTERVAL = 0.15  # s — throttle progress spam
 
 
-def _as_port(value) -> int:
+def _as_port(value, default: int | None = None) -> int:
     """Port from settings, tolerant of a hand-edited or corrupted file.
 
     A bare int() here would raise on a bad value and take out engine resolution and
     every managed-server endpoint with it - leaving the user no way to fix the setting
     through the very UI that's now broken.
+
+    `default` MUST be passed by any caller whose port is NOT the managed local server's.
+    It wasn't, and so the sidecar route fell back to the LOCAL SERVER'S port (7865)
+    whenever the body omitted one — which the UI always does — publishing the container
+    onto precisely the port this plugin goes out of its way to avoid. On Windows that
+    collision doesn't even fail: both bind, and requests silently go to the wrong server.
     """
+    if default is None:
+        default = demucs_server.DEFAULT_PORT
     try:
         port = int(value)
     except (TypeError, ValueError):
-        return demucs_server.DEFAULT_PORT
-    return port if 1 <= port <= 65535 else demucs_server.DEFAULT_PORT
+        return default
+    return port if 1 <= port <= 65535 else default
 
 
 class JobCanceled(Exception):
@@ -732,9 +744,9 @@ def setup(app: FastAPI, context: dict) -> None:
         return st
 
     @app.post(f"{P}/sidecar/up")
-    def post_sidecar_up(body: dict | None = Body(None)):
+    def post_sidecar_up(body: dict | None = _OPT_BODY):
         body = body or {}
-        port = _as_port(body.get("port"))
+        port = _as_port(body.get("port"), docker_sidecar.DEFAULT_PORT)
         gpu = bool(body.get("gpu"))
         # cb takes the same {line, pct, phase} dict docker_sidecar already emits.
         if not mgr.run_server_op("sidecar_up", lambda cb: docker_sidecar.up(
@@ -763,7 +775,7 @@ def setup(app: FastAPI, context: dict) -> None:
         return {"ok": ok, "url": url, "health": payload}
 
     @app.post(f"{P}/sidecar/down")
-    def post_sidecar_down(body: dict | None = Body(None)):
+    def post_sidecar_down(body: dict | None = _OPT_BODY):
         body = body or {}
         remove = bool((body or {}).get("remove"))
         if _op_in_flight():

@@ -188,8 +188,12 @@ def ping() -> tuple[bool, str]:
             return (False, "Docker Desktop on Windows exposes a named pipe, which this "
                            "cannot speak. Enable 'Expose daemon on tcp://localhost:2375' "
                            "in Docker Desktop settings, or use the compose snippet.")
-        return (False, "No Docker socket found. Mount /var/run/docker.sock into this "
-                       "container (or set DOCKER_HOST) to enable one-click setup.")
+        # Deliberately NOT "mount the docker socket to enable this". The socket is
+        # root-equivalent on the host; suggesting it to get a convenience button is bad
+        # advice, and the compose snippet reaches the same end state without it.
+        return (False, "One-click setup isn't available (no Docker socket is mounted). "
+                       "Use the compose service above — it does the same thing and needs "
+                       "no daemon access.")
     try:
         status, body = _request("GET", "/_ping", timeout=5.0)
     except Exception as e:
@@ -273,7 +277,11 @@ def gpu_available() -> bool:
         return False
     if "nvidia" in (body.get("Runtimes") or {}):
         return True
-    return "nvidia" in " ".join(body.get("DefaultRuntime", "") or "")
+    # NOT " ".join(...): DefaultRuntime is a STRING, and joining it spaces out every
+    # character ("n v i d i a"), so the substring check could never match. That silently
+    # hid the GPU option on any daemon that sets DefaultRuntime=nvidia without listing it
+    # under Runtimes.
+    return "nvidia" in str(body.get("DefaultRuntime") or "").lower()
 
 
 def _container_spec(port: int, gpu: bool, image: str, networks: list[str]) -> dict:

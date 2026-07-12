@@ -443,6 +443,17 @@
   // Snapshot recovery for a server op that was still running while the page was away.
   function renderServerOp(st) {
     if (!st) return;
+    // The managed server and the Docker sidecar share ONE op mutex and one event stream,
+    // so the SNAPSHOT has to be routed by op exactly as the live events are. Without this,
+    // reloading the page mid-pull draws the container's progress into the local-server
+    // card — a bar moving in a section the user never touched.
+    if (isDk(st.op)) {
+      $('ss-dk-progress').style.display = 'block';
+      setDkBar(st.pct, st.phase || (st.active ? 'Working…' : 'Done'));
+      if (st.error) appendLog($('ss-dk-log'), '✗ ' + st.error);
+      setDkButtons(!!st.active);
+      return;
+    }
     $('ss-srv-progress').style.display = 'block';
     setSrvBar(st.pct, st.phase || (st.active ? st.op : 'Done'));
     if (st.error) appendLog($('ss-srv-log'), '✗ ' + st.error);

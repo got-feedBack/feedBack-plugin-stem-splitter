@@ -23,8 +23,11 @@
   server on `127.0.0.1`, and loopback goes to the more specific bind) — so the container
   looked healthy while **every request went to the other server**. The sidecar now publishes
   on 7866 and refuses to hand back a URL that doesn't identify as its own container.
-- **Don't pull when the image is already there.** An air-gapped host or a registry outage
-  would refuse to start an image sitting on the machine.
+- **A registry outage no longer blocks a cached image.** Starting the container always
+  pulled, so an air-gapped host — or a rate-limited/unreachable registry — would refuse to
+  start an image already sitting on the machine. It still checks for an update when the
+  image is present (that's cheap: only changed layers transfer), but a failed *refresh* is
+  now a warning, not an error. Only a genuinely absent image makes a pull failure fatal.
 
 ## 0.2.0
 
