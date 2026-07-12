@@ -174,6 +174,46 @@ def audio_separator_available(engine_dir: str | None = None) -> bool:
         return False
 
 
+_MAX_REDIRECTS = 5
+_REDIRECT_CODES = (301, 302, 303, 307, 308)
+
+
+def _get_authed(url: str, server_url: str, headers: dict | None, timeout: float):
+    """GET `url`, following redirects BY HAND so the API key can never ride off-origin.
+
+    ``requests`` drops the ``Authorization`` header on a cross-host redirect, but it
+    knows nothing about the ``X-API-Key`` header this server authenticates with — it
+    would happily forward it. So a compromised or malicious split server could return a
+    perfectly on-origin download URL that 302s to a host it controls and harvest the
+    user's key. ``_same_origin`` alone doesn't catch that: it only ever sees the first
+    hop.
+
+    Redirects are therefore disabled and re-evaluated per hop: the key is attached only
+    while the current URL is still on the server's origin.
+
+    Returns ``(response, final_url)`` — the caller needs the final URL because the stem
+    file extension is derived from it.
+    """
+    import requests
+    from urllib.parse import urljoin
+
+    for _ in range(_MAX_REDIRECTS + 1):
+        hop_headers = headers if _same_origin(url, server_url) else None
+        if headers and hop_headers is None:
+            log.warning("stem_splitter: %s is off-origin from %s - requesting without "
+                        "the API key", url, server_url)
+        resp = requests.get(url, headers=hop_headers, timeout=timeout,
+                            allow_redirects=False)
+        location = resp.headers.get("location") if resp.status_code in _REDIRECT_CODES \
+            else None
+        if not location:
+            return resp, url
+        resp.close()
+        url = urljoin(url, location)   # absolute, so the next _same_origin check is real
+
+    raise RuntimeError(f"split server sent more than {_MAX_REDIRECTS} redirects")
+
+
 # ── Engines ──────────────────────────────────────────────────────────────────
 
 def _run_remote(mix: Path, out_dir: Path, model: str, server_url: str,
@@ -253,8 +293,10 @@ def _run_remote(mix: Path, out_dir: Path, model: str, server_url: str,
             time.sleep(5)
             if cancel_cb:
                 cancel_cb()  # raises to abort a canceled job between polls
-            jresp = requests.get(f"{server_url}/jobs/{job_id}",
-                                 headers=headers, timeout=30)
+            # Same redirect discipline as the stem downloads: the poll carries the key,
+            # so the server must not be able to bounce it to a host of its choosing.
+            jresp, _ = _get_authed(f"{server_url}/jobs/{job_id}", server_url,
+                                   headers, timeout=30)
             if jresp.status_code != 200:
                 # A 404/500/HTML error page would blow up .json() with an opaque
                 # decode error; surface what actually happened instead.
@@ -288,15 +330,10 @@ def _run_remote(mix: Path, out_dir: Path, model: str, server_url: str,
     for name, url in stem_urls.items():
         if isinstance(url, str) and url.startswith("/"):
             url = f"{server_url}{url}"
-        # The stem URLs come from the server's response. Only send the API key when
-        # the URL is still on the configured server's origin: a self-hosted or
-        # compromised server could hand back an absolute URL on a host it controls,
-        # and we must not hand that third party the user's key.
-        dl_headers = headers if _same_origin(url, server_url) else None
-        if headers and dl_headers is None:
-            log.warning("stem_splitter: stem URL %s is off-origin from %s - "
-                        "downloading without the API key", url, server_url)
-        sr = requests.get(url, headers=dl_headers, timeout=180)
+        # The stem URLs come from the server's RESPONSE, and each hop of a redirect chain
+        # is attacker-choosable from there. _get_authed re-checks the origin per hop and
+        # only attaches the key while we're still talking to the configured server.
+        sr, final_url = _get_authed(url, server_url, headers, timeout=180)
         # Skipping a failed download silently produced a pak that LOOKS split but is
         # missing stems, and the job still reported success. Fail loudly instead so the
         # user can retry.
@@ -305,10 +342,10 @@ def _run_remote(mix: Path, out_dir: Path, model: str, server_url: str,
                 f"stem download failed for '{name}': HTTP {sr.status_code} from {url}"
             )
         # Trust the URL's own extension: roformer emits .flac, demucs .wav.
-        # (Hardcoding .wav mislabels flac stems.) Strip BOTH the query and any
-        # fragment first - ".flac#frag" would otherwise not match _AUDIO_EXTS and
-        # silently fall back to .wav.
-        clean = str(url).split("?", 1)[0].split("#", 1)[0]
+        # (Hardcoding .wav mislabels flac stems.) Use the FINAL url - a redirect is
+        # what actually names the file. Strip BOTH the query and any fragment first -
+        # ".flac#frag" would otherwise not match _AUDIO_EXTS and fall back to .wav.
+        clean = str(final_url).split("?", 1)[0].split("#", 1)[0]
         suffix = Path(clean).suffix.lower()
         ext = suffix if suffix in _AUDIO_EXTS else ".wav"
         (result_dir / f"{_sanitize(name)}{ext}").write_bytes(sr.content)
