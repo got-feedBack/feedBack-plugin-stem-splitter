@@ -50,6 +50,15 @@ _STEM_ORDER = ["guitar", "bass", "drums", "vocals", "piano", "other", "full"]
 
 _AUDIO_EXTS = (".wav", ".flac", ".mp3", ".ogg", ".opus", ".m4a")
 
+# Remote-split job limits. The server allows a roformer job up to 30 min, so give
+# it headroom rather than the old 10-min cap (which failed long splits mid-flight).
+_JOB_TIMEOUT = 35 * 60
+# The server returns 503 once MAX_CONCURRENT separations are in flight; a batch
+# split will hit that routinely, so back off and retry instead of erroring.
+_BUSY_RETRIES = 6
+_BUSY_BASE_BACKOFF = 5
+_BUSY_MAX_BACKOFF = 60
+
 
 def _sanitize(name: str) -> str:
     s = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("_").lower()
@@ -97,6 +106,75 @@ def _normalize_stem_id(raw_name: str) -> str | None:
     return None
 
 
+def _origin(url: str) -> tuple[str, str, int | None] | None:
+    """(scheme, host, port) with the DEFAULT port made explicit, or None if unparseable.
+
+    Comparing raw netlocs is wrong: `https://h` and `https://h:443` are the same origin
+    but different strings, so a server that hands back an explicit default port would
+    have its own download URL treated as third-party and the API key withheld — breaking
+    an authenticated download for no reason. Normalize instead of string-matching.
+
+    Uses .hostname (not .netloc), which also strips any `user:pass@` — so
+    `http://good.example.com@evil.com/` correctly resolves to host `evil.com`.
+    """
+    from urllib.parse import urlsplit
+    try:
+        s = urlsplit(str(url))
+        port = s.port                       # raises ValueError on a bad port
+    except ValueError:
+        return None
+    scheme = (s.scheme or "").lower()
+    host = (s.hostname or "").lower()
+    if port is None:
+        port = {"http": 80, "https": 443}.get(scheme)
+    return (scheme, host, port)
+
+
+def _same_origin(url: str, server_url: str) -> bool:
+    """Is `url` on the same scheme+host+port as the configured server?
+
+    Used to decide whether the API key may be attached — never send credentials to
+    a host the server merely *pointed* at.
+    """
+    from urllib.parse import urlparse
+    try:
+        a, b = urlparse(str(url)), urlparse(server_url)
+    except ValueError:
+        return False
+    # "Relative" means exactly one thing here: an absolute PATH that the caller
+    # rewrites onto server_url (it only does that for a leading "/"). Anything else is
+    # not ours, and the key must not ride along:
+    #   * "https:evil.com/steal"  -> scheme set, netloc empty. NOT relative.
+    #   * "//evil.com/steal"      -> netloc set (scheme inherited). NOT relative.
+    #   * "::::" / "download/x"   -> no scheme, no netloc, but we never rewrite these
+    #                                onto server_url, so they aren't ours either.
+    if not a.scheme and not a.netloc:
+        return str(url).startswith("/") and not str(url).startswith("//")
+    oa, ob = _origin(url), _origin(server_url)
+    return oa is not None and ob is not None and oa == ob
+
+
+def _module_cmd(engine_dir: str | None, module: str, argv: list[str]) -> list[str]:
+    """Build a command that runs ``python -m <module>`` in a subprocess that can
+    actually SEE the plugin's engine packages.
+
+    A plain ``-m demucs`` cannot: the engine is a ``pip --target`` tree that we add
+    to *this* process's ``sys.path``, and a child does not inherit sys.path. Setting
+    ``PYTHONPATH`` doesn't fix it either — the packaged Windows app bundles the
+    python.org embeddable distribution, which runs in isolated ``._pth`` mode where
+    **PYTHONPATH is ignored**. So inject the path in-process via ``-c``, which works
+    on every platform, packaged or dev.
+    """
+    code = (
+        "import sys, runpy\n"
+        "e = sys.argv.pop(1)\n"
+        "if e:\n"
+        "    sys.path.insert(0, e)\n"
+        "runpy.run_module(%r, run_name='__main__', alter_sys=True)\n" % module
+    )
+    return [sys.executable, "-c", code, engine_dir or "", *argv]
+
+
 def _prepend_engine_path(engine_dir: str | None) -> None:
     """Make an opt-in-installed engine importable (pip --target dir)."""
     if engine_dir and engine_dir not in sys.path:
@@ -121,6 +199,64 @@ def audio_separator_available(engine_dir: str | None = None) -> bool:
         return False
 
 
+_MAX_REDIRECTS = 5
+_REDIRECT_CODES = (301, 302, 303, 307, 308)
+
+
+def _redact_url(url: str) -> str:
+    """scheme://host/path — drop the query and fragment before logging.
+
+    The URLs we refuse to authenticate to are attacker- or third-party-chosen, and a
+    redirect target is very often a PRE-SIGNED url (S3 &X-Amz-Signature=…, a bare
+    ?token=…). Logging one verbatim writes someone's credential into the app log, which
+    is exactly the leak we just refused to commit over the wire.
+    """
+    from urllib.parse import urlparse
+    try:
+        u = urlparse(str(url))
+    except ValueError:
+        return "<unparseable url>"
+    if not u.scheme and not u.netloc:
+        return (u.path or "") + ("?…" if u.query else "")
+    return f"{u.scheme}://{u.netloc}{u.path}" + ("?…" if u.query else "")
+
+
+def _get_authed(url: str, server_url: str, headers: dict | None, timeout: float):
+    """GET `url`, following redirects BY HAND so the API key can never ride off-origin.
+
+    ``requests`` drops the ``Authorization`` header on a cross-host redirect, but it
+    knows nothing about the ``X-API-Key`` header this server authenticates with — it
+    would happily forward it. So a compromised or malicious split server could return a
+    perfectly on-origin download URL that 302s to a host it controls and harvest the
+    user's key. ``_same_origin`` alone doesn't catch that: it only ever sees the first
+    hop.
+
+    Redirects are therefore disabled and re-evaluated per hop: the key is attached only
+    while the current URL is still on the server's origin.
+
+    Returns ``(response, final_url)`` — the caller needs the final URL because the stem
+    file extension is derived from it.
+    """
+    import requests
+    from urllib.parse import urljoin
+
+    for _ in range(_MAX_REDIRECTS + 1):
+        hop_headers = headers if _same_origin(url, server_url) else None
+        if headers and hop_headers is None:
+            log.warning("stem_splitter: %s is off-origin from %s - requesting without "
+                        "the API key", _redact_url(url), server_url)
+        resp = requests.get(url, headers=hop_headers, timeout=timeout,
+                            allow_redirects=False)
+        location = resp.headers.get("location") if resp.status_code in _REDIRECT_CODES \
+            else None
+        if not location:
+            return resp, url
+        resp.close()
+        url = urljoin(url, location)   # absolute, so the next _same_origin check is real
+
+    raise RuntimeError(f"split server sent more than {_MAX_REDIRECTS} redirects")
+
+
 # ── Engines ──────────────────────────────────────────────────────────────────
 
 def _run_remote(mix: Path, out_dir: Path, model: str, server_url: str,
@@ -137,26 +273,85 @@ def _run_remote(mix: Path, out_dir: Path, model: str, server_url: str,
     params: dict[str, str] = {"model": model}
     if stems:
         params["stems"] = ",".join(stems)
-    headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
+    # The server authenticates with X-API-Key (or an ?api_key= query param) - NOT
+    # an Authorization: Bearer header. Only /health, /docs and /openapi.json are
+    # exempt, so /jobs and /download need the key too.
+    headers = {"X-API-Key": api_key} if api_key else None
 
-    with open(mix, "rb") as f:
-        resp = requests.post(
-            f"{server_url}/separate",
-            files={"file": (mix.name, f, content_type)},
-            params=params, headers=headers, timeout=600,
-        )
-    if resp.status_code != 200:
-        raise RuntimeError(f"split server error ({resp.status_code}): {resp.text[:300]}")
+    # The server caps concurrent separations (MAX_CONCURRENT) and answers 503 when
+    # it's saturated - which a batch split WILL hit. Back off and retry instead of
+    # failing the job.
+    resp = None
+    for attempt in range(_BUSY_RETRIES):
+        if cancel_cb:
+            cancel_cb()
+        with open(mix, "rb") as f:
+            resp = requests.post(
+                f"{server_url}/separate",
+                files={"file": (mix.name, f, content_type)},
+                params=params, headers=headers, timeout=600,
+            )
+        if resp.status_code != 503:
+            break
+        if attempt == _BUSY_RETRIES - 1:
+            # Last attempt: don't sleep (nobody is going to retry after it) and don't
+            # close the response - the error path below needs to read resp.text.
+            break
+        # We're going to retry: release the connection back to the pool instead of
+        # holding it open across the backoff (a batch split would otherwise pin one
+        # connection per in-flight retry).
+        resp.close()
+        wait = min(_BUSY_MAX_BACKOFF, _BUSY_BASE_BACKOFF * (2 ** attempt))
+        if progress_cb:
+            progress_cb(0.12, f"Split server busy - retrying in {wait}s")
+        # Sleep in slices and check for cancellation between them: with backoff up
+        # to a minute, a single sleep(wait) would leave a user's cancel unnoticed
+        # for that whole time.
+        deadline = time.time() + wait
+        while time.time() < deadline:
+            if cancel_cb:
+                cancel_cb()  # raises to abort
+            time.sleep(min(0.5, max(0.0, deadline - time.time())))
+
+    if resp is None or resp.status_code != 200:
+        code = resp.status_code if resp is not None else "no response"
+        body = ""
+        if resp is not None:
+            body = resp.text[:300]
+            # Read the body first, then hand the connection back to the pool. Raising
+            # with the response still open holds it out of the pool until GC — and a
+            # batch that exhausts the retries on 503 does this once per song.
+            resp.close()
+        raise RuntimeError(f"split server error ({code}): {body}")
 
     data = resp.json()
     stem_urls = data.get("stems") or {}
     if not stem_urls and data.get("job_id"):
         job_id = data["job_id"]
-        for _ in range(120):  # up to ~10 min
+        # Wall-clock deadline, not an iteration count: the server allows a roformer
+        # job up to 30 min, so the old 120x5s (=10 min) cap failed long splits that
+        # were actually still running.
+        deadline = time.time() + _JOB_TIMEOUT
+        while time.time() < deadline:
             time.sleep(5)
             if cancel_cb:
                 cancel_cb()  # raises to abort a canceled job between polls
-            jr = requests.get(f"{server_url}/jobs/{job_id}", timeout=30).json()
+            # Same redirect discipline as the stem downloads: the poll carries the key,
+            # so the server must not be able to bounce it to a host of its choosing.
+            jresp, _ = _get_authed(f"{server_url}/jobs/{job_id}", server_url,
+                                   headers, timeout=30)
+            if jresp.status_code != 200:
+                # A 404/500/HTML error page would blow up .json() with an opaque
+                # decode error; surface what actually happened instead.
+                raise RuntimeError(
+                    f"split server job poll failed ({jresp.status_code}): "
+                    f"{jresp.text[:200]}")
+            try:
+                jr = jresp.json()
+            except ValueError as e:
+                raise RuntimeError(
+                    f"split server returned a non-JSON job response: {jresp.text[:200]}"
+                ) from e
             status = jr.get("status")
             if status == "complete":
                 stem_urls = jr.get("stems") or {}
@@ -164,7 +359,12 @@ def _run_remote(mix: Path, out_dir: Path, model: str, server_url: str,
             if status == "failed":
                 raise RuntimeError(f"split server job failed: {jr.get('error')}")
             if progress_cb:
-                progress_cb(0.4, f"Separating on server ({status or 'working'})")
+                pct = jr.get("progress")
+                detail = f"{pct}%" if isinstance(pct, (int, float)) else (status or "working")
+                progress_cb(0.4, f"Separating on server ({detail})")
+        else:
+            raise RuntimeError(
+                f"split server job timed out after {_JOB_TIMEOUT // 60} min")
     if not stem_urls:
         raise RuntimeError("split server returned no stems")
 
@@ -173,10 +373,28 @@ def _run_remote(mix: Path, out_dir: Path, model: str, server_url: str,
     for name, url in stem_urls.items():
         if isinstance(url, str) and url.startswith("/"):
             url = f"{server_url}{url}"
-        sr = requests.get(url, timeout=180)
-        if sr.status_code == 200:
-            ext = ".mp3" if ".mp3" in str(url).lower() else ".wav"
-            (result_dir / f"{_sanitize(name)}{ext}").write_bytes(sr.content)
+        # The stem URLs come from the server's RESPONSE, and each hop of a redirect chain
+        # is attacker-choosable from there. _get_authed re-checks the origin per hop and
+        # only attaches the key while we're still talking to the configured server.
+        sr, final_url = _get_authed(url, server_url, headers, timeout=180)
+        # Skipping a failed download silently produced a pak that LOOKS split but is
+        # missing stems, and the job still reported success. Fail loudly instead so the
+        # user can retry.
+        if sr.status_code != 200:
+            raise RuntimeError(
+                # Redacted: this url can be a pre-signed one, and the message lands in
+                # the job error, the UI and the log.
+                f"stem download failed for '{name}': HTTP {sr.status_code} from "
+                f"{_redact_url(final_url)}"
+            )
+        # Trust the URL's own extension: roformer emits .flac, demucs .wav.
+        # (Hardcoding .wav mislabels flac stems.) Use the FINAL url - a redirect is
+        # what actually names the file. Strip BOTH the query and any fragment first -
+        # ".flac#frag" would otherwise not match _AUDIO_EXTS and fall back to .wav.
+        clean = str(final_url).split("?", 1)[0].split("#", 1)[0]
+        suffix = Path(clean).suffix.lower()
+        ext = suffix if suffix in _AUDIO_EXTS else ".wav"
+        (result_dir / f"{_sanitize(name)}{ext}").write_bytes(sr.content)
     return result_dir
 
 
@@ -242,11 +460,18 @@ def _run_demucs_local(mix: Path, out_dir: Path, model: str, engine_dir: str | No
     # them — otherwise they land in ~/.cache/torch and leak past an uninstall.
     env = dict(os.environ)
     if models_dir:
-        env.setdefault("TORCH_HOME", models_dir)
+        # Assign, don't setdefault: the packaged app already exports TORCH_HOME for
+        # itself, so setdefault would be a no-op there and demucs' weights would land
+        # in the app's cache — where engine_status can't see them and Uninstall can't
+        # reclaim them. This env is the subprocess's only, so the app is unaffected.
+        env["TORCH_HOME"] = models_dir
     # Subprocess keeps torch out of the server process and isolates crashes.
     # Popen + poll (not subprocess.run) so a cancel can terminate it mid-run;
     # output drains to a temp file to avoid a full-PIPE deadlock.
-    cmd = [sys.executable, "-m", "demucs", "-n", model, "-o", str(result_dir), str(mix)]
+    # NB: -m demucs alone would fail — the child can't see the pip --target engine
+    # tree (see _module_cmd).
+    cmd = _module_cmd(engine_dir, "demucs",
+                      ["-n", model, "-o", str(result_dir), str(mix)])
     with tempfile.TemporaryFile() as logf:  # binary — child writes raw bytes to the fd
         proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, env=env)
         try:

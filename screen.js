@@ -20,7 +20,38 @@
     lyricsEngine: null,
     ws: null,
     inited: false,
+    pendingAfterSetup: [],   // jobs waiting on a one-time model download
+    preparingModels: false,  // guard: only ever one prepare_models in flight
   };
+
+  // The model download takes many minutes, and we promise the user their job "starts
+  // automatically when it finishes". Keeping the queue in memory broke that promise on
+  // any reload/navigation, so persist it.
+  var PENDING_KEY = 'stem_splitter.pendingAfterSetup';
+  function loadPending() {
+    try {
+      var raw = window.localStorage.getItem(PENDING_KEY);
+      var arr = raw ? JSON.parse(raw) : [];
+      state.pendingAfterSetup = Array.isArray(arr) ? arr : [];
+    } catch (e) { state.pendingAfterSetup = []; }
+  }
+  var warnedPersist = false;
+  function savePending() {
+    try {
+      window.localStorage.setItem(PENDING_KEY, JSON.stringify(state.pendingAfterSetup));
+    } catch (e) {
+      // The queue IS the "starts automatically after the download, even across a
+      // reload" promise. If it can't be persisted (quota, storage disabled), the jobs
+      // still run in this page life — but say so rather than quietly breaking the
+      // promise. QuotaExceeded on a big batch is the realistic case.
+      console.warn('[stem_splitter] could not persist pending queue', e);
+      if (warnedPersist) return;   // savePending runs on every enqueue - warn once
+      warnedPersist = true;
+      toast('Queue not saved',
+            'These jobs will still start when the download finishes, but they '
+            + 'will be lost if you reload the page first.', 'warn');
+    }
+  }
 
   function $(id) { return document.getElementById(id); }
 
@@ -38,12 +69,107 @@
     return fetch(API + path, opts).then(function (r) { return r.json(); });
   }
 
-  function enqueue(kind, filenames) {
-    var body = Array.isArray(filenames) ? { filenames: filenames } : { filename: filenames };
+  function post(kind, body) {
     return api('/' + kind, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
+    });
+  }
+
+  // Enqueue, but never let a job silently stall on a lazy multi-GB model fetch:
+  // the backend answers `needs_setup` when the split would go to the managed local
+  // server and its weights aren't downloaded. Ask, then set it up, then run.
+  function enqueue(kind, filenames) {
+    var body = Array.isArray(filenames) ? { filenames: filenames } : { filename: filenames };
+    return post(kind, body).then(function (res) {
+      if (!res || !res.needs_setup) return res;
+      if (!window.confirm(res.message + '\n\nThe download runs in the background; your '
+                          + (kind === 'split' ? 'split' : 'transcription')
+                          + ' starts automatically when it finishes.')) {
+        toast('Cancelled', 'Models are needed before this can run.');
+        return res;
+      }
+      // Keep a handle on THIS entry: if the prepare_models request is refused or
+      // fails we have to remove exactly the job we just queued. pop() would remove
+      // whatever is last, which is the wrong one if another enqueue landed while our
+      // request was in flight.
+      var entry = { kind: kind, body: body };
+      state.pendingAfterSetup.push(entry);
+      savePending();
+      connectWS();
+
+      function dropEntry() {
+        var i = state.pendingAfterSetup.indexOf(entry);
+        if (i !== -1) state.pendingAfterSetup.splice(i, 1);
+        savePending();
+      }
+      // Several songs can hit needs_setup at once (a batch, or rapid clicks).
+      // Only ever kick off ONE model download — the rest just queue behind it.
+      if (state.preparingModels) {
+        toast('Already downloading models', 'This job will start when it finishes.');
+        return res;
+      }
+      state.preparingModels = true;
+      return api('/server/prepare_models', { method: 'POST' }).then(function (r) {
+        // The backend serialises server ops, so this can be REFUSED if one is already
+        // running. Swallowing that would leave preparingModels stuck true and strand
+        // the pending queue forever — reconcile only settles a prepare_models op, and
+        // that op never started. So undo the optimism and say why.
+        if (r && r.ok === false) {
+          state.preparingModels = false;
+          dropEntry();   // remove exactly the job we queued, not whatever is last
+          toast('Server busy', (r.message || 'Another server operation is running.')
+                               + ' Try again when it finishes.', 'warn');
+          return res;
+        }
+        toast('Downloading models', 'This is a one-time ~2 GB download.');
+        return res;
+      }).catch(function (e) {
+        state.preparingModels = false;
+        dropEntry();
+        toast('Could not start model download', String(e), 'warn');
+        return res;
+      });
+    });
+  }
+
+  // Settle a prepare_models that completed while we weren't listening.
+  function reconcilePrepareFromSnapshot(srv) {
+    if (!srv || srv.op !== 'prepare_models') return;
+    if (srv.active) {
+      // Authoritative: a prepare IS running (maybe started by another page/session).
+      state.preparingModels = true;
+      return;
+    }
+    // Keyed off the persisted queue, not the in-memory flag: after a reload the flag is
+    // gone but the user's approved jobs are still owed to them.
+    if (!state.preparingModels && !state.pendingAfterSetup.length) return;
+    state.preparingModels = false;
+    if (srv.error) {
+      toast('Model download failed', srv.error, 'warn');
+      state.pendingAfterSetup.length = 0;
+      savePending();
+    } else {
+      toast('Models ready', 'The local server is warmed up.', 'ok');
+      flushPendingAfterSetup();
+    }
+    refreshConfig();
+  }
+
+  function flushPendingAfterSetup() {
+    var pending = state.pendingAfterSetup.splice(0);
+    savePending();
+    pending.forEach(function (p) {
+      var body = Object.assign({}, p.body, { skip_setup_check: true });
+      post(p.kind, body).then(function (r) {
+        if (r && r.enqueued) toast('Models ready', 'Queued ' + p.kind + ' now.');
+        else toast('Could not queue ' + p.kind, (r && r.message) || 'The request was rejected.', 'warn');
+      }).catch(function (e) {
+        // Don't let a failed re-queue vanish as an unhandled rejection: the user
+        // agreed to a 2 GB download for this job, so say that it didn't run.
+        toast('Could not queue ' + p.kind, String(e), 'warn');
+      });
     });
   }
 
@@ -85,7 +211,9 @@
       enabled: function (song) { return state.missingStems.has(song.filename); },
       run: function (song) {
         if (!state.splitEngine) { toast('No split engine', 'Open Stem Splitter settings to configure a server or download a local engine.', 'warn'); return; }
-        enqueue('split', song.filename).then(function () { toast('Split queued', song.filename); });
+        enqueue('split', song.filename).then(function (r) {
+          if (r && r.enqueued) toast('Split queued', song.filename);
+        });
       },
     });
     reg.register({
@@ -98,7 +226,9 @@
       enabled: function (song) { return state.missingLyrics.has(song.filename); },
       run: function (song) {
         if (!state.lyricsEngine) { toast('No lyrics engine', 'Open Stem Splitter settings to configure a server or download whisperx.', 'warn'); return; }
-        enqueue('transcribe', song.filename).then(function () { toast('Transcription queued', song.filename); });
+        enqueue('transcribe', song.filename).then(function (r) {
+          if (r && r.enqueued) toast('Transcription queued', song.filename);
+        });
       },
     });
   }
@@ -148,6 +278,11 @@
       try { msg = JSON.parse(ev.data); } catch (e) { return; }
       if (msg.type === 'jobs') {
         renderJobs(msg);
+        // Snapshot recovery: if the WS dropped while prepare_models was running we'd
+        // have missed the live server_done/server_error, leaving preparingModels stuck
+        // true and the jobs the user approved a multi-GB download for never queued.
+        // The snapshot carries the server op's terminal state, so settle it from there.
+        reconcilePrepareFromSnapshot(msg.server);
         // A finished job may have changed missing-sets → refresh them (debounced).
         scheduleMissingRefresh();
       } else if (msg.type === 'install_done') {
@@ -155,6 +290,24 @@
         refreshConfig();
       } else if (msg.type === 'install_error') {
         toast('Install failed', msg.error, 'warn');
+      } else if (msg.type === 'server_done') {
+        if (msg.op === 'prepare_models') {
+          state.preparingModels = false;
+          toast('Models ready', 'The local server is warmed up.', 'ok');
+          flushPendingAfterSetup();
+        }
+        refreshConfig();
+      } else if (msg.type === 'server_error') {
+        toast('Server error', msg.error, 'warn');
+        // ONLY a failed prepare_models invalidates the pending queue. A failed
+        // start/install/stop says nothing about the jobs waiting on the models, and
+        // binning them here would break the "starts automatically" promise for a
+        // completely unrelated failure.
+        if (msg.op === 'prepare_models') {
+          state.preparingModels = false;
+          state.pendingAfterSetup.length = 0;
+          savePending();
+        }
       }
     };
     ws.onclose = function () { state.ws = null; setTimeout(connectWS, 2000); };
@@ -175,12 +328,16 @@
     bind('ss-split-all', function () {
       var list = Array.from(state.missingStems);
       if (!list.length) { toast('Nothing to split', 'No songs are missing stems.'); return; }
-      enqueue('split', list).then(function (r) { toast('Queued', r.enqueued + ' split job(s)'); });
+      enqueue('split', list).then(function (r) {
+        if (r && r.enqueued) toast('Queued', r.enqueued + ' split job(s)');
+      });
     });
     bind('ss-transcribe-all', function () {
       var list = Array.from(state.missingLyrics);
       if (!list.length) { toast('Nothing to transcribe', 'No songs are missing lyrics.'); return; }
-      enqueue('transcribe', list).then(function (r) { toast('Queued', r.enqueued + ' transcription job(s)'); });
+      enqueue('transcribe', list).then(function (r) {
+        if (r && r.enqueued) toast('Queued', r.enqueued + ' transcription job(s)');
+      });
     });
     bind('ss-refresh-missing', function () { refreshMissing(); refreshConfig(); });
     bind('ss-pause', function () { api('/pause', { method: 'POST' }); });
@@ -206,6 +363,23 @@
 
   // ── boot ───────────────────────────────────────────────────────────────────
   function boot() {
+    loadPending();
+    // Jobs are owed from a previous page life. Stay connected so the completion
+    // snapshot can flush them — that's what makes "starts automatically" true.
+    //
+    // Deliberately do NOT assume a download is still running: preparingModels is
+    // in-memory, and forcing it true here would leave it stuck true forever if no
+    // prepare_models op is actually active, blocking every future setup attempt. The
+    // snapshot tells us the truth; and if the models finished while we were away,
+    // flush the queue right now.
+    if (state.pendingAfterSetup.length) {
+      connectWS();
+      api('/server_status').then(function (st) {
+        if (st && st.models_downloaded && state.pendingAfterSetup.length) {
+          flushPendingAfterSetup();
+        }
+      }).catch(function () {});
+    }
     registerCardActions();
     refreshConfig();
     refreshMissing();

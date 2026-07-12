@@ -71,6 +71,9 @@
 .stem-splitter .ss-list .item { display: flex; gap: .5rem; align-items: center; padding: .3rem 0; }
 .stem-splitter .ss-list .item .t { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+/* NB: the settings-panel styling lives inline in settings.html — the app only loads
+   this stylesheet on the plugin SCREEN, not in the Settings panel. */
+
 /* Settings page reuses the same scope root. */
 .stem-splitter-settings { color: #e2e8f0; font: 14px/1.5 system-ui, sans-serif; }
 .stem-splitter-settings label { display: block; margin: .75rem 0 .25rem; font-weight: 600; }

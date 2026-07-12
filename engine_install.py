@@ -17,6 +17,8 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -28,6 +30,30 @@ ProgressCB = Optional[Callable[[dict], None]]
 # CPU wheels for torch keep the download sane on machines without CUDA. Callers
 # who want GPU can install torch themselves into the engine dir.
 _TORCH_INDEX = "https://download.pytorch.org/whl/cpu"
+
+# Kill pip if it goes completely silent this long — without it a hung download blocks
+# the installer thread forever with no way out but restarting the app.
+#
+# The bar for "silent" has to clear the WORST legitimate case, not the typical one. We
+# pass --progress-bar off (pip suppresses it on a non-tty anyway), so pip prints one line
+# per wheel and then nothing at all while it downloads it. torch is ~2.5 GB: on a 1 MB/s
+# link that's ~40 minutes of entirely healthy silence. A 10-minute watchdog turned a slow
+# connection into a hard failure — and the retry just fails again, slower.
+#
+# 60 min is deliberately far past any plausible real download while still bounded. Both
+# installers (local engine + managed server) share this via stream_pip, and users on a
+# genuinely awful link can raise it without a rebuild.
+def _stall_timeout() -> int:
+    # Module-level int() on an env var would raise at IMPORT time on a typo, taking the
+    # whole plugin down rather than one setting.
+    try:
+        v = int(os.environ.get("STEM_SPLITTER_PIP_STALL_TIMEOUT") or 0)
+    except ValueError:
+        v = 0
+    return max(60, v or 60 * 60)
+
+
+_PIP_STALL_TIMEOUT = _stall_timeout()
 
 # Shared PyTorch base, installed ONCE before any engine. All three engines depend
 # on torch/torchaudio; installing it per-engine into the same --target tree with
@@ -72,9 +98,34 @@ def models_dir(config_dir: Path) -> Path:
 
 
 def _dir_size(p: Path) -> int:
+    """Best-effort byte total. Never raises — it's a display number.
+
+    This walks trees we do NOT own: external_caches() sizes the shared
+    ~/.cache/huggingface and ~/.cache/torch, and the engine dir is walked while an
+    install or uninstall may be running alongside. Files vanish mid-walk, and a cache
+    dir can hold something we can't stat. An OSError escaping here would 500
+    /engine_status and take the settings UI with it, over a number in a tooltip.
+    """
     if not p.exists():
         return 0
-    return sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
+    total = 0
+    try:
+        walk = p.rglob("*")
+        while True:
+            try:
+                f = next(walk)
+            except StopIteration:
+                break
+            except OSError:
+                continue   # unreadable subdir - skip it, keep walking
+            try:
+                if f.is_file():
+                    total += f.stat().st_size
+            except OSError:
+                continue   # vanished mid-walk, or not ours to stat
+    except OSError:
+        pass
+    return total
 
 
 def _installed_dist(edir: Path, module: str) -> bool:
@@ -89,6 +140,61 @@ def _installed_dist(edir: Path, module: str) -> bool:
     return any(edir.glob(f"{module.replace('_', '?')}*.dist-info"))
 
 
+# Walking a big HF cache isn't free, and engine_status() is called from the settings
+# panel; memoize briefly so repeated reads don't re-scan it.
+_ext_cache_memo: dict = {"t": 0.0, "val": None, "key": None}
+
+
+def external_caches(config_dir: Path) -> list[dict]:
+    """Model-weight caches that live OUTSIDE the plugin's models dir.
+
+    The app deliberately pins TORCH_HOME / HF_HOME to the standard shared
+    locations (~/.cache/torch, ~/.cache/huggingface) - see feedback-desktop
+    src/main/python.ts - so in-process engines (whisperx, audio-separator) download
+    their weights there rather than into our models dir.
+
+    We REPORT these so the disk figure isn't silently short, but we never delete
+    them on uninstall: they're the conventional cache and other tools share them.
+    """
+    now = time.monotonic()
+    key = str(config_dir)
+    # Key the memo by config_dir, not just elapsed time — otherwise a call with a
+    # different config_dir inside the window silently gets the previous dir's result.
+    if (_ext_cache_memo["val"] is not None
+            and _ext_cache_memo["key"] == key
+            and now - _ext_cache_memo["t"] < 60):
+        return _ext_cache_memo["val"]
+
+    try:
+        mdir = models_dir(config_dir).resolve()
+    except OSError:
+        mdir = models_dir(config_dir)
+    base = Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache"))
+    candidates = [
+        ("torch", Path(os.environ.get("TORCH_HOME") or (base / "torch"))),
+        ("huggingface", Path(os.environ.get("HF_HOME") or (base / "huggingface"))),
+    ]
+
+    out: list[dict] = []
+    for label, p in candidates:
+        try:
+            rp = p.resolve()
+        except OSError:
+            continue
+        if not rp.is_dir():
+            continue
+        if rp == mdir or mdir in rp.parents or rp in mdir.parents:
+            continue  # already inside (or containing) our own models dir
+        size = _dir_size(rp)
+        if size:
+            out.append({"label": label, "path": str(rp), "bytes": size})
+
+    _ext_cache_memo["t"] = now
+    _ext_cache_memo["key"] = key
+    _ext_cache_memo["val"] = out
+    return out
+
+
 def installed_map(config_dir: Path) -> dict:
     """Cheap dir-presence check per engine — no directory-size walk. Use this for
     availability gating (resolve_*); reserve engine_status() for when the byte
@@ -101,6 +207,7 @@ def engine_status(config_dir: Path) -> dict:
     edir = engine_dir(config_dir)
     mdir = models_dir(config_dir)
     installed = installed_map(config_dir)
+    ext = external_caches(config_dir)
     return {
         "engine_dir": str(edir),
         "models_dir": str(mdir),
@@ -108,6 +215,10 @@ def engine_status(config_dir: Path) -> dict:
         "any_installed": any(installed.values()),
         "engine_bytes": _dir_size(edir),
         "models_bytes": _dir_size(mdir),
+        # Weights in the shared ~/.cache locations the app pins. Reported so the
+        # disk total isn't misleading; NOT removed by uninstall (see external_caches).
+        "external_caches": ext,
+        "external_cache_bytes": sum(e["bytes"] for e in ext),
     }
 
 
@@ -155,25 +266,19 @@ def _build_failure_hint(engine: str, output_tail: str) -> str:
     return ""
 
 
-def _pip_install(config_dir: Path, label: str, pkgs: list[str], progress_cb: ProgressCB,
-                 base: float, span: float) -> None:
-    """Install one package set in its own pip transaction. Raises ``RuntimeError``
-    (with an actionable hint) on failure.
+def stream_pip(python_exe: str, pip_args: list[str], label: str, progress_cb: ProgressCB,
+               base: float, span: float, pkg_count: int = 1) -> None:
+    """Run one ``pip install`` transaction, streaming its output as progress events.
 
-    ``--upgrade-strategy only-if-needed`` (pip's default, made explicit) means a
-    layered engine install only touches the shared torch/torchaudio if it actually
-    needs a different version - so one engine can't gratuitously rewrite the torch
-    another engine already installed.
+    Shared by the plugin's engine installer (``--target {config_dir}/engine``) and
+    the managed demucs-server installer (``--target .../demucs-server/pylibs``).
+    Neither uses a venv - the packaged Windows Python has none. Raises
+    ``RuntimeError`` with an actionable hint on failure.
+
+    ``pip_args`` are everything after ``pip install`` (packages + flags), so the
+    caller supplies its own ``--target``, ``--no-deps``, index URLs, etc.
     """
-    edir = engine_dir(config_dir)
-    cmd = [
-        sys.executable, "-m", "pip", "install",
-        "--target", str(edir),
-        "--upgrade", "--upgrade-strategy", "only-if-needed",
-        "--progress-bar", "off",
-        "--extra-index-url", _TORCH_INDEX,
-        *pkgs,
-    ]
+    cmd = [python_exe, "-m", "pip", "install", "--progress-bar", "off", *pip_args]
 
     def emit(line: str = "", local: float = 0.0, phase: str = "") -> None:
         if progress_cb:
@@ -181,11 +286,11 @@ def _pip_install(config_dir: Path, label: str, pkgs: list[str], progress_cb: Pro
             progress_cb({"line": line, "pct": max(0.0, min(1.0, pct)),
                          "phase": f"{label}: {phase}" if phase else label})
 
-    emit(f"Installing {label}: {', '.join(pkgs)}", 0.02, "Starting")
+    emit(f"Installing {label}", 0.02, "Starting")
 
     env = dict(os.environ)
     env.setdefault("PYTHONUNBUFFERED", "1")
-    total = max(1, len(pkgs))
+    total = max(1, pkg_count)
     collected = 0
     local = 0.02
     tail: list[str] = []
@@ -193,8 +298,33 @@ def _pip_install(config_dir: Path, label: str, pkgs: list[str], progress_cb: Pro
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, bufsize=1, env=env,
     )
+
+    # Watchdog: a stalled download would otherwise block on readline()/wait()
+    # forever, hanging the installer with no way out but restarting the app. Kill
+    # pip if it goes completely silent for too long. (Inactivity, not a wall-clock
+    # cap — a legitimate multi-GB torch download is slow but never silent.)
+    last_output = [time.monotonic()]
+    stalled = threading.Event()
+
+    def _watchdog() -> None:
+        while proc.poll() is None:
+            if time.monotonic() - last_output[0] > _PIP_STALL_TIMEOUT:
+                stalled.set()
+                log.warning("stem_splitter: pip produced no output for %ss - killing it",
+                            _PIP_STALL_TIMEOUT)
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+                return
+            time.sleep(5)
+
+    threading.Thread(target=_watchdog, name="stem_splitter-pip-watchdog",
+                     daemon=True).start()
+
     assert proc.stdout is not None
     for raw in proc.stdout:
+        last_output[0] = time.monotonic()
         line = raw.rstrip()
         if not line:
             continue
@@ -220,14 +350,47 @@ def _pip_install(config_dir: Path, label: str, pkgs: list[str], progress_cb: Pro
         emit(line, local, phase)
 
     rc = proc.wait()
+    if stalled.is_set():
+        raise RuntimeError(
+            f"pip stalled while installing {label} (no output for "
+            f"{_PIP_STALL_TIMEOUT // 60} min) and was killed. Check your network "
+            "connection and try again. If your link is simply very slow, raise "
+            "STEM_SPLITTER_PIP_STALL_TIMEOUT (seconds)."
+        )
     if rc != 0:
-        hint = _build_failure_hint(label, "\n".join(tail))
+        tail_text = "\n".join(tail)
+        hint = _build_failure_hint(label, tail_text)
         msg = f"pip install failed (exit {rc}) for {label}"
         if hint:
             msg += " - " + hint
-        raise RuntimeError(msg)
+        err = RuntimeError(msg)
+        # Carry pip's own output on the exception. Callers that tolerate a SPECIFIC
+        # failure (see demucs_server._install_diffq, which accepts "no wheel exists" but
+        # must NOT swallow a network error) need to tell the cases apart; the message
+        # alone can't, and a caller that can't tell will silently degrade the install.
+        err.pip_output = tail_text
+        err.returncode = rc
+        raise err
 
     emit(f"Done installing {label}.", 1.0, "Done")
+
+
+def _pip_install(config_dir: Path, label: str, pkgs: list[str], progress_cb: ProgressCB,
+                 base: float, span: float) -> None:
+    """Install one engine package set into the plugin's ``--target`` engine tree.
+
+    ``--upgrade-strategy only-if-needed`` (pip's default, made explicit) means a
+    layered engine install only touches the shared torch/torchaudio if it actually
+    needs a different version - so one engine can't gratuitously rewrite the torch
+    another engine already installed.
+    """
+    args = [
+        "--target", str(engine_dir(config_dir)),
+        "--upgrade", "--upgrade-strategy", "only-if-needed",
+        "--extra-index-url", _TORCH_INDEX,
+        *pkgs,
+    ]
+    stream_pip(sys.executable, args, label, progress_cb, base, span, pkg_count=len(pkgs))
 
 
 def install_engine(config_dir: Path, which: str, progress_cb: ProgressCB = None) -> dict:
@@ -363,6 +526,16 @@ def uninstall_engine(config_dir: Path) -> dict:
         except OSError as e:
             log.warning("stem_splitter: engine removed but could not clear a stale "
                         "uninstall marker (%s); startup will retry clearing it", e)
-        status["uninstall"] = {"removed": True, "pending": False,
-                               "message": "Local engine removed."}
+        msg = "Local engine removed."
+        # Be explicit about what we did NOT delete, so the reclaimed-disk figure
+        # isn't a lie. These are the shared standard caches the app pins; other
+        # tools use them, so removing them isn't ours to do.
+        ext = external_caches(config_dir)
+        if ext:
+            gb = sum(e["bytes"] for e in ext) / 1e9
+            where = ", ".join(e["path"] for e in ext)
+            msg += (f" Note: {gb:.2f} GB of model weights also live in shared caches "
+                    f"({where}) and were NOT removed - other tools use them. "
+                    "Delete those manually if you want the space back.")
+        status["uninstall"] = {"removed": True, "pending": False, "message": msg}
     return status

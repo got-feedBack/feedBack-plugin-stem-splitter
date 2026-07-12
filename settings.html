@@ -1,33 +1,138 @@
 <!-- Stem Splitter settings — injected into the app Settings panel. Scoped under
      .stem-splitter-settings. Nothing heavy loads until the user clicks Download. -->
+<style>
+/* Scoped to the plugin's settings root. Inlined on purpose: the plugin's
+   stylesheet (assets/plugin.css) is only loaded on the plugin SCREEN, not in the
+   app's Settings panel, so status styling has to live here. */
+#ss-settings .ss-statusbar {
+  display: flex; flex-wrap: wrap; gap: .4rem; align-items: center;
+  margin: .5rem 0 .75rem;
+}
+#ss-settings .ss-chip {
+  display: inline-flex; align-items: center; gap: .35rem;
+  padding: .22rem .6rem; border-radius: 999px;
+  font-size: .78rem; font-weight: 600; line-height: 1.2;
+  border: 1px solid transparent; white-space: nowrap;
+}
+#ss-settings .ss-chip.ok   { background: rgba(34,197,94,.16);  color: #4ade80; border-color: rgba(34,197,94,.35); }
+#ss-settings .ss-chip.warn { background: rgba(234,179,8,.16);  color: #facc15; border-color: rgba(234,179,8,.35); }
+#ss-settings .ss-chip.bad  { background: rgba(239,68,68,.16);  color: #f87171; border-color: rgba(239,68,68,.35); }
+#ss-settings .ss-chip.info { background: rgba(59,130,246,.16); color: #93c5fd; border-color: rgba(59,130,246,.35); }
+#ss-settings .ss-chip.off  { background: rgba(148,163,184,.12); color: #94a3b8; border-color: rgba(148,163,184,.25); }
+#ss-settings .ss-chip .dot { width: .5rem; height: .5rem; border-radius: 50%; background: currentColor; }
+#ss-settings .ss-chip.live .dot { animation: ss-pulse 1.4s ease-in-out infinite; }
+@keyframes ss-pulse { 0%,100% { opacity: 1 } 50% { opacity: .25 } }
+#ss-settings .ss-note { font-size: .78rem; color: #94a3b8; margin: .1rem 0 .6rem; }
+#ss-settings .ss-note.warn { color: #facc15; }
+
+/* Action buttons whose colour reflects state, not decoration. */
+#ss-settings .ss-actionbtn {
+  border: 0; border-radius: 7px; padding: .45rem .85rem;
+  font-weight: 600; cursor: pointer; color: #fff;
+  display: inline-flex; align-items: center; gap: .4rem;
+  transition: background .15s ease, opacity .15s ease;
+}
+#ss-settings .ss-actionbtn .dot { width: .5rem; height: .5rem; border-radius: 50%; background: currentColor; }
+#ss-settings .ss-actionbtn.green { background: #16a34a; }   /* server up */
+#ss-settings .ss-actionbtn.red   { background: #b91c1c; }   /* server down */
+#ss-settings .ss-actionbtn.blue  { background: #2563eb; }
+#ss-settings .ss-actionbtn.grey  { background: rgba(148,163,184,.2); color: #e2e8f0; }
+#ss-settings .ss-actionbtn.amber { background: #a16207; }
+#ss-settings .ss-actionbtn[disabled] { opacity: .45; cursor: not-allowed; }
+#ss-settings .ss-actionbtn.busy .dot { animation: ss-pulse 1.4s ease-in-out infinite; }
+
+/* ── Section structure ────────────────────────────────────────────────────────
+   The three areas (engines / in-process engine / managed server) previously ran
+   together as bare <h3> text with nothing separating them. Give each a card and a
+   real header so it's obvious where one ends and the next begins. */
+#ss-settings .ss-title {
+  font-size: 1.15rem; font-weight: 700; margin: 0 0 .25rem; color: #f1f5f9;
+}
+#ss-settings .ss-subtitle { color: #94a3b8; font-size: .82rem; margin: 0 0 1rem; }
+
+#ss-settings .ss-section {
+  background: rgba(30, 41, 59, .45);
+  border: 1px solid rgba(148, 163, 184, .18);
+  border-radius: 10px;
+  padding: .9rem 1.05rem 1.05rem;
+  margin: 0 0 1rem;
+}
+#ss-settings .ss-section > h3 {
+  display: flex; align-items: center; gap: .55rem;
+  margin: 0 0 .75rem; padding-bottom: .55rem;
+  font-size: .92rem; font-weight: 700; letter-spacing: .01em; color: #e2e8f0;
+  border-bottom: 1px solid rgba(148, 163, 184, .15);
+}
+/* Accent bar keys each section to its colour. */
+#ss-settings .ss-section > h3::before {
+  content: ''; width: 3px; height: 1.05rem; border-radius: 2px; flex: none;
+  background: var(--ss-accent, #3b82f6);
+}
+#ss-settings .ss-section.engines { --ss-accent: #3b82f6; }
+#ss-settings .ss-section.local   { --ss-accent: #a855f7; }
+#ss-settings .ss-section.server  { --ss-accent: #16a34a; }
+#ss-settings .ss-section > h3 .ss-h-note {
+  margin-left: auto; font-size: .72rem; font-weight: 500; color: #94a3b8;
+}
+#ss-settings .ss-section p:first-of-type { margin-top: 0; }
+
+/* Advanced: collapsed by default — these are escape hatches, not everyday knobs. */
+#ss-settings .ss-adv {
+  margin-top: .9rem; border-top: 1px solid rgba(148,163,184,.15); padding-top: .6rem;
+}
+#ss-settings .ss-adv > summary {
+  cursor: pointer; font-size: .8rem; font-weight: 600; color: #94a3b8;
+  list-style: none; user-select: none;
+}
+#ss-settings .ss-adv > summary::-webkit-details-marker { display: none; }
+#ss-settings .ss-adv > summary::before { content: '▸ '; }
+#ss-settings .ss-adv[open] > summary::before { content: '▾ '; }
+#ss-settings .ss-adv > summary:hover { color: #cbd5e1; }
+#ss-settings .ss-adv .ss-adv-body { padding-top: .6rem; }
+#ss-settings code.ss-mono {
+  font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: rgba(148,163,184,.12); padding: .1rem .35rem; border-radius: 4px;
+}
+</style>
+
 <div class="stem-splitter-settings" id="ss-settings">
-  <h3>Stem Splitter</h3>
-  <p class="ss-muted">Pick how splitting and lyric transcription run. Remote uses the
-    server configured in the app's audio settings (<code>demucs_server_url</code>).
-    Local runs on this machine after an opt-in download.</p>
+  <h2 class="ss-title">Stem Splitter</h2>
+  <p class="ss-subtitle">Split stems and transcribe lyrics — using a server, or on this machine.</p>
+
+  <section class="ss-section engines">
+    <h3>Engines <span class="ss-h-note">which engine runs the work</span></h3>
+  <p class="ss-muted">Chooses <em>where</em> splitting and lyric transcription happen. Leave both on
+    <strong>Auto</strong> and it does the right thing: use the server below if it's running, otherwise
+    fall back to the in-app engine if you installed one.</p>
+  <p class="ss-note"><strong>“Server”</strong> = the managed local demucs server below whenever it's
+    running, otherwise whatever the app's <code>demucs_server_url</code> points at — so the same option
+    covers both. <strong>“In-app”</strong> = the models run inside the feedBack process itself.<br>
+    These settings apply to <em>both</em>: “Split model” is sent to the server <em>and</em> used by the
+    in-app audio-separator; “WhisperX model” is the one exception — only the in-app transcriber uses it,
+    the server has its own.</p>
 
   <label for="ss-set-split">Split engine</label>
   <select id="ss-set-split">
-    <option value="auto">Auto (remote if available, else local)</option>
-    <option value="remote">Remote server (bs_roformer_sw)</option>
-    <option value="audio-separator">Local — audio-separator (bs_roformer_sw)</option>
-    <option value="demucs">Local — demucs (htdemucs_6s)</option>
+    <option value="auto">Auto — server if running, else in-app</option>
+    <option value="remote">Server (managed local, or demucs_server_url)</option>
+    <option value="audio-separator">In-app — audio-separator (bs_roformer_sw)</option>
+    <option value="demucs">In-app — demucs (htdemucs_6s)</option>
   </select>
 
   <label for="ss-set-lyrics">Lyrics engine</label>
   <select id="ss-set-lyrics">
-    <option value="auto">Auto (remote if available, else local)</option>
-    <option value="remote">Remote server (/align)</option>
-    <option value="local">Local — whisperx</option>
+    <option value="auto">Auto — server if running, else in-app</option>
+    <option value="remote">Server (/align)</option>
+    <option value="local">In-app — whisperx</option>
   </select>
 
   <div class="row">
     <div>
-      <label for="ss-set-remote-model">Remote split model</label>
+      <label for="ss-set-remote-model" title="Sent to the server AND used by the in-app audio-separator engine">Split model (server + in-app)</label>
       <input type="text" id="ss-set-remote-model" value="bs_roformer_sw">
     </div>
     <div>
-      <label for="ss-set-wx-model">WhisperX model (local)</label>
+      <label for="ss-set-wx-model" title="Only the in-app whisperx uses this; the server has its own">WhisperX model (in-app only)</label>
       <select id="ss-set-wx-model">
         <option>tiny</option><option>base</option><option>small</option>
         <option selected>medium</option><option>large-v2</option><option>large-v3</option>
@@ -41,9 +146,91 @@
 
   <div style="margin-top:1rem"><button class="ss-btn" id="ss-set-save" style="background:#2563eb;color:#fff;border:0;border-radius:7px;padding:.45rem .85rem;font-weight:600;cursor:pointer">Save</button>
     <span id="ss-set-saved" class="ss-muted"></span></div>
+  </section>
 
-  <h3 style="margin-top:1.75rem">Local engine (opt-in download)</h3>
-  <p class="ss-muted" id="ss-engine-status">Checking…</p>
+  <section class="ss-section server">
+    <h3>Local demucs server <span class="ss-h-note" id="ss-srv-saved">recommended — start here</span></h3>
+  <p class="ss-muted"><strong>The easiest way to get splitting working.</strong> Runs got-feedBack's real
+    demucs/whisperx server on this machine and manages it for you. <em>Install server + models</em> does
+    the whole setup in one click (dependencies, then the model weights) and starts it.</p>
+  <p class="ss-note">Once it's running, the plugin uses it automatically — nothing else to configure.
+    It can use your <strong>GPU</strong> (big speed-up: seconds instead of minutes), it runs in its own
+    process so it can't destabilise the app, and <em>Uninstall server</em> removes every byte it
+    downloaded. This is the only thing here that downloads anything; app startup never downloads and
+    is never blocked by it.</p>
+  <div class="ss-statusbar" id="ss-srv-chips"><span class="ss-chip off">Checking…</span></div>
+  <p class="ss-note" id="ss-srv-note"></p>
+
+  <div class="row">
+    <div>
+      <label for="ss-srv-port">Port</label>
+      <input type="text" id="ss-srv-port" value="7865" style="width:5.5rem">
+    </div>
+    <div>
+      <label for="ss-srv-device">Device</label>
+      <select id="ss-srv-device">
+        <option value="">Auto</option>
+        <option value="cpu">CPU</option>
+        <option value="cuda">CUDA (GPU)</option>
+      </select>
+    </div>
+    <div>
+      <label><input type="checkbox" id="ss-srv-autostart"> Start with the app</label>
+      <label><input type="checkbox" id="ss-srv-global"> Use for the whole app</label>
+      <label><input type="checkbox" id="ss-srv-gpu"> <span id="ss-srv-gpu-label">Use GPU (CUDA)</span></label>
+    </div>
+  </div>
+
+  <div class="row" style="margin-top:.6rem">
+    <button class="ss-actionbtn blue" id="ss-srv-install"><span id="ss-srv-install-label">Install server + models (~5 GB)</span></button>
+    <!-- One button. Its COLOUR is the server's state (red = down, green = up); its
+         LABEL is what clicking will do. -->
+    <button class="ss-actionbtn red" id="ss-srv-toggle"><i class="dot"></i><span id="ss-srv-toggle-label">Start server</span></button>
+    <button class="ss-actionbtn grey" id="ss-srv-test">Test status</button>
+    <button class="ss-actionbtn grey" id="ss-srv-uninstall">Uninstall server</button>
+  </div>
+
+  <details class="ss-adv" id="ss-srv-adv">
+    <summary>Advanced — pin a server revision / CUDA build</summary>
+    <div class="ss-adv-body">
+      <p class="ss-note" style="margin-top:0">Only needed if you're testing a specific server revision,
+        or if the default CUDA build doesn't match your driver. Changing these takes effect on the
+        <strong>next install</strong> — use <em>Uninstall server</em>, then install again.</p>
+
+      <div class="row">
+        <div>
+          <label for="ss-srv-ref">Server revision (branch, tag or commit)</label>
+          <input type="text" id="ss-srv-ref" placeholder="main" style="width:16rem">
+        </div>
+        <div>
+          <label for="ss-srv-cuda">CUDA build</label>
+          <select id="ss-srv-cuda"></select>
+        </div>
+      </div>
+      <p class="ss-note" id="ss-srv-adv-note"></p>
+    </div>
+  </details>
+
+  <div id="ss-srv-progress" style="display:none;margin-top:.75rem">
+    <div class="ss-row" style="justify-content:space-between">
+      <strong id="ss-srv-phase" style="font-size:.85rem">Starting…</strong>
+      <span id="ss-srv-pct" class="ss-muted">0%</span>
+    </div>
+    <div class="ss-bar" style="width:100%;margin:.35rem 0"><i id="ss-srv-fill" style="width:0%"></i></div>
+    <pre class="ss-log" id="ss-srv-log" style="height:240px;max-height:240px;overflow:auto;margin:0;padding:.6rem;background:#0b1220;color:#94a3b8;border:1px solid rgba(148,163,184,.2);border-radius:6px;font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;word-break:break-word"></pre>
+  </div>
+  </section>
+
+  <section class="ss-section local">
+    <h3>Local engine <span class="ss-h-note">alternative — no server</span></h3>
+  <p class="ss-muted">Runs the models <strong>inside the feedBack process</strong> instead of talking to
+    a server. You don't need this if you're using the server above — it's a separate, second download.</p>
+  <p class="ss-note">Worth knowing: it's <strong>CPU-only</strong> (no CUDA install path, so it's slower
+    than the server on an NVIDIA machine), it loads multi-GB models into the app's own process, and its
+    weights land in the shared <code>~/.cache</code> — so <em>Uninstall</em> can't reclaim them all.
+    Prefer the server unless you specifically want to avoid running one.</p>
+  <div class="ss-statusbar" id="ss-engine-chips"><span class="ss-chip off">Checking…</span></div>
+  <p class="ss-note" id="ss-engine-note"></p>
   <div class="row">
     <button class="ss-btn" id="ss-dl-all" style="background:#2563eb;color:#fff;border:0;border-radius:7px;padding:.45rem .85rem;font-weight:600;cursor:pointer">Download local engine + models (~2 GB+)</button>
     <button class="ss-btn" id="ss-dl-as" style="background:rgba(148,163,184,.2);color:#e2e8f0;border:0;border-radius:7px;padding:.45rem .85rem;cursor:pointer">audio-separator only</button>
@@ -59,6 +246,8 @@
     <div class="ss-bar" style="width:100%;margin:.35rem 0"><i id="ss-install-fill" style="width:0%"></i></div>
     <pre class="ss-log" id="ss-install-log" style="height:240px;max-height:240px;overflow:auto;margin:0;padding:.6rem;background:#0b1220;color:#94a3b8;border:1px solid rgba(148,163,184,.2);border-radius:6px;font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;word-break:break-word"></pre>
   </div>
+
+  </section>
 </div>
 
 <script>
@@ -78,16 +267,59 @@
       $('ss-set-remote-model').value = s.remote_model || 'bs_roformer_sw';
       $('ss-set-wx-model').value = s.whisperx_model || 'medium';
       $('ss-set-lang').value = s.language || '';
-      renderStatus(cfg.engine_status);
+      $('ss-srv-port').value = s.local_server_port || 7865;
+      $('ss-srv-device').value = s.local_server_device || '';
+      $('ss-srv-autostart').checked = !!s.local_server_autostart;
+      $('ss-srv-global').checked = !!s.local_server_use_globally;
+      if (s.local_server_gpu !== null && typeof s.local_server_gpu !== 'undefined') {
+        $('ss-srv-gpu').checked = !!s.local_server_gpu;
+        gpuTouched = true;
+      }
+      $('ss-srv-ref').value = s.local_server_ref || '';
+      advCudaWanted = s.local_server_cuda_tag || '';
+      // /config carries only the cheap install map now; the full status
+      // (with the expensive cache-size walk) comes from /engine_status.
+      renderStatus(null);
     }).catch(function () {});
+    loadServerStatus();
   }
+
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+    });
+  }
+  // tone: ok | warn | bad | info | off. `live` adds a pulsing dot.
+  function chip(label, tone, opts) {
+    opts = opts || {};
+    return '<span class="ss-chip ' + tone + (opts.live ? ' live' : '') + '"'
+      + (opts.title ? ' title="' + esc(opts.title) + '"' : '') + '>'
+      + (opts.dot ? '<i class="dot"></i>' : '') + esc(label) + '</span>';
+  }
+  function gb(bytes) { return ((bytes || 0) / 1e9).toFixed(2) + ' GB'; }
 
   function renderStatus(st) {
     if (!st) { j('/engine_status').then(renderStatus); return; }
     var inst = st.installed || {};
-    var parts = Object.keys(inst).map(function (k) { return k + ': ' + (inst[k] ? '✓' : '—'); });
-    var gb = (st.engine_bytes + st.models_bytes) / 1e9;
-    $('ss-engine-status').textContent = parts.join('   ') + '   (' + gb.toFixed(2) + ' GB on disk)';
+    var chips = Object.keys(inst).map(function (k) {
+      return inst[k] ? chip(k + ' ✓', 'ok') : chip(k + ' —', 'off');
+    });
+    var onDisk = (st.engine_bytes || 0) + (st.models_bytes || 0);
+    chips.push(chip(gb(onDisk) + ' on disk', onDisk ? 'info' : 'off'));
+    $('ss-engine-chips').innerHTML = chips.join('');
+
+    // The app pins TORCH_HOME/HF_HOME to the shared ~/.cache dirs, so some weights
+    // land there rather than in our models dir. Say so — Uninstall won't reclaim them.
+    var note = $('ss-engine-note');
+    if (st.external_cache_bytes) {
+      note.textContent = '⚠ ' + gb(st.external_cache_bytes)
+        + ' of model weights also live in shared caches and are NOT removed by Uninstall — '
+        + (st.external_caches || []).map(function (c) { return c.path; }).join(', ');
+      note.className = 'ss-note warn';
+    } else {
+      note.textContent = '';
+      note.className = 'ss-note';
+    }
   }
 
   function save() {
@@ -98,6 +330,7 @@
       whisperx_model: $('ss-set-wx-model').value,
       language: $('ss-set-lang').value,
     };
+    // The server card saves itself (see saveServerSettings) - don't duplicate its keys here.
     j('/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
       .then(function () { $('ss-set-saved').textContent = 'Saved.'; setTimeout(function () { $('ss-set-saved').textContent = ''; }, 2000); });
   }
@@ -153,6 +386,15 @@
     setEngineButtons(!!st.active);  // keep buttons locked if an install is still running
   }
 
+  // Snapshot recovery for a server op that was still running while the page was away.
+  function renderServerOp(st) {
+    if (!st) return;
+    $('ss-srv-progress').style.display = 'block';
+    setSrvBar(st.pct, st.phase || (st.active ? st.op : 'Done'));
+    if (st.error) appendLog($('ss-srv-log'), '✗ ' + st.error);
+    setServerButtons(!!st.active);
+  }
+
   var ws = null;
   function connectWS() {
     if (ws) return;
@@ -163,6 +405,22 @@
       var log = $('ss-install-log');
       if (m.type === 'jobs') {
         if (m.install) renderInstall(m.install);   // snapshot recovery
+        if (m.server) renderServerOp(m.server);
+      } else if (m.type === 'server') {
+        $('ss-srv-progress').style.display = 'block';
+        if (m.line) appendLog($('ss-srv-log'), m.line);
+        setSrvBar(m.pct, m.phase);
+        setServerButtons(true);
+      } else if (m.type === 'server_done') {
+        appendLog($('ss-srv-log'), '✓ ' + m.op + ' done.');
+        setSrvBar(1, 'Done');
+        setServerButtons(false);
+        if (m.status) renderServerStatus(m.status); else loadServerStatus();
+      } else if (m.type === 'server_error') {
+        appendLog($('ss-srv-log'), '✗ ' + m.error);
+        setSrvBar(0, 'Failed');
+        setServerButtons(false);
+        loadServerStatus();
       } else if (m.type === 'install') {
         $('ss-install-progress').style.display = 'block';
         if (m.line) appendLog(log, m.line);
@@ -204,6 +462,446 @@
       $('ss-install-log').textContent = 'Uninstall request failed: ' + err + '\n';
     }).finally(function () { setEngineButtons(false); });
   });
+  // ── managed demucs server ──────────────────────────────────────────────────
+  // These controls sit in their own card, away from the Engines "Save" button, so a
+  // user reasonably expects them to stick on their own. They used to be dropped on
+  // reload unless you happened to press a Save button in a different section.
+  var srvSaveTimer = null;
+  var SRV_FIELDS = ['ss-srv-autostart', 'ss-srv-global', 'ss-srv-gpu',
+                    'ss-srv-port', 'ss-srv-device', 'ss-srv-ref', 'ss-srv-cuda'];
+
+  function saveServerSettings() {
+    // POST /config merges only the keys present, so a partial body is safe.
+    var body = {
+      local_server_port: parseInt($('ss-srv-port').value, 10) || 7865,
+      local_server_device: $('ss-srv-device').value,
+      local_server_autostart: $('ss-srv-autostart').checked,
+      local_server_use_globally: $('ss-srv-global').checked,
+      local_server_ref: $('ss-srv-ref').value.trim(),
+      local_server_cuda_tag: $('ss-srv-cuda').value,
+    };
+    // local_server_gpu is TRI-state: null means "auto-detect at install time", and
+    // renderServerStatus pre-checks the box for a detected GPU without the user asking.
+    // Sending the checkbox unconditionally would launder that hint into an explicit
+    // `true` the first time ANY other field on this card is touched, permanently
+    // disabling auto-detection. Only send it once the user has actually set it.
+    if (gpuTouched) body.local_server_gpu = $('ss-srv-gpu').checked;
+    return j('/config', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }).then(function () {
+      var el = $('ss-srv-saved');
+      if (!el) return;
+      var prev = el.textContent;
+      el.textContent = 'Saved ✓';
+      setTimeout(function () { el.textContent = prev; }, 1500);
+    }).catch(function () {});
+  }
+
+  function queueServerSave() {
+    if (srvSaveTimer) clearTimeout(srvSaveTimer);
+    srvSaveTimer = setTimeout(function () { srvSaveTimer = null; saveServerSettings(); }, 400);
+  }
+
+  SRV_FIELDS.forEach(function (id) {
+    var el = $(id);
+    if (!el) return;
+    el.addEventListener('change', queueServerSave);
+    if (el.tagName === 'INPUT' && el.type === 'text') el.addEventListener('input', queueServerSave);
+  });
+  var SERVER_BTNS = ['ss-srv-install', 'ss-srv-toggle', 'ss-srv-test', 'ss-srv-uninstall'];
+  var serverManageable = true;   // false when the backend says it can't manage a server here
+  var serverBusy = false;        // an install/start/stop/prepare is in flight
+  function setServerButtons(disabled) {
+    serverBusy = !!disabled;
+    var d = disabled || !serverManageable;   // never re-enable an unsupported section
+    SERVER_BTNS.forEach(function (id) { var el = $(id); if (el) el.disabled = d; });
+  }
+  function setSrvBar(pct, phase) {
+    $('ss-srv-fill').style.width = Math.round((pct || 0) * 100) + '%';
+    $('ss-srv-pct').textContent = Math.round((pct || 0) * 100) + '%';
+    if (phase) $('ss-srv-phase').textContent = phase;
+  }
+  function srvLog(line) { $('ss-srv-progress').style.display = 'block'; appendLog($('ss-srv-log'), line); }
+
+  var lastServerStatus = null;
+  var gpuTouched = false;   // did the user set the GPU box themselves?
+  var advCudaWanted = '';   // saved CUDA override, applied once the options exist
+
+  // Advanced is rendered from the backend's defaults, so the UI never hardcodes the
+  // ref or the list of CUDA builds.
+  function renderAdvanced(st) {
+    var sel = $('ss-srv-cuda'), note = $('ss-srv-adv-note');
+    if (!sel || !st || !st.defaults) return;
+    var d = st.defaults;
+
+    if (!sel.options.length) {
+      var opts = ['<option value="">Default (' + esc(d.cuda_tag) + ')</option>'];
+      (d.cuda_tags || []).forEach(function (t) {
+        opts.push('<option value="' + esc(t) + '">' + esc(t) + '</option>');
+      });
+      sel.innerHTML = opts.join('');
+      sel.value = advCudaWanted || '';
+    }
+    $('ss-srv-ref').placeholder = d.ref || 'main';
+
+    // Show what's actually on disk, so "pinned" isn't a claim you have to trust.
+    var bits = [];
+    var src = st.source || {}, inst = st.install_info || {};
+    if (src.commit) {
+      bits.push('installed: ' + esc(d.repo) + ' @ ' + esc(String(src.ref || '')) +
+                ' (' + esc(String(src.commit).slice(0, 8)) + ')');
+    }
+    if (inst.torch) bits.push('torch: ' + esc(inst.torch));
+    note.innerHTML = bits.length
+      ? bits.join(' · ')
+      : 'Nothing installed yet — these apply to the next install.';
+  }
+
+  // The toggle's colour tracks the SERVER's state (red = down, green = up); its label
+  // says what a click will do. Previously Start was always green and Stop always grey,
+  // so the controls told you nothing about what was actually happening.
+  function setBtnTone(id, tone) {
+    var el = $(id);
+    if (!el) return;
+    el.classList.remove('green', 'red', 'blue', 'grey', 'amber', 'busy');
+    el.classList.add(tone);
+  }
+  // The setup button reflects what's still MISSING, rather than just disabling itself
+  // once the deps exist: installing the dependencies without the model weights leaves a
+  // server that starts but can't split, and that half-state needs a way forward.
+  function renderInstallBtn(st) {
+    var btn = $('ss-srv-install'), label = $('ss-srv-install-label');
+    if (!btn || !label) return;
+    if (!st) { btn.disabled = true; return; }
+
+    // Only offer the GPU build when there's actually an NVIDIA card to use it, and
+    // default it on in that case - a CPU install on a GPU box is minutes vs seconds.
+    var gpuBox = $('ss-srv-gpu'), gpuLabel = $('ss-srv-gpu-label');
+    var g = st.gpu_detected;
+    if (g) {
+      gpuBox.disabled = false;
+      gpuLabel.textContent = 'Use GPU (CUDA) - ' + g.name;
+      if (!gpuTouched && !st.installed) gpuBox.checked = true;
+    } else {
+      gpuBox.disabled = true;
+      gpuBox.checked = false;
+      gpuLabel.textContent = 'Use GPU (CUDA) - no NVIDIA GPU detected';
+    }
+
+    // A GPU box running a CPU-only install: offer the rebuild rather than greying out.
+    if (st.installed && g && !st.gpu_build && gpuBox.checked) {
+      setBtnTone('ss-srv-install', 'amber');
+      label.textContent = 'Reinstall with GPU (~5.5 GB)';
+      btn.disabled = serverBusy || !serverManageable;
+      btn.title = 'torch is the CPU-only build; rebuild it against CUDA to use ' + g.name;
+      return;
+    }
+
+    if (!st.installed) {
+      setBtnTone('ss-srv-install', 'blue');
+      label.textContent = 'Install server + models (~5 GB)';
+      btn.disabled = serverBusy || !serverManageable;
+    } else if (!st.models_downloaded) {
+      setBtnTone('ss-srv-install', 'amber');
+      label.textContent = 'Download models (~2 GB)';   // deps are there; finish the job
+      btn.disabled = serverBusy || !serverManageable;
+    } else {
+      setBtnTone('ss-srv-install', 'grey');
+      label.textContent = 'Installed ✓';
+      btn.disabled = true;                              // nothing left to do
+      btn.title = 'Server and models are installed. Use Uninstall server to remove them.';
+    }
+  }
+
+  function renderToggle(st) {
+    var label = $('ss-srv-toggle-label');
+    if (!st || !st.installed) {
+      setBtnTone('ss-srv-toggle', 'grey');
+      label.textContent = 'Not installed';
+      $('ss-srv-toggle').disabled = true;
+      return;
+    }
+    $('ss-srv-toggle').disabled = serverBusy || !serverManageable;
+    if (st.running) {
+      setBtnTone('ss-srv-toggle', 'green');
+      label.textContent = 'Running — click to stop';
+    } else {
+      setBtnTone('ss-srv-toggle', 'red');
+      label.textContent = 'Stopped — click to start';
+    }
+  }
+  var WARMUP_TONE = { ready: 'ok', skipped: 'ok', downloading: 'warn',
+                      pending: 'off', failed: 'bad', evicted: 'off' };
+
+  function renderServerStatus(st) {
+    lastServerStatus = st || null;
+    var bar = $('ss-srv-chips'), note = $('ss-srv-note');
+    if (!st) { bar.innerHTML = chip('Status unavailable', 'bad'); return; }
+
+    // Deployments where a managed server can't work (no pip, read-only config dir):
+    // disable the section and say why, rather than letting the user start an install
+    // that cannot succeed.
+    if (st.manageable === false) {
+      serverManageable = false;
+      bar.innerHTML = chip('Unavailable here', 'bad', { dot: true });
+      renderToggle(null);
+      renderInstallBtn(null);
+      note.textContent = st.manage_reason || '';
+      note.className = 'ss-note warn';
+      setServerButtons(true);
+      return;
+    }
+    serverManageable = true;
+
+    var chips = [];
+    if (!st.installed) {
+      chips.push(chip('Not installed', 'off', { dot: true }));
+    } else if (st.running) {
+      chips.push(chip('Running · :' + st.port, 'ok', { dot: true, live: true }));
+      var h = st.health || {};
+      if (h.device) chips.push(chip(h.device.toUpperCase() + (h.gpu ? ' · GPU' : ''),
+                                    h.gpu ? 'ok' : 'info'));
+    } else {
+      chips.push(chip('Installed · stopped', 'warn', { dot: true }));
+    }
+
+    chips.push(st.models_downloaded ? chip('Models downloaded', 'ok')
+                                    : chip('Models not downloaded', 'warn'));
+
+    // The case worth shouting about: a GPU is sitting right there, but the install
+    // built CPU-only torch, so every split runs at CPU speed for no reason.
+    var g = st.gpu_detected;
+    if (st.installed && g && !st.gpu_build) {
+      chips.push(chip('CPU-only build - GPU idle', 'warn',
+                      { title: g.name + ' detected. Reinstall with GPU to use it.' }));
+    } else if (st.installed && st.gpu_build) {
+      chips.push(chip('GPU build' + (g ? ' - ' + g.name : ''), 'ok'));
+    } else if (!st.installed && g) {
+      chips.push(chip('GPU available - ' + g.name, 'info'));
+    }
+    if (st.running && st.models_ready) chips.push(chip('Warm · ready to split', 'ok'));
+
+    // Per-model warmup detail (pending / downloading / ready / failed).
+    var wu = (st.health || {}).warmup || {};
+    Object.keys(wu).forEach(function (k) {
+      var v = wu[k];
+      if (typeof v !== 'string') return;
+      chips.push(chip(k + ': ' + v, WARMUP_TONE[v] || 'off',
+                      { live: v === 'downloading' , dot: v === 'downloading' }));
+    });
+
+    if (st.disk_bytes) chips.push(chip(gb(st.disk_bytes) + ' on disk', 'info'));
+    bar.innerHTML = chips.join('');
+    renderToggle(st);
+    renderInstallBtn(st);
+    renderAdvanced(st);
+
+    var notes = [];
+    if (st.advisory) notes.push('⚠ ' + st.advisory);
+    if (st.source && st.source.commit) {
+      notes.push('source: ' + st.source.ref + ' @ ' + String(st.source.commit).slice(0, 8));
+    }
+    note.textContent = notes.join('   ');
+    note.className = st.advisory ? 'ss-note warn' : 'ss-note';
+
+    syncGlobalUrl(st);
+  }
+
+  function loadServerStatus() {
+    return j('/server_status').then(renderServerStatus).catch(function () {});
+  }
+
+  // Poll while the server is up but not yet warm, so the per-model warmup chips
+  // tick from pending -> downloading -> ready on their own. Idle otherwise (and
+  // stops entirely once everything is ready) so we're not hammering /health.
+  setInterval(function () {
+    var st = lastServerStatus;
+    if (!serverManageable || !st) return;
+    var busy = st.running && !st.models_ready;
+    if (busy) loadServerStatus();
+  }, 5000);
+
+  // "Use for the whole app": mirror the running local URL into the app's own
+  // demucs_server_url via the app's writer (it holds the settings lock + does an
+  // atomic write; a plugin-side config.json write would race it).
+  function appSettings(body) {
+    return fetch('/api/settings', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }).then(function (r) { return r.json(); });
+  }
+  // What we last wrote into the app's demucs_server_url, PERSISTED.
+  //
+  // It has to survive a reload. The clear-on-untoggle path may only clear a value it
+  // knows it wrote (otherwise it would clobber a remote URL the user set), and an
+  // in-memory-only record forced it to guess "the server's current url" instead. That
+  // guess is wrong precisely when it matters: the port is user-configurable, so after
+  // changing it (or reinstalling on a different port) the CURRENT url no longer equals
+  // the one we wrote, and the stale value would be left pointing the whole app at a
+  // server that is no longer there — with no way to clear it from the UI.
+  var SYNCED_KEY = 'stem_splitter.global_url';
+  function loadSyncedUrl() {
+    try { return window.localStorage.getItem(SYNCED_KEY) || null; } catch (e) { return null; }
+  }
+  function saveSyncedUrl(url) {
+    try {
+      if (url) window.localStorage.setItem(SYNCED_KEY, url);
+      else window.localStorage.removeItem(SYNCED_KEY);
+    } catch (e) { /* private mode / quota - degrades to in-memory only */ }
+  }
+  var lastSyncedUrl = loadSyncedUrl();   // what we last wrote, so a poll doesn't rewrite it
+
+  function syncGlobalUrl(st) {
+    if (!st) return;
+    // Turning the toggle OFF has to UNDO the write, not just stop making new ones —
+    // bailing out here left the whole app still pointed at our local server.
+    if (!$('ss-srv-global').checked) return clearGlobalUrl(st);
+    if (st.running && st.url) {
+      // renderServerStatus runs on every poll (every 5s while models warm), so writing
+      // unconditionally meant hammering the app's settings file - and its lock - with
+      // an identical value. Only write on an actual change.
+      if (st.url === lastSyncedUrl) return;
+      // The url CHANGED (e.g. the user moved the port) while we own the global setting:
+      // clear the old one first, or it leaks — nothing else remembers it.
+      if (lastSyncedUrl) clearGlobalUrl(st, lastSyncedUrl);
+      lastSyncedUrl = st.url;
+      saveSyncedUrl(st.url);
+      clearedUrl = null;
+      appSettings({ demucs_server_url: st.url }).catch(function () {
+        lastSyncedUrl = null; saveSyncedUrl(null);
+      });
+    } else {
+      clearGlobalUrl(st);
+    }
+  }
+
+  // Clear the app-level demucs_server_url — but ONLY if it still points at the URL WE
+  // wrote, so we never clobber a remote URL the user set in the meantime.
+  var clearedUrl = null;      // don't re-clear the same URL on every 5s poll
+  function clearGlobalUrl(st, explicitUrl) {
+    // Prefer the persisted record of what we actually wrote. Fall back to the server's
+    // current url only when we have no record at all (first run, or localStorage
+    // unavailable) — it is a guess, and a wrong one once the port has changed.
+    var mine = explicitUrl || lastSyncedUrl || loadSyncedUrl() || (st && st.url) || null;
+    if (!mine || mine === clearedUrl) return;
+    if (!explicitUrl) { lastSyncedUrl = null; saveSyncedUrl(null); }
+    clearedUrl = mine;
+    fetch('/api/settings').then(function (r) { return r.json(); }).then(function (cur) {
+      if (cur && cur.demucs_server_url === mine) appSettings({ demucs_server_url: '' });
+    }).catch(function () {});
+  }
+
+  function serverOpBody(path, label, body) {
+    setServerButtons(true);
+    $('ss-srv-progress').style.display = 'block';
+    $('ss-srv-log').textContent = label + '…\n';
+    setSrvBar(0.02, label);
+    connectWS();
+    return j(path, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                     body: JSON.stringify(body || {}) })
+      .then(function (res) {
+        if (res && res.ok === false && res.busy) {
+          srvLog('… ' + res.message);
+          setSrvBar(0, 'Busy: ' + res.busy);
+          setServerButtons(false);
+        }
+        return res;
+      }).catch(function (err) {
+        srvLog('✗ ' + label + ' failed: ' + err);
+        setSrvBar(0, 'Failed');
+        setServerButtons(false);
+      });
+  }
+
+  $('ss-srv-gpu').addEventListener('change', function () { gpuTouched = true; });
+  $('ss-srv-global').addEventListener('change', function () { syncGlobalUrl(lastServerStatus); });
+
+  function serverOp(path, label) {
+    setServerButtons(true);
+    $('ss-srv-progress').style.display = 'block';
+    $('ss-srv-log').textContent = label + '…\n';
+    setSrvBar(0.02, label);
+    connectWS();
+    return j(path, { method: 'POST' }).then(function (res) {
+      // The backend serialises lifecycle ops; if one is already running it says so
+      // rather than racing (which would corrupt the shared subprocess/state file).
+      if (res && res.ok === false && res.busy) {
+        srvLog('… ' + res.message);
+        setSrvBar(0, 'Busy: ' + res.busy);
+        setServerButtons(false);
+        return res;
+      }
+      // stop/uninstall answer synchronously with a status; install/start/prepare
+      // stream over the WS and unlock on server_done/server_error.
+      if (res && typeof res.installed !== 'undefined') {
+        renderServerStatus(res);
+        setSrvBar(1, 'Done');
+        setServerButtons(false);
+      }
+      return res;
+    }).catch(function (err) {
+      srvLog('✗ ' + label + ' failed: ' + err);
+      setSrvBar(0, 'Failed');
+      setServerButtons(false);
+    });
+  }
+
+  $('ss-srv-install').addEventListener('click', function () {
+    var st = lastServerStatus || {};
+
+    // Deps already installed, only the weights missing: fetch just those. Re-running
+    // the full install would needlessly re-download ~3 GB of packages already on disk.
+    if (st.installed && !st.models_downloaded) {
+      if (!confirm('Download the model weights (~2 GB)?\n\nThe dependencies are already '
+                   + 'installed; this finishes the setup and warms the server up.')) return;
+      serverOp('/server/prepare_models', 'Downloading models').then(loadServerStatus);
+      return;
+    }
+
+    // Everything else is a (re)install. Carry the CURRENT selections — the button can
+    // promise a GPU rebuild, so it has to actually send the GPU choice rather than
+    // letting the backend fall back to the saved config or auto-detect.
+    var useGpu = $('ss-srv-gpu').checked;
+    var rebuilding = st.installed;
+    if (!confirm((rebuilding ? 'Reinstall the demucs server?' : 'Set up the demucs server?')
+                 + '\n\nThis downloads its Python dependencies ('
+                 + (useGpu ? '~5.5 GB, CUDA build' : '~3 GB, CPU build')
+                 + ')' + (rebuilding ? '' : ' and the model weights (~2 GB)')
+                 + ', then starts it.')) return;
+
+    serverOpBody('/server/install', rebuilding ? 'Reinstalling server' : 'Setting up server', {
+      gpu: useGpu,
+      ref: $('ss-srv-ref').value.trim(),   // blank = default
+      cuda_tag: $('ss-srv-cuda').value,    // blank = default
+    }).then(loadServerStatus);
+  });
+  $('ss-srv-toggle').addEventListener('click', function () {
+    var running = lastServerStatus && lastServerStatus.running;
+    var label = $('ss-srv-toggle-label');
+    setBtnTone('ss-srv-toggle', 'amber');
+    $('ss-srv-toggle').classList.add('busy');
+    label.textContent = running ? 'Stopping…' : 'Starting…';
+    serverOp(running ? '/server/stop' : '/server/start',
+             running ? 'Stopping server' : 'Starting server')
+      .then(loadServerStatus)      // settle the toggle from real status, not optimism
+      .catch(loadServerStatus);
+  });
+  $('ss-srv-uninstall').addEventListener('click', function () {
+    if (!confirm('Remove the demucs server, its dependencies and all downloaded models?')) return;
+    serverOp('/server/uninstall', 'Uninstalling server');
+  });
+  $('ss-srv-test').addEventListener('click', function () {
+    setServerButtons(true);
+    $('ss-srv-progress').style.display = 'block';
+    j('/server/health').then(function (r) {
+      srvLog((r.ok ? '✓ ' : '✗ ') + r.url + ' → ' + JSON.stringify(r.health));
+      setSrvBar(r.ok ? 1 : 0, r.ok ? 'Healthy' : 'No response');
+      return loadServerStatus();
+    }).catch(function (e) { srvLog('✗ ' + e); })
+      .finally(function () { setServerButtons(false); });
+  });
+
   loadConfig();
   connectWS();  // connect on load so a snapshot recovers any install that finished while away
 })();
