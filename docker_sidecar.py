@@ -46,6 +46,7 @@ import json
 import logging
 import os
 import socket
+import time
 import urllib.parse
 from pathlib import Path
 from typing import Callable, Optional
@@ -61,7 +62,26 @@ DEFAULT_IMAGE = os.environ.get(
 )
 CONTAINER_NAME = "feedback-demucs-server"
 CACHE_VOLUME = "feedback-demucs-cache"      # model weights (~1.5 GB) survive recreation
-DEFAULT_PORT = 7865
+
+# The port the server listens on INSIDE the container. Fixed; nothing else is in there.
+SERVER_PORT = 7865
+
+# The port we publish it on. Deliberately NOT 7865: that is the managed local server's
+# port (demucs_server.DEFAULT_PORT), and a user can plausibly have both — a local server
+# they installed earlier, and a sidecar they start now.
+#
+# The collision is nastier than "one of them fails to bind":
+#   * Linux  — `docker run` fails with "address already in use". Loud, at least.
+#   * Windows — BOTH bind successfully, because Docker publishes on 0.0.0.0 while the
+#     local server listens on 127.0.0.1, and a loopback connection goes to the MORE
+#     SPECIFIC bind. So the container starts, reports healthy, and every request silently
+#     goes to the other server. That is how this was found: /health came back describing a
+#     Windows cache_dir from inside a Linux container.
+#
+# Publishing on a different port sidesteps it entirely, and _find_container() reads the
+# real published port back out of Docker rather than assuming.
+DEFAULT_PORT = 7866
+
 DEFAULT_MODEL = "bs_roformer_sw"            # warmup only prefetches the DEFAULT model
 
 _API = "v1.41"                              # widely supported; avoids negotiating
@@ -258,7 +278,7 @@ def gpu_available() -> bool:
 
 def _container_spec(port: int, gpu: bool, image: str, networks: list[str]) -> dict:
     env = [
-        f"PORT={DEFAULT_PORT}",
+        f"PORT={SERVER_PORT}",
         "HOST=0.0.0.0",
         f"SLOPSMITH_DEMUCS_MODEL={DEFAULT_MODEL}",
         "SKIP_WARMUP=false",
@@ -270,7 +290,7 @@ def _container_spec(port: int, gpu: bool, image: str, networks: list[str]) -> di
     host_config: dict = {
         # Publish to the host as well as attaching to our network: an Electron user (not
         # in a container) reaches it on 127.0.0.1, and a human can curl it either way.
-        "PortBindings": {f"{DEFAULT_PORT}/tcp": [{"HostPort": str(port)}]},
+        "PortBindings": {f"{SERVER_PORT}/tcp": [{"HostPort": str(port)}]},
         "Binds": [f"{CACHE_VOLUME}:/app/cache"],
         "RestartPolicy": {"Name": "unless-stopped"},
     }
@@ -283,7 +303,7 @@ def _container_spec(port: int, gpu: bool, image: str, networks: list[str]) -> di
     spec: dict = {
         "Image": image,
         "Env": env,
-        "ExposedPorts": {f"{DEFAULT_PORT}/tcp": {}},
+        "ExposedPorts": {f"{SERVER_PORT}/tcp": {}},
         "HostConfig": host_config,
         "Labels": {
             "org.feedback.managed-by": "stem_splitter",
@@ -297,6 +317,16 @@ def _container_spec(port: int, gpu: bool, image: str, networks: list[str]) -> di
     return spec
 
 
+def image_exists(image: str) -> bool:
+    """Is the image already on the daemon?"""
+    try:
+        status, _ = _request("GET", f"/images/{urllib.parse.quote(image, safe='')}/json",
+                             timeout=10.0)
+    except Exception:
+        return False
+    return status == 200
+
+
 def pull_image(image: str = DEFAULT_IMAGE, progress_cb: ProgressCB = None) -> None:
     """Pull the image. ~4.8 GB compressed — an explicit-click operation, never implicit."""
     ref, _, tag = image.rpartition(":")
@@ -304,25 +334,110 @@ def pull_image(image: str = DEFAULT_IMAGE, progress_cb: ProgressCB = None) -> No
         ref, tag = image, "latest"
     q = urllib.parse.urlencode({"fromImage": ref, "tag": tag})
 
-    layers: dict[str, tuple[int, int]] = {}
+    # Docker reports progress PER LAYER, and a layer is downloaded and then extracted.
+    # Track both: this is a ~4.8 GB pull, and extraction of the CUDA-torch layer alone
+    # takes minutes. A bar that shows only downloads sits at "100%" (or, worse, at a
+    # capped 90%) through all of it, which reads exactly like a hang — the single most
+    # common way a long-running install gets killed by an impatient user.
+    dl: dict[str, tuple[int, int]] = {}
+    ex: dict[str, tuple[int, int]] = {}
+
+    def _gb(n: float) -> str:
+        return f"{n / 1e9:.1f} GB"
 
     def on_event(ev: dict) -> None:
-        pid = ev.get("id")
+        pid = ev.get("id") or ""
+        status = (ev.get("status") or "").strip()
         det = ev.get("progressDetail") or {}
-        if pid and det.get("total"):
-            layers[pid] = (int(det.get("current") or 0), int(det["total"]))
-        done = sum(c for c, _ in layers.values())
-        total = sum(t for _, t in layers.values())
+        cur, tot = int(det.get("current") or 0), int(det.get("total") or 0)
+
+        if status.startswith("Downloading") and pid and tot:
+            dl[pid] = (cur, tot)
+        elif status.startswith("Download complete") and pid and pid in dl:
+            dl[pid] = (dl[pid][1], dl[pid][1])
+        elif status.startswith("Extracting") and pid and tot:
+            ex[pid] = (cur, tot)
+        elif status.startswith("Pull complete") and pid and pid in ex:
+            ex[pid] = (ex[pid][1], ex[pid][1])
+
+        d_done, d_tot = sum(c for c, _ in dl.values()), sum(t for _, t in dl.values())
+        e_done, e_tot = sum(c for c, _ in ex.values()), sum(t for _, t in ex.values())
+
+        # Download is the bulk of the wall-clock; give it 80% of the bar and extraction
+        # the rest, so BOTH phases visibly move.
+        pct = None
+        phase = "Pulling image"
+        line = f"{status} {pid}".strip()
+        if d_tot:
+            pct = 0.8 * (d_done / d_tot)
+            line = f"downloading… {_gb(d_done)} / {_gb(d_tot)}"
+        if e_tot and d_tot and d_done >= d_tot:
+            phase = "Extracting"
+            pct = 0.8 + 0.18 * (e_done / e_tot)
+            line = f"extracting… {_gb(e_done)} / {_gb(e_tot)}"
         if progress_cb:
-            progress_cb({
-                "line": f"{ev.get('status', '')} {pid or ''}".strip(),
-                # Cap at 0.9: layers are still being extracted after the bytes land, and a
-                # bar that sits at 100% while the user waits is worse than one that doesn't.
-                "pct": min(0.9, done / total) if total else None,
-                "phase": "Pulling image",
-            })
+            progress_cb({"line": line, "pct": pct, "phase": phase})
 
     _stream("POST", f"/images/create?{q}", progress_cb=on_event)
+
+
+def demucs_server_default_port() -> int:
+    """The managed LOCAL server's port — the thing we most plausibly collide with."""
+    try:
+        import demucs_server
+        return int(demucs_server.DEFAULT_PORT)
+    except Exception:
+        return 7865
+
+
+# Our container always reports this, because we set SLOPSMITH_DEMUCS_CACHE=/app/cache in
+# its env. A server running on the HOST reports a host path (a Windows path, a config dir),
+# never this. It is the cheapest reliable "is this actually my container?" discriminator
+# available without adding an endpoint to the server.
+_OUR_CACHE_DIR = "/app/cache"
+
+
+def _assert_port_is_ours(port: int, progress_cb: ProgressCB = None) -> None:
+    """Refuse to hand back a URL that belongs to somebody else's server.
+
+    See the note at DEFAULT_PORT: on Windows a port collision does NOT fail the bind, and
+    the result is a container that looks healthy while every request goes to a different
+    server. Silently splitting against the wrong server is far worse than failing to start.
+    """
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    url = f"http://127.0.0.1:{port}/health"
+    for attempt in range(10):          # the server binds fast, but not instantly
+        try:
+            with urllib.request.urlopen(url, timeout=3) as r:
+                health = _json.loads(r.read().decode("utf-8", "replace"))
+            break
+        except Exception:
+            if attempt == 9:
+                # Not reachable yet is not proof of a collision — warmup can be slow and
+                # the caller polls status() anyway. Don't turn a slow start into an error.
+                if progress_cb:
+                    progress_cb({"line": f"Started, but nothing is answering on port {port} "
+                                         f"yet — it may still be coming up.",
+                                 "pct": 0.98, "phase": "Starting"})
+                return
+            time.sleep(1.0)
+    else:
+        return
+
+    cache = str(health.get("cache_dir") or "")
+    if cache and cache != _OUR_CACHE_DIR:
+        raise RuntimeError(
+            f"port {port} is already served by a DIFFERENT demucs server (it reports "
+            f"cache_dir={cache!r}, ours is {_OUR_CACHE_DIR!r}). The container is running, "
+            f"but every request to that port would go to the other server instead — so "
+            f"this is being refused rather than silently splitting against the wrong one. "
+            f"The usual cause is the plugin's own managed local server on port "
+            f"{demucs_server_default_port()}. Stop it, or publish the container on another "
+            f"port."
+        )
 
 
 def up(port: int = DEFAULT_PORT, gpu: bool = False, image: str = DEFAULT_IMAGE,
@@ -334,17 +449,57 @@ def up(port: int = DEFAULT_PORT, gpu: bool = False, image: str = DEFAULT_IMAGE,
 
     existing = _find_container()
     if existing and existing.get("State") == "running":
-        return status()
+        # Idempotent ONLY if the running container actually matches what was asked for.
+        # Returning it regardless meant changing the port (or the image) in the UI and
+        # pressing Start appeared to work and silently did nothing — the user is left
+        # looking at a container that is running with the OLD settings.
+        cur_port = None
+        for p in existing.get("Ports") or []:
+            if p.get("PrivatePort") == SERVER_PORT and p.get("PublicPort"):
+                cur_port = int(p["PublicPort"])
+                break
+        same = (cur_port == int(port)) and (existing.get("Image") == image)
+        if same:
+            return status()
+        if progress_cb:
+            progress_cb({"line": f"Recreating: it is running with different settings "
+                                 f"(port {cur_port}, image {existing.get('Image')}).",
+                         "pct": 0.02, "phase": "Starting"})
 
     if existing:
-        # A stopped container may have been created with a stale spec (different port,
-        # no GPU, an older image). Recreate rather than start it and hope.
+        # A stale container may carry an old spec (different port, no GPU, an older
+        # image). Recreate rather than start it and hope.
         _request("DELETE", f"/containers/{existing['Id']}?force=1&v=0", timeout=60.0)
 
-    if progress_cb:
-        progress_cb({"line": f"Pulling {image} (~4.8 GB)…", "pct": 0.02,
-                     "phase": "Pulling image"})
-    pull_image(image, progress_cb)
+    # Pull only when we have to, and never let a pull failure kill a usable local image.
+    #
+    # Three cases this gets right that an unconditional pull gets wrong:
+    #   * the image is a LOCAL tag (built by hand, or loaded from a tar) — there is no
+    #     registry to pull it from, and pulling 404s;
+    #   * the host is air-gapped, or the registry is down / rate-limited — but the image
+    #     is already cached, so there is nothing actually wrong;
+    #   * the image is present and current — re-pulling 4.8 GB to discover that is rude.
+    have = image_exists(image)
+    if not have:
+        if progress_cb:
+            progress_cb({"line": f"Pulling {image} (~4.8 GB)…", "pct": 0.02,
+                         "phase": "Pulling image"})
+        pull_image(image, progress_cb)          # no local copy: a failure here IS fatal
+    else:
+        try:
+            if progress_cb:
+                progress_cb({"line": f"Checking {image} for updates…", "pct": 0.02,
+                             "phase": "Pulling image"})
+            pull_image(image, progress_cb)
+        except Exception as e:
+            # We already have it. Refusing to start because the registry is unreachable
+            # would be a self-inflicted outage.
+            log.warning("stem_splitter: could not refresh %s (%s) - using the local copy",
+                        image, e)
+            if progress_cb:
+                progress_cb({"line": f"Could not reach the registry ({e}) — using the "
+                                     f"local copy of {image}.",
+                             "pct": 0.9, "phase": "Starting"})
 
     want_gpu = bool(gpu) and gpu_available()
     if gpu and not want_gpu:
@@ -366,7 +521,22 @@ def up(port: int = DEFAULT_PORT, gpu: bool = False, image: str = DEFAULT_IMAGE,
 
     st, body = _request("POST", f"/containers/{cid}/start", timeout=60.0)
     if st not in (204, 304):
+        msg = str(body)
+        if "port is already allocated" in msg or "address already in use" in msg:
+            raise RuntimeError(
+                f"host port {port} is already in use, so the container has nowhere to "
+                f"publish. Something else is on it — often the plugin's own managed local "
+                f"server (it defaults to {demucs_server_default_port()}). Stop that, or "
+                f"pick a different port."
+            )
         raise RuntimeError(f"could not start the container: {body}")
+
+    # Windows will NOT fail the bind above. Docker publishes on 0.0.0.0 while a local
+    # server listens on 127.0.0.1, both succeed, and loopback traffic then goes to the
+    # MORE SPECIFIC bind — i.e. to the other server. The container looks healthy and every
+    # request silently goes somewhere else. So don't trust the bind: ask the thing on the
+    # published port to identify itself, and refuse to hand back a URL that isn't ours.
+    _assert_port_is_ours(port, progress_cb)
 
     if progress_cb:
         progress_cb({"line": "Started.", "pct": 1.0, "phase": "Done"})
@@ -393,8 +563,61 @@ def url_for(port: int, networks_shared: bool) -> str:
     embedded DNS). Otherwise via the published host port on loopback.
     """
     if networks_shared:
-        return f"http://{CONTAINER_NAME}:{DEFAULT_PORT}"
+        # By container NAME we reach the port inside the container, not the published one.
+        return f"http://{CONTAINER_NAME}:{SERVER_PORT}"
     return f"http://127.0.0.1:{port}"
+
+
+def container_logs(cid: str, tail: int = 40) -> str:
+    """Recent container output, de-multiplexed.
+
+    Docker frames stdout/stderr with an 8-byte header per chunk, so the raw body is not
+    text. Without this the UI can only ever say "not running", which is the least useful
+    thing it could say to someone whose container is crash-looping.
+    """
+    try:
+        conn = _connect(15.0)
+        try:
+            conn.request("GET", f"/{_API}/containers/{cid}/logs"
+                                f"?stdout=1&stderr=1&tail={int(tail)}")
+            resp = conn.getresponse()
+            if resp.status >= 400:
+                return ""
+            raw = resp.read()
+        finally:
+            conn.close()
+    except Exception:
+        return ""
+
+    out, i = [], 0
+    while i + 8 <= len(raw):
+        n = int.from_bytes(raw[i + 4:i + 8], "big")
+        out.append(raw[i + 8:i + 8 + n].decode("utf-8", "replace"))
+        i += 8 + n
+    return "".join(out) if out else raw.decode("utf-8", "replace")
+
+
+def _diagnose(cid: str, state: str | None) -> str:
+    """Turn a dead/looping container into a sentence the user can act on."""
+    if state == "running":
+        return ""
+    logs = container_logs(cid, tail=60)
+    if "Permission denied" in logs and "/app/cache" in logs:
+        # The one we actually hit: a fresh named volume is created root-owned, but the
+        # image runs as uid 10001. Fixed in the image — but an ALREADY-created volume
+        # keeps its root ownership forever, so telling the user to pull a new image
+        # without also telling them to drop the volume would be useless advice.
+        return ("The container can't write to its model cache: the Docker volume "
+                f"'{CACHE_VOLUME}' is owned by root, but the server runs as an "
+                "unprivileged user. This happens with a volume created by an older, "
+                "broken image — Docker only sets a volume's ownership when it first "
+                f"creates it. Remove it and start again: `docker volume rm {CACHE_VOLUME}`.")
+    if state == "restarting":
+        tail = " ".join(logs.strip().splitlines()[-3:])[:300]
+        return f"The container keeps restarting. Last output: {tail}"
+    if logs.strip():
+        return " ".join(logs.strip().splitlines()[-3:])[:300]
+    return ""
 
 
 def status() -> dict:
@@ -427,7 +650,7 @@ def status() -> dict:
     running = c.get("State") == "running"
     port = DEFAULT_PORT
     for p in c.get("Ports") or []:
-        if p.get("PrivatePort") == DEFAULT_PORT and p.get("PublicPort"):
+        if p.get("PrivatePort") == SERVER_PORT and p.get("PublicPort"):
             port = int(p["PublicPort"])
             break
     shared = bool(set(_self_networks()) &
@@ -438,6 +661,10 @@ def status() -> dict:
         "running": running,
         "port": port,
         "url": url_for(port, shared) if running else None,
+        # A container that exists but isn't running has a REASON, and the user cannot see
+        # `docker logs` from inside the app. Surfacing it is the difference between "not
+        # running" (useless) and "your volume is root-owned, remove it" (actionable).
+        "problem": _diagnose(c.get("Id", ""), c.get("State")),
     })
     return out
 
@@ -455,7 +682,7 @@ def compose_snippet(port: int = DEFAULT_PORT, gpu: bool = False) -> str:
         f"    container_name: {CONTAINER_NAME}\n"
         "    restart: unless-stopped\n"
         "    ports:\n"
-        f"      - \"{port}:{DEFAULT_PORT}\"\n"
+        f"      - \"{port}:{SERVER_PORT}\"\n"
         "    volumes:\n"
         f"      - {CACHE_VOLUME}:/app/cache\n"
         "    environment:\n"
