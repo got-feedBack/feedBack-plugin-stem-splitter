@@ -760,9 +760,33 @@
   }
 
   $('ss-srv-install').addEventListener('click', function () {
-    if (!confirm('Set up the demucs server?\n\nThis downloads its Python dependencies '
-                 + '(~3 GB) and the model weights (~2 GB), then starts it. One time.')) return;
-    serverOp('/server/install', 'Setting up server');
+    var st = lastServerStatus || {};
+
+    // Deps already installed, only the weights missing: fetch just those. Re-running
+    // the full install would needlessly re-download ~3 GB of packages already on disk.
+    if (st.installed && !st.models_downloaded) {
+      if (!confirm('Download the model weights (~2 GB)?\n\nThe dependencies are already '
+                   + 'installed; this finishes the setup and warms the server up.')) return;
+      serverOp('/server/prepare_models', 'Downloading models').then(loadServerStatus);
+      return;
+    }
+
+    // Everything else is a (re)install. Carry the CURRENT selections — the button can
+    // promise a GPU rebuild, so it has to actually send the GPU choice rather than
+    // letting the backend fall back to the saved config or auto-detect.
+    var useGpu = $('ss-srv-gpu').checked;
+    var rebuilding = st.installed;
+    if (!confirm((rebuilding ? 'Reinstall the demucs server?' : 'Set up the demucs server?')
+                 + '\n\nThis downloads its Python dependencies ('
+                 + (useGpu ? '~5.5 GB, CUDA build' : '~3 GB, CPU build')
+                 + ')' + (rebuilding ? '' : ' and the model weights (~2 GB)')
+                 + ', then starts it.')) return;
+
+    serverOpBody('/server/install', rebuilding ? 'Reinstalling server' : 'Setting up server', {
+      gpu: useGpu,
+      ref: $('ss-srv-ref').value.trim(),   // blank = default
+      cuda_tag: $('ss-srv-cuda').value,    // blank = default
+    }).then(loadServerStatus);
   });
   $('ss-srv-toggle').addEventListener('click', function () {
     var running = lastServerStatus && lastServerStatus.running;

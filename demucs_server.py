@@ -996,6 +996,43 @@ def _startup_failure_message(rc: int | None, tail: list[str]) -> str:
     return f"{msg}. Last output:\n" + "\n".join(tail[-12:])
 
 
+def _pid_cmdline(pid: int) -> str | None:
+    """The process's command line, or None if we can't determine it."""
+    try:
+        if os.name == "nt":
+            p = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 f"(Get-CimInstance Win32_Process -Filter 'ProcessId={int(pid)}').CommandLine"],
+                capture_output=True, text=True, timeout=20)
+            out = (p.stdout or "").strip()
+            return out or None
+        proc = Path(f"/proc/{int(pid)}/cmdline")
+        if proc.exists():
+            return proc.read_bytes().replace(b"\\x00", b" ").decode("utf-8", "replace").strip() or None
+        p = subprocess.run(["ps", "-p", str(int(pid)), "-o", "args="],
+                           capture_output=True, text=True, timeout=20)
+        return (p.stdout or "").strip() or None
+    except Exception as e:
+        log.warning("stem_splitter: could not read cmdline for pid %s: %s", pid, e)
+        return None
+
+
+def _pid_is_our_server(pid: int, config_dir: Path) -> bool:
+    """Does this pid actually look like the server WE launched?
+
+    A recorded pid plus a port that answers /health is NOT proof: the state file can be
+    stale (server crashed, pid reused) while some other service happens to be on that
+    port. Killing on that basis - with taskkill /T, which takes the whole tree - could
+    take down an unrelated process. So check the command line really is our launcher
+    before signalling anything.
+    """
+    cmd = _pid_cmdline(pid)
+    if not cmd:
+        return False   # can't verify -> don't kill
+    launcher = str(launcher_path(config_dir))
+    return launcher in cmd or ("_launch.py" in cmd and str(server_dir(config_dir)) in cmd)
+
+
 def _posix_kill_tree(pid: int) -> None:
     """TERM then KILL the server's process group, never our own.
 
@@ -1082,12 +1119,21 @@ def stop_server(config_dir: Path) -> dict:
         recorded_pid, recorded_port = st.get("pid"), st.get("port")
         if recorded_pid and recorded_port:
             alive, _ = is_running(config_dir)
-            if alive:
-                pid = recorded_pid
-            else:
+            if not alive:
                 log.info("stem_splitter: recorded server pid %s is not answering on "
                          "port %s - treating it as stale and NOT killing it "
                          "(the pid may have been reused)", recorded_pid, recorded_port)
+            elif not _pid_is_our_server(int(recorded_pid), config_dir):
+                # Something answers /health on that port, but this pid isn't our
+                # launcher - so the state file is stale and the pid belongs to someone
+                # else. Killing it (tree-wide) could take down an unrelated process.
+                log.warning(
+                    "stem_splitter: port %s answers /health but pid %s does not look "
+                    "like our server (its command line doesn't reference %s) - "
+                    "refusing to kill it. Clearing the stale state file.",
+                    recorded_port, recorded_pid, launcher_path(config_dir))
+            else:
+                pid = recorded_pid
 
     if pid:
         try:

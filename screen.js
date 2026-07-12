@@ -24,6 +24,23 @@
     preparingModels: false,  // guard: only ever one prepare_models in flight
   };
 
+  // The model download takes many minutes, and we promise the user their job "starts
+  // automatically when it finishes". Keeping the queue in memory broke that promise on
+  // any reload/navigation, so persist it.
+  var PENDING_KEY = 'stem_splitter.pendingAfterSetup';
+  function loadPending() {
+    try {
+      var raw = window.localStorage.getItem(PENDING_KEY);
+      var arr = raw ? JSON.parse(raw) : [];
+      state.pendingAfterSetup = Array.isArray(arr) ? arr : [];
+    } catch (e) { state.pendingAfterSetup = []; }
+  }
+  function savePending() {
+    try {
+      window.localStorage.setItem(PENDING_KEY, JSON.stringify(state.pendingAfterSetup));
+    } catch (e) {}
+  }
+
   function $(id) { return document.getElementById(id); }
 
   function toast(title, message, accent) {
@@ -62,6 +79,7 @@
         return res;
       }
       state.pendingAfterSetup.push({ kind: kind, body: body });
+      savePending();
       connectWS();
       // Several songs can hit needs_setup at once (a batch, or rapid clicks).
       // Only ever kick off ONE model download — the rest just queue behind it.
@@ -83,12 +101,15 @@
 
   // Settle a prepare_models that completed while we weren't listening.
   function reconcilePrepareFromSnapshot(srv) {
-    if (!state.preparingModels) return;
     if (!srv || srv.op !== 'prepare_models' || srv.active) return;
+    // Keyed off the persisted queue, not the in-memory flag: after a reload the flag is
+    // gone but the user's approved jobs are still owed to them.
+    if (!state.preparingModels && !state.pendingAfterSetup.length) return;
     state.preparingModels = false;
     if (srv.error) {
       toast('Model download failed', srv.error, 'warn');
       state.pendingAfterSetup.length = 0;
+      savePending();
     } else {
       toast('Models ready', 'The local server is warmed up.', 'ok');
       flushPendingAfterSetup();
@@ -98,6 +119,7 @@
 
   function flushPendingAfterSetup() {
     var pending = state.pendingAfterSetup.splice(0);
+    savePending();
     pending.forEach(function (p) {
       var body = Object.assign({}, p.body, { skip_setup_check: true });
       post(p.kind, body).then(function (r) {
@@ -239,6 +261,7 @@
         state.preparingModels = false;
         toast('Server error', msg.error, 'warn');
         state.pendingAfterSetup.length = 0;   // don't silently retry a failed setup
+        savePending();
       }
     };
     ws.onclose = function () { state.ws = null; setTimeout(connectWS, 2000); };
@@ -294,6 +317,13 @@
 
   // ── boot ───────────────────────────────────────────────────────────────────
   function boot() {
+    loadPending();
+    // Jobs are owed from a previous page life: stay connected so the completion
+    // snapshot can flush them, which is what makes "starts automatically" true.
+    if (state.pendingAfterSetup.length) {
+      state.preparingModels = true;
+      connectWS();
+    }
     registerCardActions();
     refreshConfig();
     refreshMissing();
