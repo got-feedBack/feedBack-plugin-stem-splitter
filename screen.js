@@ -124,7 +124,12 @@
 
   // Settle a prepare_models that completed while we weren't listening.
   function reconcilePrepareFromSnapshot(srv) {
-    if (!srv || srv.op !== 'prepare_models' || srv.active) return;
+    if (!srv || srv.op !== 'prepare_models') return;
+    if (srv.active) {
+      // Authoritative: a prepare IS running (maybe started by another page/session).
+      state.preparingModels = true;
+      return;
+    }
     // Keyed off the persisted queue, not the in-memory flag: after a reload the flag is
     // gone but the user's approved jobs are still owed to them.
     if (!state.preparingModels && !state.pendingAfterSetup.length) return;
@@ -281,10 +286,16 @@
         }
         refreshConfig();
       } else if (msg.type === 'server_error') {
-        state.preparingModels = false;
         toast('Server error', msg.error, 'warn');
-        state.pendingAfterSetup.length = 0;   // don't silently retry a failed setup
-        savePending();
+        // ONLY a failed prepare_models invalidates the pending queue. A failed
+        // start/install/stop says nothing about the jobs waiting on the models, and
+        // binning them here would break the "starts automatically" promise for a
+        // completely unrelated failure.
+        if (msg.op === 'prepare_models') {
+          state.preparingModels = false;
+          state.pendingAfterSetup.length = 0;
+          savePending();
+        }
       }
     };
     ws.onclose = function () { state.ws = null; setTimeout(connectWS, 2000); };
@@ -341,11 +352,21 @@
   // ── boot ───────────────────────────────────────────────────────────────────
   function boot() {
     loadPending();
-    // Jobs are owed from a previous page life: stay connected so the completion
-    // snapshot can flush them, which is what makes "starts automatically" true.
+    // Jobs are owed from a previous page life. Stay connected so the completion
+    // snapshot can flush them — that's what makes "starts automatically" true.
+    //
+    // Deliberately do NOT assume a download is still running: preparingModels is
+    // in-memory, and forcing it true here would leave it stuck true forever if no
+    // prepare_models op is actually active, blocking every future setup attempt. The
+    // snapshot tells us the truth; and if the models finished while we were away,
+    // flush the queue right now.
     if (state.pendingAfterSetup.length) {
-      state.preparingModels = true;
       connectWS();
+      api('/server_status').then(function (st) {
+        if (st && st.models_downloaded && state.pendingAfterSetup.length) {
+          flushPendingAfterSetup();
+        }
+      }).catch(function () {});
     }
     registerCardActions();
     refreshConfig();

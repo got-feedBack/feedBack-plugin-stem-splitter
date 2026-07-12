@@ -293,8 +293,11 @@ def _run_remote(mix: Path, out_dir: Path, model: str, server_url: str,
         sr = requests.get(url, headers=dl_headers, timeout=180)
         if sr.status_code == 200:
             # Trust the URL's own extension: roformer emits .flac, demucs .wav.
-            # (Hardcoding .wav mislabels flac stems.)
-            suffix = Path(str(url).split("?")[0]).suffix.lower()
+            # (Hardcoding .wav mislabels flac stems.) Strip BOTH the query and any
+            # fragment first - ".flac#frag" would otherwise not match _AUDIO_EXTS and
+            # silently fall back to .wav.
+            clean = str(url).split("?", 1)[0].split("#", 1)[0]
+            suffix = Path(clean).suffix.lower()
             ext = suffix if suffix in _AUDIO_EXTS else ".wav"
             (result_dir / f"{_sanitize(name)}{ext}").write_bytes(sr.content)
     return result_dir
