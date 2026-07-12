@@ -894,9 +894,24 @@ def stop_server(config_dir: Path) -> dict:
 
     pid = None
     if p is not None and p.poll() is None:
+        # We own this child and know it's alive - safe to kill by pid.
         pid = p.pid
     else:
-        pid = _read_state(config_dir).get("pid")
+        # No live child of ours. The state file's pid may be STALE: the server could
+        # have crashed and the OS reused that pid for something else entirely, and
+        # killing it (with /T, which takes the whole tree) could take down an
+        # unrelated process. Only act on it if the recorded port still answers
+        # /health - i.e. something that looks like our server is actually there.
+        st = _read_state(config_dir)
+        recorded_pid, recorded_port = st.get("pid"), st.get("port")
+        if recorded_pid and recorded_port:
+            alive, _ = is_running(config_dir)
+            if alive:
+                pid = recorded_pid
+            else:
+                log.info("stem_splitter: recorded server pid %s is not answering on "
+                         "port %s - treating it as stale and NOT killing it "
+                         "(the pid may have been reused)", recorded_pid, recorded_port)
 
     if pid:
         try:

@@ -207,6 +207,10 @@ def _run_remote(mix: Path, out_dir: Path, model: str, server_url: str,
             )
         if resp.status_code != 503:
             break
+        # We're going to retry: release the connection back to the pool instead of
+        # holding it open across the backoff (a batch split would otherwise pin one
+        # connection per in-flight retry).
+        resp.close()
         wait = min(_BUSY_MAX_BACKOFF, _BUSY_BASE_BACKOFF * (2 ** attempt))
         if progress_cb:
             progress_cb(0.12, f"Split server busy - retrying in {wait}s")

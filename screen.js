@@ -81,6 +81,21 @@
     });
   }
 
+  // Settle a prepare_models that completed while we weren't listening.
+  function reconcilePrepareFromSnapshot(srv) {
+    if (!state.preparingModels) return;
+    if (!srv || srv.op !== 'prepare_models' || srv.active) return;
+    state.preparingModels = false;
+    if (srv.error) {
+      toast('Model download failed', srv.error, 'warn');
+      state.pendingAfterSetup.length = 0;
+    } else {
+      toast('Models ready', 'The local server is warmed up.', 'ok');
+      flushPendingAfterSetup();
+    }
+    refreshConfig();
+  }
+
   function flushPendingAfterSetup() {
     var pending = state.pendingAfterSetup.splice(0);
     pending.forEach(function (p) {
@@ -201,6 +216,11 @@
       try { msg = JSON.parse(ev.data); } catch (e) { return; }
       if (msg.type === 'jobs') {
         renderJobs(msg);
+        // Snapshot recovery: if the WS dropped while prepare_models was running we'd
+        // have missed the live server_done/server_error, leaving preparingModels stuck
+        // true and the jobs the user approved a multi-GB download for never queued.
+        // The snapshot carries the server op's terminal state, so settle it from there.
+        reconcilePrepareFromSnapshot(msg.server);
         // A finished job may have changed missing-sets → refresh them (debounced).
         scheduleMissingRefresh();
       } else if (msg.type === 'install_done') {
