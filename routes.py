@@ -19,9 +19,10 @@ import time
 import uuid
 from pathlib import Path
 
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, Request, WebSocket, WebSocketDisconnect
 
 import demucs_server
+import docker_sidecar
 import engine_install
 
 INSTRUMENT_STEM_IDS = ["guitar", "bass", "drums", "vocals", "other", "piano"]
@@ -172,17 +173,42 @@ class JobManager:
         running, live_port = demucs_server.is_running(self.config_dir, port)
         return demucs_server.url_for(_as_port(live_port or port)) if running else None
 
+    def sidecar_url(self) -> str | None:
+        """URL of the managed sibling CONTAINER, if it's running.
+
+        Cheap by design: this sits on the split path, and `status()` short-circuits to a
+        dict as soon as it sees there is no reachable Docker daemon — which is the case
+        for every user who never opted in.
+        """
+        try:
+            st = docker_sidecar.status()
+        except Exception:
+            return None
+        return st.get("url") if st.get("running") else None
+
     def _server_url(self) -> str | None:
         """Split server URL (demucs/roformer).
 
-        The plugin-managed local server wins whenever it's running — that's the
-        "plugin uses it automatically" half of the toggle, and it needs no mutation
-        of the app's config.json (so there's nothing to clean up when it stops).
-        The app's `demucs_server_url` remains the fallback.
+        Precedence, most-specific first:
+
+          1. the plugin-managed local server process (Electron: a real child process);
+          2. the plugin-managed sibling CONTAINER (Docker: what the socket buys us);
+          3. the app's own `demucs_server_url` (a server the user runs themselves).
+
+        1 and 2 are mutually exclusive in practice — a containerized app can't run (1),
+        and an Electron user who has a working (1) has no reason to add (2) — but the
+        order is defined rather than accidental: a local process is closer, cheaper, and
+        already warm.
+
+        None of this mutates the app's config.json, so there is nothing to clean up when
+        any of them stops. The app's `demucs_server_url` remains the fallback.
         """
         local = self.local_server_url()
         if local:
             return local
+        sidecar = self.sidecar_url()
+        if sidecar:
+            return sidecar
         cfg = self._app_config()
         url = cfg.get("demucs_server_url")
         if isinstance(url, str) and url.strip():
@@ -682,6 +708,47 @@ def setup(app: FastAPI, context: dict) -> None:
         if _op_in_flight():
             return _busy()
         return demucs_server.stop_server(mgr.config_dir)
+
+    # ── managed sibling container (Docker socket) ────────────────────────────
+    #
+    # A containerized feedBack cannot start a process on its host - that is a namespace
+    # boundary, not a missing feature. If the user has mounted the Docker socket, we can
+    # instead ask the HOST's daemon to run the published image as a sibling container.
+    #
+    # The socket is root-equivalent on the host. We never mount it, never ask for it, and
+    # only use it if the user already exposed it. Every route below is behind an explicit
+    # click, and the only container we can create is the pinned image with a fixed spec -
+    # no image, command or bind mount is ever taken from the caller.
+
+    @app.get(f"{P}/sidecar_status")
+    def get_sidecar_status():
+        st = docker_sidecar.status()
+        # The manual compose service is always offered, socket or not: it needs no trust
+        # and no daemon access, and for a Docker user it is the option we RECOMMEND.
+        st["compose"] = docker_sidecar.compose_snippet(
+            port=st.get("port") or docker_sidecar.DEFAULT_PORT,
+            gpu=bool(st.get("gpu_available")),
+        )
+        return st
+
+    @app.post(f"{P}/sidecar/up")
+    def post_sidecar_up(body: dict | None = Body(None)):
+        body = body or {}
+        port = _as_port(body.get("port"))
+        gpu = bool(body.get("gpu"))
+        if not mgr.run_server_op("sidecar_up", lambda cb: docker_sidecar.up(
+                port=port, gpu=gpu,
+                progress_cb=lambda ev: cb(ev.get("line", ""), ev.get("pct"), ev.get("phase")))):
+            return _busy()
+        return {"ok": True}
+
+    @app.post(f"{P}/sidecar/down")
+    def post_sidecar_down(body: dict | None = Body(None)):
+        body = body or {}
+        remove = bool((body or {}).get("remove"))
+        if _op_in_flight():
+            return _busy()
+        return docker_sidecar.down(remove=remove)
 
     @app.post(f"{P}/server/prepare_models")
     def post_server_prepare_models():
