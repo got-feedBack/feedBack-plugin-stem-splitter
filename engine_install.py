@@ -227,11 +227,12 @@ def stream_pip(python_exe: str, pip_args: list[str], label: str, progress_cb: Pr
     """Run one ``pip install`` transaction, streaming its output as progress events.
 
     Shared by the plugin's engine installer (``--target {config_dir}/engine``) and
-    the managed demucs-server installer (a venv). Raises ``RuntimeError`` with an
-    actionable hint on failure.
+    the managed demucs-server installer (``--target .../demucs-server/pylibs``).
+    Neither uses a venv - the packaged Windows Python has none. Raises
+    ``RuntimeError`` with an actionable hint on failure.
 
     ``pip_args`` are everything after ``pip install`` (packages + flags), so the
-    caller decides between ``--target`` and a venv, ``--no-deps``, etc.
+    caller supplies its own ``--target``, ``--no-deps``, index URLs, etc.
     """
     cmd = [python_exe, "-m", "pip", "install", "--progress-bar", "off", *pip_args]
 

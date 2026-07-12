@@ -117,7 +117,11 @@ def _same_origin(url: str, server_url: str) -> bool:
         a, b = urlparse(str(url)), urlparse(server_url)
     except ValueError:
         return False
-    if not a.netloc:      # relative URL -> already rewritten onto server_url
+    # Only a URL with NEITHER scheme nor netloc is truly relative (i.e. one we
+    # rewrote onto server_url ourselves). Testing netloc alone is not enough:
+    # "https:evil.com/steal" parses as scheme=https, netloc='' - it is NOT relative,
+    # and treating it as such would hand the API key to evil.com.
+    if not a.scheme and not a.netloc:
         return True
     return (a.scheme, a.netloc) == (b.scheme, b.netloc)
 

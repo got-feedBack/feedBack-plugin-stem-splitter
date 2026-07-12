@@ -520,7 +520,12 @@ def setup(app: FastAPI, context: dict) -> None:
             "server_url": mgr._server_url(),
             "split": {"engine": split_engine, "reason": split_reason},
             "lyrics": {"engine": lyr_engine, "reason": lyr_reason},
-            "engine_status": engine_install.engine_status(mgr.config_dir),
+            # Deliberately NOT engine_status(): that walks the engine/models dirs and
+            # the shared ~/.cache/{torch,huggingface} trees to total their sizes, which
+            # can be many GB. /config is hit on every settings + screen refresh, so it
+            # only carries the cheap dir-presence map. The settings page fetches the
+            # full (expensive) status from /engine_status on its own.
+            "engine_installed": engine_install.installed_map(mgr.config_dir),
         }
 
     @app.post(f"{P}/config")

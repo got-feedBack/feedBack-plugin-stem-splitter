@@ -85,8 +85,13 @@
     var pending = state.pendingAfterSetup.splice(0);
     pending.forEach(function (p) {
       var body = Object.assign({}, p.body, { skip_setup_check: true });
-      post(p.kind, body).then(function () {
-        toast('Models ready', 'Queued ' + p.kind + ' now.');
+      post(p.kind, body).then(function (r) {
+        if (r && r.enqueued) toast('Models ready', 'Queued ' + p.kind + ' now.');
+        else toast('Could not queue ' + p.kind, (r && r.message) || 'The request was rejected.', 'warn');
+      }).catch(function (e) {
+        // Don't let a failed re-queue vanish as an unhandled rejection: the user
+        // agreed to a 2 GB download for this job, so say that it didn't run.
+        toast('Could not queue ' + p.kind, String(e), 'warn');
       });
     });
   }

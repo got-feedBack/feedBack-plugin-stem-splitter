@@ -153,7 +153,9 @@
       $('ss-srv-device').value = s.local_server_device || '';
       $('ss-srv-autostart').checked = !!s.local_server_autostart;
       $('ss-srv-global').checked = !!s.local_server_use_globally;
-      renderStatus(cfg.engine_status);
+      // /config carries only the cheap install map now; the full status
+      // (with the expensive cache-size walk) comes from /engine_status.
+      renderStatus(null);
     }).catch(function () {});
     loadServerStatus();
   }
