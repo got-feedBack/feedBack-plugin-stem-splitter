@@ -43,6 +43,7 @@ import io
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -73,9 +74,62 @@ DEFAULT_PORT = 7865
 DEFAULT_MODEL = "bs_roformer_sw"   # what the plugin splits with; also makes warmup prefetch it
 
 # demucs must be installed --no-deps: it pins torchaudio<2.1 while whisperx needs
-# ~2.8, and its full dep set drags in `diffq` (a C-extension with no wheels, which
-# is exactly what broke a tester's install). These are demucs' real runtime deps.
+# ~2.8, and its full dep set drags in `diffq` (see below). These are its real
+# runtime deps.
 _DEMUCS_EXTRAS = ["einops", "julius", "lameenc", "openunmix", "pyyaml", "tqdm", "dora-search"]
+
+# audio-separator must be --no-deps too, for a subtler reason. Its metadata says:
+#
+#   Requires-Dist: diffq (>=0.2)        ; sys_platform != "win32"
+#   Requires-Dist: diffq-fixed (>=0.2)  ; sys_platform == "win32"
+#
+# `diffq` is a C-extension whose newest wheels stop at **cp310**. On any Python 3.11+
+# pip therefore falls back to its sdist and needs a C compiler — which is precisely
+# the failure a Linux/macOS user hits, and the reason the demucs-server's own Docker
+# image has never built (its requirements.txt lists audio-separator, so `-r` drags
+# diffq in and the compile dies before the Dockerfile's careful --no-deps lines ever
+# run). Windows escapes it only by accident: it resolves to `diffq-fixed`, which does
+# ship wheels through cp313. Leaving audio-separator's deps to pip means the install
+# works on the one platform we happened to test and fails on the other two.
+_AUDIO_SEPARATOR = "audio-separator>=0.44.0"
+# NOT \b: a word boundary matches before a hyphen too, so `audio-separator-extras`
+# (a different distribution) would be dropped as well. Only the exact name.
+_AS_REQ_RE = re.compile(r"^\s*audio[-_]separator(?![-_A-Za-z0-9])", re.I)
+
+# audio-separator 0.44's real runtime deps, minus diffq (handled binary-only below)
+# and minus everything the main resolve already brings in through requirements.txt
+# (torch, librosa, soundfile, numpy, scipy) or _DEMUCS_EXTRAS (einops, julius, pyyaml,
+# tqdm). Keep in sync when the pinned audio-separator moves; verify_install()'s import
+# check is the backstop that turns a miss into a clear install-time error.
+_AS_EXTRAS = [
+    "beartype>=0.18.5,<0.19.0",
+    "ml_collections",
+    "onnx-weekly",
+    "onnx2torch-py313>=1.6",
+    "onnxruntime>=1.17",
+    "pydub>=0.25",
+    "requests>=2",
+    "resampy>=0.4",
+    "rotary-embedding-torch>=0.6.1,<0.7.0",
+    "samplerate==0.1.0",
+    "six>=1.16",
+    'audioop-lts>=0.2.1; python_version>="3.13"',
+]
+
+# diffq, installed BINARY-ONLY so pip can never start a compile. Both distributions
+# install the same `diffq` module, so either satisfies the import:
+#
+#   diffq-fixed  wheels: win_amd64 cp310-313, manylinux cp310-312
+#   diffq        wheels: macOS/manylinux/win, but only up to cp310
+#
+# Try the fork first (it covers modern Pythons), then the original (it covers macOS,
+# where the fork ships nothing). If NEITHER has a wheel for this interpreter — macOS
+# on 3.11+, Linux on 3.13 — we skip it rather than compile. That is safe for what this
+# plugin actually does: diffq is only needed to load QUANTIZED demucs checkpoints.
+# `demucs` guards its import (`_check_diffq`) and audio-separator only imports it from
+# its bundled demucs ARCHITECTURE — neither is on the bs_roformer_sw path, which is the
+# model we split with.
+_DIFFQ_CANDIDATES = ("diffq-fixed>=0.2", "diffq>=0.2")
 
 # ── GPU / CUDA ───────────────────────────────────────────────────────────────
 # On Windows (and by default everywhere), `pip install torch` from PyPI gives the
@@ -568,6 +622,64 @@ def patch_driver_scripts(config_dir: Path) -> list[str]:
     return patched
 
 
+def _requirements_without_audio_separator(config_dir: Path) -> Path:
+    """The server's requirements.txt with the ``audio-separator`` line removed.
+
+    It is installed separately with ``--no-deps`` (see _AUDIO_SEPARATOR). Leaving it in
+    the ``-r`` file would defeat that entirely: pip resolves the ``-r`` file FIRST, so
+    diffq gets dragged in and the source build fails before we ever reach the --no-deps
+    step. (That exact ordering is why the upstream Dockerfile's --no-deps lines are dead
+    code and its image has never built.)
+
+    Written next to the source rather than mutating requirements.txt in place, so
+    re-downloading the source doesn't have to care.
+    """
+    src = src_dir(config_dir) / "requirements.txt"
+    out = src_dir(config_dir) / "requirements.no-audio-separator.txt"
+    try:
+        lines = src.read_text(encoding="utf-8").splitlines(keepends=True)
+    except OSError as e:
+        raise RuntimeError(f"the server's requirements.txt is unreadable: {e}") from e
+
+    kept = [ln for ln in lines if not _AS_REQ_RE.match(ln)]
+    if len(kept) == len(lines):
+        # Upstream may fix this on their side (that's the proper home for it). Not an
+        # error - our separate --no-deps install still runs.
+        log.info("stem_splitter: requirements.txt no longer pins audio-separator")
+    out.write_text("".join(kept), encoding="utf-8")
+    return out
+
+
+def _install_diffq(target: Path, progress_cb: ProgressCB = None,
+                   base: float = 0.9, span: float = 0.03) -> None:
+    """Best-effort, BINARY-ONLY diffq install (see _DIFFQ_CANDIDATES).
+
+    ``--only-binary=:all:`` is the whole point: it makes pip *fail* rather than fall
+    back to the sdist, so this can never start a C compile on a user's machine. Both
+    candidates are tried, and if neither has a wheel for this interpreter we log it and
+    move on — quantized demucs checkpoints become unavailable, bs_roformer_sw (what we
+    actually split with) does not care.
+    """
+    for spec in _DIFFQ_CANDIDATES:
+        try:
+            engine_install.stream_pip(
+                sys.executable,
+                ["--target", str(target), "--no-deps", "--only-binary=:all:", spec],
+                f"{spec.split('>')[0]} (optional)", progress_cb,
+                base=base, span=span, pkg_count=1,
+            )
+            return
+        except RuntimeError as e:
+            log.info("stem_splitter: no %s wheel for this interpreter (%s)", spec, e)
+
+    _emit(progress_cb,
+          "No diffq wheel exists for this Python — skipping it rather than compiling "
+          "from source. Quantized demucs checkpoints won't load; bs_roformer_sw (the "
+          "model this plugin splits with) is unaffected.",
+          base + span, "Preparing")
+    log.warning("stem_splitter: diffq unavailable as a wheel; skipped")
+
+
 def install_server(config_dir: Path, gpu: bool = False, ref: str | None = None,
                    cuda_tag: str | None = None,
                    progress_cb: ProgressCB = None) -> dict:
@@ -607,7 +719,7 @@ def install_server(config_dir: Path, gpu: bool = False, ref: str | None = None,
             )
     target.mkdir(parents=True, exist_ok=True)
 
-    req = src_dir(config_dir) / "requirements.txt"
+    req = _requirements_without_audio_separator(config_dir)
     tgt = ["--target", str(target)]
 
     # GPU: pin the CUDA torch build INTO the same resolve rather than installing it
@@ -635,18 +747,24 @@ def install_server(config_dir: Path, gpu: bool = False, ref: str | None = None,
     # tree that only failed at server start with "Numba needs NumPy 2.4 or less".
     # Resolving together lets pip honour every constraint at once.
     #
-    # demucs is the one exception and MUST stay --no-deps: its metadata pins
-    # torchaudio<2.1 (whisperx needs ~2.8) and drags in diffq, a C-extension with no
-    # wheels. It adds no transitive deps that way, so it can't perturb the resolve.
+    # demucs and audio-separator are the exceptions and MUST stay --no-deps (see the
+    # notes on _DEMUCS_EXTRAS / _AUDIO_SEPARATOR above — between them they'd drag in a
+    # torchaudio<2.1 pin and a diffq source build). Their real deps ride in the main
+    # resolve instead, so they add no transitive deps here and can't perturb it.
     steps: list[tuple[str, list[str], int]] = [
         ("server dependencies" + (" (GPU/CUDA)" if gpu else ""),
-         tgt + ["-r", str(req), *_DEMUCS_EXTRAS, *gpu_args], 9 + len(_DEMUCS_EXTRAS)),
+         tgt + ["-r", str(req), *_AS_EXTRAS, *_DEMUCS_EXTRAS, *gpu_args],
+         9 + len(_AS_EXTRAS) + len(_DEMUCS_EXTRAS)),
+        ("audio-separator (no-deps)", tgt + ["--no-deps", _AUDIO_SEPARATOR], 1),
         ("demucs (no-deps)", tgt + ["--no-deps", "demucs"], 1),
     ]
-    n = len(steps) + 1  # + the verify step
+    n = len(steps) + 2  # + diffq + the verify step
     for i, (label, args, count) in enumerate(steps):
         engine_install.stream_pip(sys.executable, args, label, progress_cb,
                                   base=0.12 + (i / n) * 0.86, span=0.86 / n, pkg_count=count)
+
+    _install_diffq(target, progress_cb,
+                   base=0.12 + (len(steps) / n) * 0.86, span=0.86 / n)
 
     with _disk_lock:
         _disk_memo.clear()   # the tree just changed materially
