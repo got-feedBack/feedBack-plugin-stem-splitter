@@ -147,6 +147,58 @@ class ImageRefParsing(unittest.TestCase):
         self.assertEqual(ds.split_ref("demucs-permfix:test"), ("demucs-permfix", "test"))
 
 
+class ReachabilityFromInsideAContainer(unittest.TestCase):
+    """Publishing to 127.0.0.1 on the HOST is useless to a containerized feedBack: that
+    loopback is *this container*. Starting a server nobody can reach is worse than not
+    starting one — it looks like success."""
+
+    def _ctx(self, containerized, host_net=False, networks=()):
+        return (
+            mock.patch("demucs_server.in_container", return_value=containerized),
+            mock.patch.object(ds, "_self_uses_host_networking", return_value=host_net),
+            mock.patch.object(ds, "_self_networks", return_value=list(networks)),
+        )
+
+    def _run(self, fn, containerized, host_net=False, networks=()):
+        a, b, c = self._ctx(containerized, host_net, networks)
+        with a, b, c:
+            return fn()
+
+    def test_on_the_host_loopback_is_fine(self):
+        self.assertEqual(self._run(ds._reachability_problem, containerized=False), "")
+        self.assertEqual(self._run(lambda: ds.url_for(7866, False), containerized=False),
+                         "http://127.0.0.1:7866")
+
+    def test_host_networking_makes_loopback_valid(self):
+        self.assertEqual(
+            self._run(ds._reachability_problem, containerized=True, host_net=True), "")
+        self.assertEqual(
+            self._run(lambda: ds.url_for(7866, False), containerized=True, host_net=True),
+            "http://127.0.0.1:7866")
+
+    def test_shared_user_defined_network_is_reachable_by_name(self):
+        self.assertEqual(
+            self._run(ds._reachability_problem, containerized=True, networks=["appnet"]), "")
+        self.assertEqual(
+            self._run(lambda: ds.url_for(7866, True), containerized=True, networks=["appnet"]),
+            f"http://{ds.CONTAINER_NAME}:{ds.SERVER_PORT}")
+
+    def test_bridge_only_container_is_refused_not_silently_broken(self):
+        # The trap: default bridge has no name DNS, and the published port is on the HOST's
+        # loopback. A one-click here would "succeed" and produce an unusable server.
+        problem = self._run(ds._reachability_problem, containerized=True, networks=[])
+        self.assertTrue(problem)
+        self.assertIn("bridge", problem)
+        self.assertIn("compose", problem)      # tells them what to do instead
+
+    def test_bridge_only_container_gets_no_url_rather_than_a_wrong_one(self):
+        url = self._run(lambda: ds.url_for(7866, False), containerized=True, networks=[])
+        self.assertIsNone(
+            url, "returning http://127.0.0.1:7866 from a bridge-only container points at "
+                 "the app container itself — autodetection and the health check would fail "
+                 "with a confusing timeout instead of an honest error")
+
+
 class GpuRuntimeDetection(unittest.TestCase):
     """`" ".join(a_string)` spaces out every character, so the DefaultRuntime check used to
     be dead code — it could never match, silently hiding the GPU option."""

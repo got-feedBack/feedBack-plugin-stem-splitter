@@ -229,6 +229,26 @@ def _self_container_id() -> str | None:
     return hid or None
 
 
+def _self_uses_host_networking() -> bool:
+    """Are we on the host's network stack (`--network host`)?
+
+    The one case where loopback genuinely works from inside a container: there is no network
+    namespace of our own, so 127.0.0.1 IS the host's 127.0.0.1 and the published port is
+    directly reachable.
+    """
+    cid = _self_container_id()
+    if not cid:
+        return False
+    try:
+        status, body = _request("GET", f"/containers/{cid}/json", timeout=5.0)
+    except Exception:
+        return False
+    if status != 200 or not isinstance(body, dict):
+        return False
+    mode = str(((body.get("HostConfig") or {}).get("NetworkMode") or "")).lower()
+    return mode == "host"
+
+
 def _self_networks() -> list[str]:
     """The networks OUR container is on.
 
@@ -497,12 +517,58 @@ def _assert_port_is_ours(port: int, progress_cb: ProgressCB = None) -> None:
         )
 
 
+def _reachability_problem() -> str:
+    """Would a sidecar we start actually be reachable FROM HERE? '' if yes.
+
+    Checked BEFORE pulling 4.8 GB, because the failure is silent otherwise: the container
+    starts, Docker reports it healthy, and nothing can talk to it.
+
+    From the host (Electron) the published port on 127.0.0.1 is always reachable. From
+    inside a container it is NOT — that loopback is *this container*, not the Docker host —
+    so we need one of:
+
+      * host networking: we share the host's stack, so 127.0.0.1 really is the host's; or
+      * a user-defined network we can attach the sidecar to, giving us Docker's embedded DNS
+        and `http://feedback-demucs-server:7865`.
+
+    The default `bridge` network gives NEITHER: it has no name-based DNS, and the published
+    port is on the host's loopback, not ours. A one-click there would succeed and produce an
+    unusable server — the worst outcome, because it looks like it worked.
+    """
+    try:
+        from demucs_server import in_container
+        if not in_container():
+            return ""                      # host: loopback is genuinely ours
+    except Exception:
+        return ""
+
+    if _self_uses_host_networking():
+        return ""
+    if _self_networks():
+        return ""                          # a shared user-defined network: reachable by name
+
+    return (
+        "feedBack is in a container that is only on Docker's default 'bridge' network, so a "
+        "server started here would be unreachable: the published port lands on the HOST's "
+        "loopback (not this container's), and the default bridge has no name-based DNS. "
+        "Use the compose service instead — compose puts both containers on a shared network, "
+        "which is exactly what makes this work. (Or run feedBack on a user-defined network, "
+        "or with host networking.)"
+    )
+
+
 def up(port: int = DEFAULT_PORT, gpu: bool = False, image: str = DEFAULT_IMAGE,
        progress_cb: ProgressCB = None) -> dict:
     """Pull (if needed), create and start the sidecar. Idempotent."""
     ok, reason = ping()
     if not ok:
         raise RuntimeError(reason)
+
+    # Refuse BEFORE the 4.8 GB pull. Starting a server we cannot reach is worse than not
+    # starting one: it looks like success.
+    problem = _reachability_problem()
+    if problem:
+        raise RuntimeError(problem)
 
     existing = _find_container()
     if existing and existing.get("State") == "running":
@@ -613,15 +679,30 @@ def down(remove: bool = False) -> dict:
     return status()
 
 
-def url_for(port: int, networks_shared: bool) -> str:
-    """How WE reach the sidecar.
+def url_for(port: int, networks_shared: bool) -> str | None:
+    """How WE reach the sidecar, or None if we can't.
 
-    From inside a container that shares a user-defined network with it, by name (Docker's
-    embedded DNS). Otherwise via the published host port on loopback.
+    From inside a container that shares a user-defined network with it: by NAME (Docker's
+    embedded DNS). Otherwise via the published host port on loopback — which is only *ours*
+    when we're on the host, or sharing the host's network stack.
+
+    Returns None rather than a plausible-but-wrong URL. Handing back
+    `http://127.0.0.1:7866` from inside a bridge-only container points at the app container
+    itself; autodetection and the health check would both fail with a confusing timeout
+    instead of an honest "this can't be reached from here".
     """
     if networks_shared:
         # By container NAME we reach the port inside the container, not the published one.
         return f"http://{CONTAINER_NAME}:{SERVER_PORT}"
+
+    try:
+        from demucs_server import in_container
+        containerized = in_container()
+    except Exception:
+        containerized = False
+
+    if containerized and not _self_uses_host_networking():
+        return None                 # loopback here is US, not the host. Don't pretend.
     return f"http://127.0.0.1:{port}"
 
 
@@ -712,16 +793,28 @@ def status() -> dict:
             break
     shared = bool(set(_self_networks()) &
                   set((c.get("NetworkSettings") or {}).get("Networks") or {}))
+    url = url_for(port, shared) if running else None
+    problem = _diagnose(c.get("Id", ""), c.get("State"))
+    if running and not url:
+        # It IS running — we simply cannot reach it from in here. Say so, rather than
+        # advertising a loopback URL that points at this container.
+        problem = problem or (
+            f"The container is running, but feedBack can't reach it from inside its own "
+            f"container: it isn't on a shared Docker network with us, and the published "
+            f"port {port} is on the HOST's loopback, not ours. Put both on the same network "
+            f"(the compose service does this), or use host networking."
+        )
     out.update({
         "container": {"id": c.get("Id", "")[:12], "state": c.get("State"),
                       "status": c.get("Status"), "image": c.get("Image")},
         "running": running,
         "port": port,
-        "url": url_for(port, shared) if running else None,
-        # A container that exists but isn't running has a REASON, and the user cannot see
-        # `docker logs` from inside the app. Surfacing it is the difference between "not
-        # running" (useless) and "your volume is root-owned, remove it" (actionable).
-        "problem": _diagnose(c.get("Id", ""), c.get("State")),
+        "url": url,
+        # A container that exists but isn't running — or is running but unreachable from
+        # here — has a REASON, and the user cannot run `docker logs` from inside the app.
+        # Surfacing it is the difference between "not running" (useless) and "your volume is
+        # root-owned, remove it" (actionable).
+        "problem": problem,
     })
     return out
 
