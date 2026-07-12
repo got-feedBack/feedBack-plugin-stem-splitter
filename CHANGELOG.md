@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.3.0
+
+### Run the demucs server in Docker
+
+- **Sibling-container support.** A containerized feedBack cannot install the server on its
+  host — `Popen` forks into the *caller's* namespaces, and there is no syscall for "run
+  this over there". The settings page now offers Docker users the two things that are
+  actually possible: a **compose snippet** (always shown, recommended — it needs no daemon
+  access and grants nobody root on the host), and, *only when the Docker socket is already
+  mounted*, a **one-click** that pulls the image and starts the server as a sibling
+  container. We never suggest mounting the socket; it is root-equivalent on the host.
+- **GPU** is requested only when the daemon advertises the nvidia runtime; otherwise the
+  option is hidden with an explanation rather than silently downgrading to CPU.
+- **A crash-looping container explains itself** — the plugin reads its logs and recognizes
+  the root-owned-volume failure, since you can't run `docker logs` from inside the app.
+
+### Fixes
+
+- **Never publish onto the managed local server's port.** Both defaulted to 7865. On Linux
+  the collision fails loudly; on **Windows both bind** (Docker on `0.0.0.0`, the local
+  server on `127.0.0.1`, and loopback goes to the more specific bind) — so the container
+  looked healthy while **every request went to the other server**. The sidecar now publishes
+  on 7866 and refuses to hand back a URL that doesn't identify as its own container.
+- **Don't pull when the image is already there.** An air-gapped host or a registry outage
+  would refuse to start an image sitting on the machine.
+
+## 0.2.0
+
+*Released without a version bump — recorded here retroactively.*
+
+### Managed local demucs server
+
+- **Install / start / stop / status for a real demucs server**, managed by the plugin: one
+  click installs the dependencies and model weights and starts it. Nothing heavy is ever
+  downloaded implicitly — startup never pulls weights, and a split that needs them asks
+  first.
+- **GPU/CUDA support** for the local server, with the torch build pinned into a single pip
+  resolve.
+- **Cross-platform install without a venv** (`pip --target`), because the packaged Windows
+  app bundles the python.org *embeddable* distribution, which has no `venv`/`ensurepip` and
+  ignores `PYTHONPATH`.
+- **The install could never have worked on Linux or macOS** until late in review:
+  `audio-separator` pulls `diffq`, whose newest wheels stop at cp310, so pip fell back to a
+  source build and needed a compiler. Windows escaped it by accident (it resolves
+  `diffq-fixed`, which does ship modern wheels). Now `--no-deps` + binary-only.
+
 ## 0.1.3
 
 Fixes from code review:
