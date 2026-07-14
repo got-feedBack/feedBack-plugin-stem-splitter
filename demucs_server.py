@@ -684,7 +684,8 @@ def check_update(config_dir: Path, ref: str | None = None) -> dict:
     }
 
 
-def update_server(config_dir: Path, ref: str | None = None,
+def update_server(config_dir: Path, ref: str | None = None, port: int = DEFAULT_PORT,
+                  device: str = "", model: str = DEFAULT_MODEL,
                   progress_cb: ProgressCB = None) -> dict:
     """Re-fetch the server SOURCE at `ref` and restart it if it was running.
 
@@ -694,10 +695,14 @@ def update_server(config_dir: Path, ref: str | None = None,
     a thing anyone will do, so in practice the fix never lands. (The 24h cache sweeper that
     deletes model weights daily is exactly this: fixed upstream, unreachable in the field.)
 
-    This updates ONLY the source: a few hundred KB. It does not touch pylibs (the deps are
-    pinned by requirements.txt, which we re-fetch — if THAT changes, verify_install() will say
-    so and the user can reinstall) and it does not touch the model cache, so nothing is
-    re-downloaded.
+    This updates ONLY the source: a few hundred KB. It does not touch pylibs, and it does not
+    touch the model cache, so nothing is re-downloaded.
+
+    But a new source revision can require a dependency the installed pylibs tree does not have.
+    So after refreshing, the imports are re-checked (verify_install). If they no longer hold, we
+    say so plainly and do NOT restart: a server that cannot import its own dependencies would
+    just crash-loop, and "it keeps restarting" is a far worse message than "the update needs new
+    dependencies — click Install server".
     """
     if not installed(config_dir):
         raise RuntimeError("the server isn't installed, so there is nothing to update")
@@ -732,12 +737,28 @@ def update_server(config_dir: Path, ref: str | None = None,
             _emit(progress_cb, f"Update failed ({e}) — restarting the server as it was.",
                   0.9, "Updating")
             try:
-                start_server(config_dir, warmup=models_downloaded(config_dir),
-                             progress_cb=progress_cb)
+                start_server(config_dir, port=port, device=device, model=model,
+                             warmup=models_downloaded(config_dir), progress_cb=progress_cb)
             except Exception as restart_error:
                 log.warning("stem_splitter: update failed AND the server could not be "
                             "restarted: %s", restart_error)
         raise
+
+    # A newer source may need a dependency the installed tree does not have. Check before
+    # restarting, so a missing module surfaces as one clear sentence rather than a crash-loop.
+    try:
+        _emit(progress_cb, "Checking the updated server's dependencies…", 0.86, "Updating")
+        verify_install(config_dir, progress_cb=None)
+    except Exception as e:
+        _emit(progress_cb,
+              f"The updated server needs dependencies this install doesn't have ({e}). "
+              f"Click 'Install server + models' to refresh them. Not restarting, because a "
+              f"server that can't import its own deps would only crash-loop.",
+              1.0, "Needs reinstall")
+        st = server_status(config_dir)
+        st["updated"] = True
+        st["needs_reinstall"] = True
+        return st
 
     after = str(source_meta(config_dir).get("commit") or "")
     # Compare FULL shas. Two different commits can share an 8-char prefix, and reporting
@@ -749,11 +770,14 @@ def update_server(config_dir: Path, ref: str | None = None,
           0.85, "Updating")
 
     if was_running:
-        _emit(progress_cb, "Restarting the server…", 0.9, "Updating")
-        # Warmup only if the weights are already on disk — an update must never turn into a
+        _emit(progress_cb, "Restarting the server…", 0.92, "Updating")
+        # On the port it was ACTUALLY running on. Restarting on DEFAULT_PORT would move a
+        # server the user had deliberately configured elsewhere — or collide with whatever is
+        # on 7865 — leaving a working setup down or unreachable, after a click meant to help.
+        # Warmup only if the weights are already on disk: an update must never become a
         # surprise multi-GB download.
-        start_server(config_dir, warmup=models_downloaded(config_dir),
-                     progress_cb=progress_cb)
+        start_server(config_dir, port=port, device=device, model=model,
+                     warmup=models_downloaded(config_dir), progress_cb=progress_cb)
 
     _emit(progress_cb, "Done.", 1.0, "Done")
     st = server_status(config_dir)

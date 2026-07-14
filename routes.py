@@ -752,8 +752,12 @@ def setup(app: FastAPI, context: dict) -> None:
         """
         s = mgr.read_settings()
         ref = s.get("local_server_ref") or None
+        # The port/device the server is CONFIGURED for. Without these the restart would land on
+        # DEFAULT_PORT, moving a server the user deliberately put elsewhere.
+        port, device = _server_opts()
         if not mgr.run_server_op("update", lambda cb: demucs_server.update_server(
-                mgr.config_dir, ref=ref, progress_cb=cb)):
+                mgr.config_dir, ref=ref, port=port, device=device,
+                model=s.get("remote_model") or demucs_server.DEFAULT_MODEL, progress_cb=cb)):
             return _busy()
         return {"ok": True}
 
