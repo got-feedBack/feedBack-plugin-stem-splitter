@@ -567,8 +567,12 @@ class JobManager:
             "needs_setup": True,
             "missing": missing,
             "size": size,
+            # No "one time" — the server's own 24h cache sweeper can still delete the
+            # roformer checkpoint until the install picks up the upstream fix (Check for
+            # update, 0.3.3), and a user who was promised "one time" and then watched it
+            # re-download would be right to conclude we were lying to them.
             "message": f"The local demucs server is running, but it still needs "
-                       f"{', '.join(missing)} ({size}, one time). Download now?",
+                       f"{', '.join(missing)} ({size}). Download now?",
         }
 
 
