@@ -86,6 +86,30 @@ class TheLineBreakMovesBackOneToken(unittest.TestCase):
         self.assertEqual([t["w"] for t in realign.segments_to_lyrics(segments)], ["kept"])
 
 
+class TheVocalStemIsFoundTheSameWayTranscribeFindsIt(unittest.TestCase):
+    """A pak written by another tool can carry `"Vocals"`.
+
+    transcribe.py lowercases before comparing; this used to match case-sensitively. Same manifest,
+    two answers: it would transcribe fine and then re-align with "this song has no vocal stem" —
+    which reads as a broken pak rather than a broken plugin."""
+
+    def test_a_capitalised_stem_id_is_found(self):
+        m = {"stems": [{"id": "Vocals", "file": "stems/vocals.ogg"}]}
+        self.assertEqual(realign._vocals_relpath(m), "stems/vocals.ogg")
+
+    def test_whitespace_is_trimmed(self):
+        m = {"stems": [{"id": " vocals ", "file": " stems/vocals.ogg "}]}
+        self.assertEqual(realign._vocals_relpath(m), "stems/vocals.ogg")
+
+    def test_an_empty_file_field_is_not_a_stem(self):
+        m = {"stems": [{"id": "vocals", "file": "  "}]}
+        self.assertIsNone(realign._vocals_relpath(m))
+
+    def test_other_stems_are_not_mistaken_for_vocals(self):
+        m = {"stems": [{"id": "drums", "file": "stems/drums.ogg"}]}
+        self.assertIsNone(realign._vocals_relpath(m))
+
+
 class TheRoundTripPreservesTheWords(unittest.TestCase):
     def test_text_out_equals_text_in(self):
         """The point of the feature: same words, new timings."""

@@ -129,9 +129,18 @@ def segments_to_lyrics(segments: list[dict]) -> list[dict]:
 
 
 def _vocals_relpath(manifest: dict) -> str | None:
+    """The vocal stem's path, matched exactly as transcribe.py matches it.
+
+    Case-insensitive and trimmed on purpose: a pak written by another tool can carry `"Vocals"`,
+    and matching case-sensitively here would mean the same manifest transcribes fine and then
+    re-aligns with "this song has no vocal stem" — two features disagreeing about what is
+    plainly there, which reads as a broken pak rather than a broken plugin.
+    """
     for stem in manifest.get("stems") or []:
-        if isinstance(stem, dict) and stem.get("id") == "vocals" and stem.get("file"):
-            return str(stem["file"])
+        if isinstance(stem, dict) and str(stem.get("id", "")).strip().lower() == "vocals":
+            f = stem.get("file")
+            if isinstance(f, str) and f.strip():
+                return f.strip()
     return None
 
 
