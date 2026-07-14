@@ -12,6 +12,7 @@ import os
 import sys
 import tempfile
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from unittest import mock
 
@@ -71,6 +72,134 @@ class TheSetupPromptNamesTheMissingWeights(unittest.TestCase):
                  mock.patch.object(mgr, "local_server_url", return_value=None), \
                  mock.patch.object(demucs_server, "missing_models", return_value=["whisperx"]):
                 self.assertIsNone(mgr.needs_server_setup())
+
+
+class ReAlignAsksItsOwnQuestion(unittest.TestCase):
+    """A re-align never splits. It hands the vocal stem it already has, plus the lyrics, to the
+    server's aligner.
+
+    So gating it on the SPLIT engine — which is what the shared check used to do — is wrong twice
+    over: it blocks a user who forced local demucs from a job that never touches the split engine,
+    and then offers them the 700 MB roformer separator for an alignment that will never load it.
+    """
+
+    def _prompt(self, missing, *, lyrics_url="http://127.0.0.1:7865",
+                local_url="http://127.0.0.1:7865", split_engine="demucs"):
+        with tempfile.TemporaryDirectory() as td:
+            mgr = routes.JobManager.__new__(routes.JobManager)
+            mgr.config_dir = Path(td)
+            with ExitStack() as stack:
+                stack.enter_context(mock.patch.object(
+                    mgr, "_lyrics_server_url", return_value=lyrics_url))
+                stack.enter_context(mock.patch.object(
+                    mgr, "local_server_url", return_value=local_url))
+                stack.enter_context(mock.patch.object(
+                    mgr, "resolve_split_engine", return_value=(split_engine, "")))
+                stack.enter_context(mock.patch.object(
+                    demucs_server, "missing_models", return_value=missing))
+                stack.enter_context(mock.patch.object(
+                    demucs_server, "download_size", return_value="~1.9 GB"))
+                return mgr.needs_server_setup("realign")
+
+    def test_it_does_not_ask_for_the_separator(self):
+        """The roformer checkpoint is 700 MB and alignment never loads it. Demanding it puts a
+        700 MB download in front of a job that doesn't need a byte of it."""
+        out = self._prompt(["bs_roformer_sw"])
+        self.assertIsNone(out, "a missing separator must not block a re-align")
+
+    def test_it_does_ask_for_the_aligner(self):
+        out = self._prompt(["whisperx aligner"])
+        self.assertEqual(out["missing"], ["whisperx aligner"])
+        self.assertIn("Re-aligning", out["message"], "the prompt must speak about THIS job")
+
+    def test_it_filters_the_separator_out_of_a_mixed_list(self):
+        out = self._prompt(["bs_roformer_sw", "whisperx", "whisperx aligner"])
+        self.assertEqual(out["missing"], ["whisperx", "whisperx aligner"])
+        self.assertNotIn("bs_roformer_sw", out["message"])
+
+    def test_everything_present_is_no_prompt(self):
+        self.assertIsNone(self._prompt([]))
+
+    def test_the_split_engine_is_irrelevant(self):
+        # A user who forced local demucs must not be blocked from a job that never splits.
+        out = self._prompt(["whisperx"], split_engine="demucs")
+        self.assertIsNotNone(out, "the split engine has nothing to do with re-aligning")
+
+    def test_someone_elses_server_is_not_ours_to_set_up(self):
+        out = self._prompt(["whisperx"], lyrics_url="http://nas.local:9000",
+                           local_url="http://127.0.0.1:7865")
+        self.assertIsNone(out, "we cannot download models onto a server we do not manage")
+
+    def test_no_lyrics_server_at_all(self):
+        self.assertIsNone(self._prompt(["whisperx"], lyrics_url=None))
+
+
+class TranscribeAsksAboutBothRoutes(unittest.TestCase):
+    """A transcribe uses the LYRICS server, and — when the song has no vocal stem — splits first.
+
+    The old check asked only the split question, so a user who splits locally but transcribes on
+    our managed server got NO prompt, and the job stalled on the lazy multi-GB fetch the prompt
+    exists to prevent. That looks like a hang, not a download. (Pre-existing; found on #21.)"""
+
+    def _prompt(self, missing, *, split_engine, lyrics_ours=True):
+        with tempfile.TemporaryDirectory() as td:
+            mgr = routes.JobManager.__new__(routes.JobManager)
+            mgr.config_dir = Path(td)
+            local = "http://127.0.0.1:7865"
+            with ExitStack() as stack:
+                stack.enter_context(mock.patch.object(
+                    mgr, "local_server_url", return_value=local))
+                stack.enter_context(mock.patch.object(
+                    mgr, "_lyrics_server_url",
+                    return_value=local if lyrics_ours else "http://nas:9000"))
+                stack.enter_context(mock.patch.object(
+                    mgr, "resolve_split_engine", return_value=(split_engine, "")))
+                stack.enter_context(mock.patch.object(
+                    demucs_server, "missing_models", return_value=missing))
+                stack.enter_context(mock.patch.object(
+                    demucs_server, "download_size", return_value="~1.9 GB"))
+                return mgr.needs_server_setup("transcribe")
+
+    def test_a_local_splitter_still_gets_prompted_for_the_lyrics_models(self):
+        # THE bug: split locally, transcribe on our server -> no prompt -> silent stall.
+        out = self._prompt(["whisperx", "whisperx aligner"], split_engine="demucs")
+        self.assertIsNotNone(out, "the lyrics server's models are needed however you split")
+        self.assertEqual(out["missing"], ["whisperx", "whisperx aligner"])
+
+    def test_it_also_asks_for_the_separator_when_the_split_is_ours(self):
+        # A transcribe of a song with no vocal stem splits first, so it can need both.
+        out = self._prompt(["bs_roformer_sw", "whisperx"], split_engine="remote")
+        self.assertEqual(out["missing"], ["bs_roformer_sw", "whisperx"])
+
+    def test_it_does_not_ask_for_the_separator_when_the_split_is_local(self):
+        out = self._prompt(["bs_roformer_sw", "whisperx"], split_engine="demucs")
+        self.assertEqual(out["missing"], ["whisperx"],
+                         "a locally-split transcribe never loads the server's separator")
+
+    def test_someone_elses_lyrics_server_with_a_local_split_is_not_ours_to_set_up(self):
+        out = self._prompt(["whisperx"], split_engine="demucs", lyrics_ours=False)
+        self.assertIsNone(out)
+
+
+class TheSplitPathIsUnchanged(unittest.TestCase):
+    """The re-align branch must not have moved the ground under the split one."""
+
+    def test_split_still_asks_about_every_model(self):
+        with tempfile.TemporaryDirectory() as td:
+            mgr = routes.JobManager.__new__(routes.JobManager)
+            mgr.config_dir = Path(td)
+            with ExitStack() as stack:
+                stack.enter_context(mock.patch.object(
+                    mgr, "resolve_split_engine", return_value=("remote", "")))
+                stack.enter_context(mock.patch.object(
+                    mgr, "local_server_url", return_value="http://127.0.0.1:7865"))
+                stack.enter_context(mock.patch.object(
+                    demucs_server, "missing_models", return_value=["bs_roformer_sw"]))
+                stack.enter_context(mock.patch.object(
+                    demucs_server, "download_size", return_value="~700 MB"))
+                out = mgr.needs_server_setup()      # default kind
+        self.assertEqual(out["missing"], ["bs_roformer_sw"],
+                         "a split DOES need the separator — don't filter it out here")
 
 
 if __name__ == "__main__":

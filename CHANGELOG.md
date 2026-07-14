@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.4.0
+
+### Re-align lyrics to vocals
+
+- **New song-card action: "Re-align lyrics to vocals".** ([#20](https://github.com/got-feedBack/feedBack-plugin-stem-splitter/issues/20))
+  The words are already right; the timings aren't. That happens constantly — lyrics pasted from
+  the web, imported from a Guitar Pro file, or transcribed against a different mix: correct text,
+  drifting timestamps. Until now the only repair was **Transcribe lyrics**, which throws your
+  words away and lets Whisper guess them again. You fixed the timing by corrupting the text, and
+  a mis-heard line is a worse outcome than a late one.
+
+  Re-align sends the lyrics you already have to the server's `/align` endpoint — *"here are the
+  words, when is each one sung?"* — and rewrites **only** the timings. It never invents a word.
+
+  Enabled only when the song has both lyrics to re-time and a vocal stem to time them against —
+  greyed out otherwise, since there is nothing a click could do about a missing stem.
+
+  A missing *server* is different, and follows what Split and Transcribe already do: the item
+  stays clickable and tells you what's wrong ("re-aligning needs a demucs/WhisperX server"),
+  because a greyed-out item with no explanation teaches you nothing about how to fix it. Re-align
+  is server-only on purpose — the local engine can transcribe but has no alignment entry point,
+  and silently falling back to transcription would replace your words with Whisper's guesses,
+  which is exactly what you clicked re-align to avoid.
+
+  The manifest is not touched. `lyrics_source` is a closed vocabulary in the feedpak spec
+  (authored | transcribed | user), and re-aligning doesn't change where the words came from —
+  a pak whose timings were repaired is not a pak whose provenance changed.
+
 ## 0.3.4
 
 ### Fixes

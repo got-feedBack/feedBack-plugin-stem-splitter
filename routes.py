@@ -24,6 +24,7 @@ from fastapi import Body, FastAPI, Request, WebSocket, WebSocketDisconnect
 import demucs_server
 import docker_sidecar
 import engine_install
+import realign
 
 # Hoisted: ruff B008 rightly objects to Body() being called in an argument
 # default. Both sidecar routes take an optional JSON body.
@@ -435,6 +436,24 @@ class JobManager:
                 engine_dir=edir, models_dir=mdir, split_kwargs=split_kwargs,
                 cancel_cb=cancel_cb, progress_cb=cb,
             )
+        elif job["kind"] == "realign":
+            # Re-time the lyrics the pak ALREADY has. Deliberately server-only: /align is the
+            # endpoint for "here are the words, when are they sung", and the local whisperx path
+            # has no equivalent entry point today. Say so plainly rather than silently falling
+            # back to transcription, which would REPLACE the user's words with Whisper's guesses
+            # — the exact thing they clicked re-align to avoid.
+            lyr_server = self._lyrics_server_url()
+            if not lyr_server:
+                raise RuntimeError(
+                    "re-aligning needs a demucs/WhisperX server — configure one in the plugin "
+                    "settings (the local engine cannot re-align, only transcribe)"
+                )
+            self._update(job["id"], message="Re-aligning existing lyrics")
+            realign.realign_pak(
+                pak_path, server_url=lyr_server, api_key=api_key,
+                language=settings.get("language") or None,
+                cancel_cb=cancel_cb, progress_cb=cb,
+            )
         else:
             raise RuntimeError(f"unknown job kind {job['kind']!r}")
 
@@ -540,20 +559,61 @@ class JobManager:
         threading.Thread(target=_run, name=f"stem_splitter-server-{op}", daemon=True).start()
         return True
 
-    def needs_server_setup(self) -> dict | None:
-        """If the split would go to our managed local server but its weights aren't
-        downloaded yet, say so instead of letting the job silently stall on a ~2 GB
-        lazy fetch. The UI turns this into a 'download now?' prompt."""
-        # Only when the job would ACTUALLY go through the server. A user who forced
-        # a local engine (demucs / audio-separator) doesn't need the server's models
-        # at all, and must not be blocked just because the server happens to be
-        # running without them.
-        engine, _reason = self.resolve_split_engine()
-        if engine != "remote":
+    # Re-align never separates anything: it hands the vocal stem it already has, plus the
+    # lyrics, to the server's aligner. So it needs whisperx and its wav2vec2 aligner — and NOT
+    # the 700 MB roformer separator. Demanding that one anyway would put a 700 MB download in
+    # front of a job that will never touch it.
+    # Which models each job actually loads. A split loads the separator; an alignment loads
+    # whisperx and its wav2vec2 aligner. Asking for the wrong ones puts a download in front of a
+    # job that will never open it — and NOT asking for the right ones lets the job stall on a
+    # lazy multi-GB fetch, which looks like a hang rather than a download.
+    _SEPARATOR_MODELS = ("bs_roformer_sw",)
+    _ALIGN_MODELS = ("whisperx", "whisperx aligner")
+
+    def needs_server_setup(self, kind: str = "split") -> dict | None:
+        """If the job would go to our managed local server but its weights aren't downloaded
+        yet, say so instead of letting it silently stall on a lazy multi-GB fetch. The UI turns
+        this into a 'download now?' prompt.
+
+        The question is per-JOB, because the jobs travel by different routes and load different
+        models:
+
+        * a **split** goes to the split engine and loads the separator;
+        * a **re-align** goes to the lyrics server and loads the aligner — it never splits;
+        * a **transcribe** goes to the lyrics server AND, when the song has no vocal stem yet,
+          splits first. So it can need both — and it can need the lyrics server's models even
+          when the user splits locally, which the old split-only check missed entirely: the
+          prompt was skipped and the job stalled on the lazy fetch it exists to prevent.
+
+        Each route is only ours to set up if it points at OUR managed server. Someone else's
+        server is their business.
+        """
+        missing_all = demucs_server.missing_models(self.config_dir)
+        if not missing_all:
             return None
-        if not self.local_server_url():
-            return None   # a real remote server: not ours to set up
-        missing = demucs_server.missing_models(self.config_dir)
+
+        local = self.local_server_url()
+        lyrics_is_ours = bool(local) and self._lyrics_server_url() == local
+        split_engine, _reason = self.resolve_split_engine()
+        split_is_ours = split_engine == "remote" and bool(local)
+
+        wanted: list[str] = []
+        if kind == "realign":
+            if lyrics_is_ours:
+                wanted = [m for m in missing_all if m in self._ALIGN_MODELS]
+        elif kind == "transcribe":
+            # Both routes, because a transcribe of a song with no vocal stem splits first.
+            if lyrics_is_ours:
+                wanted += [m for m in missing_all if m in self._ALIGN_MODELS]
+            if split_is_ours:
+                wanted += [m for m in missing_all if m in self._SEPARATOR_MODELS]
+        elif split_is_ours:
+            # A split. Ask about everything the server would warm — the separator is what it
+            # loads, and this is the path that has always prompted for the full set.
+            wanted = list(missing_all)
+
+        # Preserve missing_models()' order, and don't repeat a model both routes want.
+        missing = [m for m in missing_all if m in set(wanted)]
         if not missing:
             return None
         # Name them. "Its models aren't downloaded" reads as "nothing is downloaded" to someone
@@ -571,8 +631,14 @@ class JobManager:
             # roformer checkpoint until the install picks up the upstream fix (Check for
             # update, 0.3.3), and a user who was promised "one time" and then watched it
             # re-download would be right to conclude we were lying to them.
-            "message": f"The local demucs server is running, but it still needs "
-                       f"{', '.join(missing)} ({size}). Download now?",
+            "message": (
+                f"Re-aligning runs on the local server, which still needs "
+                f"{', '.join(missing)} ({size}). Download now?"
+                if kind == "realign" else
+                f"The local demucs server is running, but it still needs "
+                f"{', '.join(missing)} ({size}). Download now?"
+            ),
+            "kind": kind,
         }
 
 
@@ -875,7 +941,7 @@ def setup(app: FastAPI, context: dict) -> None:
         # The client re-POSTs with skip_setup_check once the user has agreed (and the
         # models have been prepared).
         if not body.get("skip_setup_check"):
-            needs = mgr.needs_server_setup()
+            needs = mgr.needs_server_setup(kind)
             if needs:
                 return {**needs, "ok": False, "enqueued": 0}
         created = [mgr.enqueue(kind, n) for n in names]
@@ -888,6 +954,11 @@ def setup(app: FastAPI, context: dict) -> None:
     @app.post(f"{P}/transcribe")
     def post_transcribe(body: dict):
         return _enqueue_many("transcribe", body or {})
+
+    @app.post(f"{P}/realign")
+    def post_realign(body: dict):
+        """Re-time existing lyrics against the vocal stem. Never changes the words."""
+        return _enqueue_many("realign", body or {})
 
     # ── missing detection ────────────────────────────────────────────────────
     def _query(**kwargs):
@@ -922,6 +993,18 @@ def setup(app: FastAPI, context: dict) -> None:
     @app.get(f"{P}/missing_lyrics")
     def missing_lyrics():
         songs = _query(has_lyrics=0)
+        return {"songs": [{"filename": s.get("filename"), "title": s.get("title"),
+                           "artist": s.get("artist")} for s in songs]}
+
+    @app.get(f"{P}/missing_vocals")
+    def missing_vocals():
+        """Songs with no VOCALS stem specifically.
+
+        Not the same question as /missing_stems, which asks for songs lacking any of the six
+        instrument stems — a song with vocals but no piano is in that set, and re-align works
+        perfectly well on it. Re-align needs exactly one thing: something to align against.
+        """
+        songs = _query(stems_lacks=["vocals"])
         return {"songs": [{"filename": s.get("filename"), "title": s.get("title"),
                            "artist": s.get("artist")} for s in songs]}
 

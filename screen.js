@@ -16,6 +16,10 @@
   var state = {
     missingStems: new Set(),
     missingLyrics: new Set(),
+    missingVocals: new Set(),
+    // False until the three missing-sets have ALL loaded. Actions gated on a song HAVING
+    // something (re-align) must not fire while the sets are still empty-because-unknown.
+    missingReady: false,
     splitEngine: null,
     lyricsEngine: null,
     ws: null,
@@ -55,6 +59,17 @@
 
   function $(id) { return document.getElementById(id); }
 
+  // Job kinds, in the two places the user reads them. The old code asked "is it a split?" and
+  // called everything else a transcription — which, with re-align added, means telling someone
+  // their LYRICS ARE ABOUT TO BE REPLACED when they clicked the button that promises not to.
+  var KIND = {
+    split:      { noun: 'split',      pill: 'split' },
+    transcribe: { noun: 'transcription', pill: 'transcribe' },
+    realign:    { noun: 're-align',   pill: 'realign' },
+  };
+  function kindNoun(kind) { return (KIND[kind] || KIND.transcribe).noun; }
+  function kindPill(kind) { return (KIND[kind] || KIND.transcribe).pill; }
+
   function toast(title, message, accent) {
     try {
       if (window.fbNotify && window.fbNotify.show) {
@@ -85,7 +100,7 @@
     return post(kind, body).then(function (res) {
       if (!res || !res.needs_setup) return res;
       if (!window.confirm(res.message + '\n\nThe download runs in the background; your '
-                          + (kind === 'split' ? 'split' : 'transcription')
+                          + kindNoun(kind)
                           + ' starts automatically when it finishes.')) {
         toast('Cancelled', 'Models are needed before this can run.');
         return res;
@@ -185,15 +200,35 @@
   }
 
   function refreshMissing() {
+    // A failed fetch is UNKNOWN, not "nothing is missing".
+    //
+    // Split and Transcribe are gated on PRESENCE in a missing-set, so an empty set means the
+    // action is disabled — a failed fetch is safe by accident. Re-align is gated on ABSENCE
+    // (it needs the lyrics and the stem to be there), so an empty set means ENABLED, and a
+    // failed fetch would offer a re-align on a song with neither. Same data, opposite default.
+    //
+    // So the sets are only trusted once they have all actually loaded. Until then re-align is
+    // greyed out — the right answer to "I don't know" is not "go ahead".
     return Promise.all([
-      api('/missing_stems').catch(function () { return { songs: [] }; }),
-      api('/missing_lyrics').catch(function () { return { songs: [] }; }),
+      api('/missing_stems'),
+      api('/missing_lyrics'),
+      // Vocals SPECIFICALLY — not the same question as /missing_stems, which asks for songs
+      // lacking any of the six instrument stems. A song with vocals but no piano is in that set,
+      // and re-align works fine on it: all it needs is something to align against.
+      api('/missing_vocals'),
     ]).then(function (res) {
       state.missingStems = new Set((res[0].songs || []).map(function (s) { return s.filename; }));
       state.missingLyrics = new Set((res[1].songs || []).map(function (s) { return s.filename; }));
+      state.missingVocals = new Set((res[2].songs || []).map(function (s) { return s.filename; }));
+      state.missingReady = true;
       var a = $('ss-missing-stems-n'), b = $('ss-missing-lyrics-n');
       if (a) a.textContent = state.missingStems.size;
       if (b) b.textContent = state.missingLyrics.size;
+    }).catch(function (e) {
+      // Keep whatever we last knew, but stop trusting it: an action that depends on a song
+      // HAVING something must not fire on a guess.
+      state.missingReady = false;
+      console.warn('[stem_splitter] could not refresh the missing-sets', e);
     });
   }
 
@@ -231,6 +266,44 @@
         });
       },
     });
+    reg.register({
+      id: 'stem_splitter.realign',
+      pluginId: 'stem_splitter',
+      label: 'Re-align lyrics to vocals',
+      placement: 'menu',
+      order: 32,
+      applies: function (song) { return !!(song && song.filename); },
+      // Needs BOTH: lyrics to re-time, and a vocal stem to time them against. The mirror image
+      // of Transcribe on the first count — that one needs lyrics to be MISSING, this one needs
+      // them present (words already right, timings wrong: the case where transcribing again
+      // would "fix" the timing by throwing the correct words away). The backend refuses either
+      // way, but a menu item that is clickable and then fails is a worse answer than one that
+      // is greyed out.
+      enabled: function (song) {
+        // Unknown is not "yes". Before the sets load — or after a failed refresh — an
+        // absence-gated action would be enabled on every song, including ones with no lyrics
+        // and no stem, and the user's click would travel all the way to the backend to be told
+        // no. Split and Transcribe are gated on PRESENCE, so they default to disabled and never
+        // had this problem; this one is the mirror image and needs the guard.
+        return state.missingReady &&
+               !state.missingLyrics.has(song.filename) &&
+               !state.missingVocals.has(song.filename);
+      },
+      run: function (song) {
+        // Server-only: /align is "here are the words, when are they sung", and the local engine
+        // has no equivalent entry point. Falling back to transcription would replace the user's
+        // lyrics with Whisper's guesses — precisely what they clicked re-align to avoid.
+        if (state.lyricsEngine !== 'remote') {
+          toast('Re-align needs a server',
+                'Re-aligning keeps your words and only fixes their timing, which needs a demucs/WhisperX server. The local engine can transcribe, but not re-align. Configure a server in Stem Splitter settings.',
+                'warn');
+          return;
+        }
+        enqueue('realign', song.filename).then(function (r) {
+          if (r && r.enqueued) toast('Re-align queued', song.filename);
+        });
+      },
+    });
   }
 
   // ── job queue rendering ────────────────────────────────────────────────────
@@ -257,7 +330,7 @@
 
       row.innerHTML =
         '<div class="ss-job-main">' +
-          '<span class="ss-pill ' + (j.kind === 'split' ? 'split' : 'transcribe') + '">' + j.kind + '</span>' +
+          '<span class="ss-pill ' + kindPill(j.kind) + '">' + esc(j.kind) + '</span>' +
           '<span class="name" title="' + esc(j.filename) + '">' + esc(label) +
           (failed ? '' : '<br><span class="msg">' + esc(j.message || '') + '</span>') + '</span>' +
           '<div class="ss-bar"><i style="width:' + pct + '%"></i></div>' +
