@@ -697,6 +697,51 @@ def check_update(config_dir: Path, ref: str | None = None) -> dict:
     }
 
 
+def _snapshot_source(config_dir: Path) -> Path | None:
+    """Copy the installed source aside so a failed update can be undone.
+
+    download_source() overwrites the tree in place, so without this the moment we discover the
+    new revision can't run here, the old working one is already gone — and the user is left with
+    a stopped server and a source that crash-loops. It's a few hundred KB; the insurance is free.
+
+    Returns None if the snapshot couldn't be taken; the update then proceeds without a safety
+    net (which is exactly the old behaviour) rather than refusing to run.
+    """
+    src = src_dir(config_dir)
+    if not src.is_dir():
+        return None
+    backup = src.with_name(src.name + ".bak")
+    try:
+        if backup.exists():
+            shutil.rmtree(backup, ignore_errors=True)
+        shutil.copytree(src, backup)
+        return backup
+    except OSError as e:
+        log.warning("stem_splitter: could not snapshot the server source (%s) - an update that "
+                    "fails will not be able to roll back", e)
+        return None
+
+
+def _restore_source(config_dir: Path, backup: Path | None) -> bool:
+    """Put the snapshot back. True if the old source is now on disk."""
+    if not backup or not backup.is_dir():
+        return False
+    src = src_dir(config_dir)
+    try:
+        if src.exists():
+            shutil.rmtree(src, ignore_errors=True)
+        shutil.copytree(backup, src)
+        return True
+    except OSError as e:
+        log.warning("stem_splitter: could not restore the previous server source: %s", e)
+        return False
+
+
+def _discard_snapshot(backup: Path | None) -> None:
+    if backup:
+        shutil.rmtree(backup, ignore_errors=True)
+
+
 def update_server(config_dir: Path, ref: str | None = None, port: int = DEFAULT_PORT,
                   device: str = "", model: str = DEFAULT_MODEL,
                   progress_cb: ProgressCB = None) -> dict:
@@ -733,6 +778,12 @@ def update_server(config_dir: Path, ref: str | None = None, port: int = DEFAULT_
         _emit(progress_cb, "Stopping the server…", 0.05, "Updating")
         stop_server(config_dir)
 
+    # download_source() overwrites the source tree IN PLACE, so by the time we discover the new
+    # revision needs a dependency this install doesn't have, the old — working — source is gone.
+    # The user is then stranded: their server is stopped, and the only source on disk is one that
+    # cannot run. Snapshot first. It's a few hundred KB.
+    backup = _snapshot_source(config_dir)
+
     try:
         _emit(progress_cb, "Fetching the latest server source…", 0.2, "Updating")
         # Scaled into [0.2, 0.75): download_source() reports its OWN 0→1, so forwarding our
@@ -751,9 +802,11 @@ def update_server(config_dir: Path, ref: str | None = None, port: int = DEFAULT_
         # click that was meant to fix something has instead taken the user's server away — a
         # strictly worse position than before they clicked, over a network blip.
         #
-        # Put it back, then report the failure. The source may be half-updated, but the
-        # launcher and drivers are regenerated from our own templates on every start, so
-        # whatever is on disk is startable.
+        # Put the OLD source back first (the fetch may have left a half-extracted tree), then
+        # restart, then report. The launcher and drivers are regenerated from our own templates
+        # on every start, so the restored tree is startable.
+        _restore_source(config_dir, backup)
+        _discard_snapshot(backup)
         if was_running:
             _emit(progress_cb, f"Update failed ({e}) — restarting the server as it was.",
                   0.9, "Updating")
@@ -780,15 +833,39 @@ def update_server(config_dir: Path, ref: str | None = None, port: int = DEFAULT_
         _emit(progress_cb, "Checking the updated server's dependencies…", 0.86, "Updating")
         verify_install(config_dir, progress_cb=None)
     except Exception as e:
-        _emit(progress_cb,
-              f"The updated server needs dependencies this install doesn't have ({e}). "
-              f"Click 'Install server + models' to refresh them. Not restarting, because a "
-              f"server that can't import its own deps would only crash-loop.",
-              1.0, "Needs reinstall")
-        st = server_status(config_dir)
-        st["updated"] = True
+        # The new source can't run here. Don't leave it on disk: rolling forward would strand the
+        # user with a stopped server and the only source on disk being one that crash-loops.
+        # Put the old source back and start it, so a failed update costs them nothing but time.
+        rolled_back = _restore_source(config_dir, backup)
+        restored = False
+        if rolled_back and was_running:
+            try:
+                start_server(config_dir, port=port, device=device, model=model,
+                             warmup=models_downloaded(config_dir), progress_cb=None)
+                restored = True
+            except Exception as restart_error:
+                log.warning("stem_splitter: rolled back the source but could not restart: %s",
+                            restart_error)
+
+        if rolled_back:
+            msg = (f"The new server revision needs dependencies this install doesn't have ({e}). "
+                   f"Rolled back to the previous revision"
+                   + (" and restarted it — nothing was lost. "
+                      if restored else " (it is stopped; use Start). ")
+                   + "Click 'Install server + models' to update the dependencies and try again.")
+        else:
+            msg = (f"The new server revision needs dependencies this install doesn't have ({e}), "
+                   f"and the previous source could not be restored. Click 'Install server + "
+                   f"models' to repair the install.")
+        _emit(progress_cb, msg, 1.0, "Needs reinstall")
+
+        st = server_status(config_dir, model=model)
+        st["updated"] = not rolled_back      # rolled back => the source is what it was
+        st["rolled_back"] = rolled_back
         st["needs_reinstall"] = True
         return st
+    finally:
+        _discard_snapshot(backup)
 
     after = str(source_meta(config_dir).get("commit") or "")
     # Compare FULL shas. Two different commits can share an 8-char prefix, and reporting
@@ -2006,7 +2083,16 @@ def _model_ready(warmup: dict, model: str) -> bool:
     return str(v) in ("ready", "skipped")
 
 
-def server_status(config_dir: Path) -> dict:
+def server_status(config_dir: Path, model: str = DEFAULT_MODEL) -> dict:
+    """Offline, cheap, and polled every few seconds.
+
+    `model` is the model the server was actually STARTED with. It defaults to DEFAULT_MODEL
+    for callers that don't know (nothing here can read the plugin's settings), but the route
+    passes the configured one — otherwise a user on a non-default model warms it fully and
+    models_ready stays false forever, because we'd be asking /health about a model the server
+    was never told to warm. The UI would never say "Warm · ready to split" and would keep
+    polling a server that is, in fact, ready.
+    """
     st = _read_state(config_dir)
     port = _as_port(st.get("port"), DEFAULT_PORT)
     running, live_port = is_running(config_dir, port)
@@ -2018,7 +2104,7 @@ def server_status(config_dir: Path) -> dict:
     if running:
         ok, health = server_health(url, timeout=2.0)
         if ok:
-            models_ready = _model_ready(health.get("warmup") or {}, DEFAULT_MODEL)
+            models_ready = _model_ready(health.get("warmup") or {}, model)
 
     manageable, manage_reason = can_manage(config_dir)
 

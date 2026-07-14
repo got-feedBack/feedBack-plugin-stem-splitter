@@ -276,6 +276,84 @@ class EveryLifecyclePathRunsTheSameServer(unittest.TestCase):
         self.assertEqual(seen.get("model"), "htdemucs")
 
 
+class AFailedUpdateLeavesNothingBroken(unittest.TestCase):
+    """download_source() overwrites the source tree IN PLACE.
+
+    So by the time verify_install() discovers the new revision needs a dependency this install
+    doesn't have, the old — working — source is already gone. The user is left with a stopped
+    server and the only source on disk being one that cannot run: strictly worse than never
+    having clicked, and not recoverable from the button they clicked. Snapshot, then roll back.
+    """
+
+    def _install(self, td, body="OLD"):
+        src = ds.src_dir(Path(td))
+        src.mkdir(parents=True, exist_ok=True)
+        (src / "server.py").write_text(body, encoding="utf-8")
+        return src
+
+    def _run(self, td, download, verify, was_running=True):
+        started = []
+        with mock.patch.object(ds, "installed", return_value=True), \
+             mock.patch.object(ds, "is_running", return_value=(was_running, 7865)), \
+             mock.patch.object(ds, "source_meta", return_value={"commit": "a" * 40}), \
+             mock.patch.object(ds, "stop_server"), \
+             mock.patch.object(ds, "download_source", side_effect=download), \
+             mock.patch.object(ds, "write_launcher"), \
+             mock.patch.object(ds, "patch_driver_scripts", return_value=[]), \
+             mock.patch.object(ds, "verify_install", side_effect=verify), \
+             mock.patch.object(ds, "models_downloaded", return_value=False), \
+             mock.patch.object(ds, "server_status", return_value={}), \
+             mock.patch.object(ds, "start_server",
+                               side_effect=lambda cfg, **kw: started.append(kw) or {}):
+            try:
+                out = ds.update_server(Path(td))
+            except Exception as e:
+                out = e
+        return out, started
+
+    def _overwrite(self, td):
+        def download(config_dir, ref=None, progress_cb=None):
+            (ds.src_dir(Path(td)) / "server.py").write_text("NEW", encoding="utf-8")
+        return download
+
+    def test_a_source_that_cannot_import_is_rolled_back(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = self._install(td)
+            out, started = self._run(
+                td, self._overwrite(td),
+                verify=lambda cfg, progress_cb=None: (_ for _ in ()).throw(RuntimeError("no sphn")))
+
+            self.assertEqual((src / "server.py").read_text(encoding="utf-8"), "OLD",
+                             "the working source must be back on disk — rolling forward strands "
+                             "the user with a server that only crash-loops")
+            self.assertTrue(out["rolled_back"])
+            self.assertTrue(out["needs_reinstall"])
+            self.assertFalse(out["updated"], "nothing was updated: we put it back")
+            self.assertEqual(len(started), 1, "the server it was running must be running again")
+
+    def test_a_failed_fetch_is_rolled_back_too(self):
+        # A half-extracted tree is the same trap as a source that can't import.
+        def half_extract(config_dir, ref=None, progress_cb=None):
+            (ds.src_dir(config_dir) / "server.py").write_text("HALF", encoding="utf-8")
+            raise RuntimeError("connection reset")
+
+        with tempfile.TemporaryDirectory() as td:
+            src = self._install(td)
+            out, started = self._run(td, half_extract, verify=lambda cfg, progress_cb=None: None)
+            self.assertIsInstance(out, RuntimeError)      # the failure is still reported
+            self.assertEqual((src / "server.py").read_text(encoding="utf-8"), "OLD")
+            self.assertEqual(len(started), 1)
+
+    def test_the_snapshot_is_cleaned_up_on_success(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = self._install(td)
+            self._run(td, self._overwrite(td), verify=lambda cfg, progress_cb=None: None)
+            self.assertEqual((src / "server.py").read_text(encoding="utf-8"), "NEW",
+                             "a successful update must actually update")
+            self.assertFalse(src.with_name(src.name + ".bak").exists(),
+                             "the snapshot must not be left behind")
+
+
 class CheckUpdateContract(unittest.TestCase):
     def test_unknown_is_present_even_when_github_is_unreachable(self):
         # A caller reading `unknown` to decide whether to offer an update to an install with no
