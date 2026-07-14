@@ -30,13 +30,24 @@ import demucs_server as ds  # noqa: E402
 class Cache:
     """Builds a cache dir with whichever weights you name."""
 
-    BIG = b"x" * (60 * 1024 * 1024)      # over _MIN_WEIGHT_BYTES
-    SMALL = b"x" * 1024                  # a partial download
-    # Distinguishable payloads. The never-clobber test compared SIZES of two files written
-    # with identical bytes — so it would have passed whether or not the destination was
-    # overwritten. A test that cannot fail on the bug it exists to catch is worse than none.
-    NEW = b"N" * (60 * 1024 * 1024)      # what is already at the destination
-    OLD = b"O" * (61 * 1024 * 1024)      # what sits in the old layout (different size AND byte)
+    # Sizes and marker bytes, not payloads. Materializing 60 MB byte strings at import cost
+    # ~180 MB resident for tests that only ever assert on size and first byte — enough to slow,
+    # or flake, a memory-constrained CI runner. write() writes the marker and truncates to
+    # length: same assertions, a sparse file, and nothing held in memory.
+    BIG = 60 * 1024 * 1024               # over _MIN_WEIGHT_BYTES
+    SMALL = 1024                         # a partial download
+    # Distinguishable. The never-clobber test compared SIZES of two files written with identical
+    # bytes — so it would have passed whether or not the destination was overwritten. A test that
+    # cannot fail on the bug it exists to catch is worse than none.
+    NEW, NEW_BYTE = 60 * 1024 * 1024, b"N"   # what is already at the destination
+    OLD, OLD_BYTE = 61 * 1024 * 1024, b"O"   # the old layout's copy (different size AND byte)
+
+    @staticmethod
+    def write(path: Path, size: int, marker: bytes = b"x") -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(marker)
+            f.truncate(size)
 
     def __init__(self, td, roformer=False, whisper=False, aligner=False, old_aligner=False,
                  empty_new_hub=False, whisper_shell=False, whisper_incomplete=False,
@@ -45,9 +56,8 @@ class Cache:
         c = ds.cache_dir(self.cfg)
         c.mkdir(parents=True, exist_ok=True)
         if roformer or tiny_roformer:
-            (c / "_roformer-models").mkdir(parents=True, exist_ok=True)
-            (c / "_roformer-models" / "BS-Roformer-SW.ckpt").write_bytes(
-                self.SMALL if tiny_roformer else self.BIG)
+            self.write(c / "_roformer-models" / "BS-Roformer-SW.ckpt",
+                       self.SMALL if tiny_roformer else self.BIG)
         if whisper or whisper_shell or whisper_incomplete:
             repo = c / "huggingface" / "hub" / "models--Systran--faster-whisper-medium"
             (repo / "blobs").mkdir(parents=True, exist_ok=True)
@@ -55,20 +65,18 @@ class Cache:
             rev = repo / "snapshots" / "08e178d4"
             rev.mkdir(parents=True, exist_ok=True)
             if whisper:                          # a completed download
-                (rev / "model.bin").write_bytes(self.BIG)
+                self.write(rev / "model.bin", self.BIG)
             if whisper_incomplete:               # interrupted: payload + a .incomplete marker
-                (rev / "model.bin").write_bytes(self.BIG)
-                (repo / "blobs" / "abc123.incomplete").write_bytes(self.SMALL)
+                self.write(rev / "model.bin", self.BIG)
+                self.write(repo / "blobs" / "abc123.incomplete", self.SMALL)
             # whisper_shell: the directory structure and nothing else — which is exactly what
             # huggingface_hub leaves behind the moment a download STARTS.
         if aligner:
-            d = c / "torch" / "hub" / "checkpoints"
-            d.mkdir(parents=True, exist_ok=True)
-            (d / "wav2vec2_fairseq_base_ls960_asr_ls960.pth").write_bytes(self.NEW)
+            self.write(c / "torch" / "hub" / "checkpoints" /
+                       "wav2vec2_fairseq_base_ls960_asr_ls960.pth", self.NEW, self.NEW_BYTE)
         if old_aligner:                       # the pre-move layout
-            d = c / "hub" / "checkpoints"
-            d.mkdir(parents=True, exist_ok=True)
-            (d / "wav2vec2_fairseq_base_ls960_asr_ls960.pth").write_bytes(self.OLD)
+            self.write(c / "hub" / "checkpoints" /
+                       "wav2vec2_fairseq_base_ls960_asr_ls960.pth", self.OLD, self.OLD_BYTE)
         if empty_new_hub:                     # torch/hub exists but is EMPTY
             (c / "torch" / "hub").mkdir(parents=True, exist_ok=True)
 
@@ -211,10 +219,11 @@ class MigrationWhenTheDestinationAlreadyExists(unittest.TestCase):
                     "wav2vec2_fairseq_base_ls960_asr_ls960.pth")
             ds._migrate_torch_home(cache)
 
-            data = dest.read_bytes()
-            self.assertEqual(len(data), len(Cache.NEW),
+            with open(dest, "rb") as f:
+                first = f.read(1)
+            self.assertEqual(dest.stat().st_size, Cache.NEW,
                              "the destination file must be the one that was already there")
-            self.assertEqual(data[:1], b"N",
+            self.assertEqual(first, Cache.NEW_BYTE,
                              "the old-layout file must NOT have overwritten it — this is the "
                              "file torch will actually use")
 
@@ -223,8 +232,7 @@ class MigrationWhenTheDestinationAlreadyExists(unittest.TestCase):
             c = Cache(td, aligner=True)
             cache = ds.cache_dir(c.cfg)
             old = cache / "hub" / "checkpoints"
-            old.mkdir(parents=True, exist_ok=True)
-            (old / "some_other_model.pth").write_bytes(Cache.BIG)
+            Cache.write(old / "some_other_model.pth", Cache.BIG)
             ds._migrate_torch_home(cache)
             self.assertTrue((cache / "torch" / "hub" / "checkpoints" /
                              "some_other_model.pth").is_file())

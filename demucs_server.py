@@ -438,9 +438,17 @@ def _big(p: Path) -> bool:
         return False
 
 
+# Every predicate below is BEST-EFFORT, like _big(): a walk over a cache dir can raise (a
+# half-written download, a permissions problem, the server's own TTL sweep deleting underneath
+# us). models_downloaded() gates start_server() and the routes, so an OSError escaping one of
+# these would take the whole server lifecycle down over one unreadable directory. "Can't read
+# it" must mean "can't count it", not "crash".
 def _has_roformer(cache: Path) -> bool:
-    d = cache / "_roformer-models"
-    return d.is_dir() and any(_big(f) for f in d.glob("*.ckpt"))
+    try:
+        d = cache / "_roformer-models"
+        return d.is_dir() and any(_big(f) for f in d.glob("*.ckpt"))
+    except OSError:
+        return False
 
 
 def _has_whisper(cache: Path) -> bool:
@@ -459,17 +467,23 @@ def _has_whisper(cache: Path) -> bool:
     symlink, so it writes the files straight into snapshots and leaves blobs EMPTY. A
     blobs-based check would report "missing" on every Windows install.)
     """
-    hub = cache / "huggingface" / "hub"
-    if not hub.is_dir():
+    try:
+        hub = cache / "huggingface" / "hub"
+        if not hub.is_dir():
+            return False
+        for repo in hub.glob("models--*faster-whisper*"):
+            try:
+                if any(repo.rglob("*.incomplete")):
+                    continue               # a download in progress, or an abandoned one
+                snaps = repo / "snapshots"
+                if not snaps.is_dir():
+                    continue
+                if any(_big(rev / "model.bin") for rev in snaps.iterdir() if rev.is_dir()):
+                    return True
+            except OSError:
+                continue                   # this one repo dir is unreadable; try the next
+    except OSError:
         return False
-    for repo in hub.glob("models--*faster-whisper*"):
-        if any(repo.rglob("*.incomplete")):
-            continue                       # a download in progress, or an abandoned one
-        snaps = repo / "snapshots"
-        if not snaps.is_dir():
-            continue
-        if any(_big(rev / "model.bin") for rev in snaps.iterdir() if rev.is_dir()):
-            return True
     return False
 
 
@@ -481,9 +495,12 @@ def _has_aligner(cache: Path) -> bool:
     _server_env for why that moved. An existing install has the old layout and must not be
     told its weights are missing just because we moved the goalposts.
     """
-    for hub in (cache / "torch" / "hub" / "checkpoints", cache / "hub" / "checkpoints"):
-        if hub.is_dir() and any(_big(f) for f in hub.glob("wav2vec2*")):
-            return True
+    try:
+        for hub in (cache / "torch" / "hub" / "checkpoints", cache / "hub" / "checkpoints"):
+            if hub.is_dir() and any(_big(f) for f in hub.glob("wav2vec2*")):
+                return True
+    except OSError:
+        pass
     return False
 
 
