@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.4.1
+
+### Getting to the queue
+
+- **The "queued" toast is now a door.** ([#18](https://github.com/got-feedBack/feedBack-plugin-stem-splitter/issues/18))
+  Click it and you land in the queue. The moment you start a job is exactly the moment you want
+  to watch it, and the toast was the one thing on screen that knew about it — and did nothing.
+
+  Only the *queued* toasts navigate. The rest stay inert on purpose: a toast that jumps you
+  somewhere when you only meant to dismiss it is worse than one that does nothing.
+
+- **A queue button in Settings**, with a live count of running and queued jobs. The queue screen
+  already had a Settings button; this is that door from the other side. A user who has just
+  finished configuring a server wants to watch it work, and previously had to go hunting for the
+  way back.
+
 ## 0.4.0
 
 ### Re-align lyrics to vocals

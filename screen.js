@@ -70,14 +70,41 @@
   function kindNoun(kind) { return (KIND[kind] || KIND.transcribe).noun; }
   function kindPill(kind) { return (KIND[kind] || KIND.transcribe).pill; }
 
-  function toast(title, message, accent) {
+  // Take the user to the queue. The plugin's own screen IS the queue, so this is just
+  // navigation — but it has to work from the library, from settings, and from a toast, which is
+  // three different places the user can be standing when they wonder where their job went.
+  function openQueue() {
+    if (fb && fb.navigate) fb.navigate(SCREEN_ID);
+    else if (window.showScreen) window.showScreen(SCREEN_ID);
+  }
+
+  function toast(title, message, accent, onClick) {
     try {
       if (window.fbNotify && window.fbNotify.show) {
-        window.fbNotify.show({ title: title, message: message || '', accent: accent || 'info' });
-        return;
+        // show() hands back the card, and its only built-in handler is dismiss-on-click. So a
+        // click can carry us somewhere useful AND still dismiss — the two listeners coexist.
+        var card = window.fbNotify.show({
+          title: title,
+          message: message || '',
+          accent: accent || 'info',
+        });
+        if (card && onClick) {
+          card.style.cursor = 'pointer';
+          card.title = 'Open the Stem Splitter queue';
+          card.addEventListener('click', onClick);
+        }
+        return card;
       }
     } catch (e) {}
     console.log('[stem_splitter]', title, message || '');
+    return null;
+  }
+
+  // "Queued" toasts are the moment the user most wants the queue: they just started something and
+  // want to watch it. Every other toast stays inert — a toast that navigates when you only meant
+  // to dismiss it is worse than one that does nothing.
+  function queuedToast(title, message) {
+    return toast(title, (message || '') + ' — click to open the queue', 'info', openQueue);
   }
 
   function api(path, opts) {
@@ -247,7 +274,7 @@
       run: function (song) {
         if (!state.splitEngine) { toast('No split engine', 'Open Stem Splitter settings to configure a server or download a local engine.', 'warn'); return; }
         enqueue('split', song.filename).then(function (r) {
-          if (r && r.enqueued) toast('Split queued', song.filename);
+          if (r && r.enqueued) queuedToast('Split queued', song.filename);
         });
       },
     });
@@ -262,7 +289,7 @@
       run: function (song) {
         if (!state.lyricsEngine) { toast('No lyrics engine', 'Open Stem Splitter settings to configure a server or download whisperx.', 'warn'); return; }
         enqueue('transcribe', song.filename).then(function (r) {
-          if (r && r.enqueued) toast('Transcription queued', song.filename);
+          if (r && r.enqueued) queuedToast('Transcription queued', song.filename);
         });
       },
     });
@@ -300,7 +327,7 @@
           return;
         }
         enqueue('realign', song.filename).then(function (r) {
-          if (r && r.enqueued) toast('Re-align queued', song.filename);
+          if (r && r.enqueued) queuedToast('Re-align queued', song.filename);
         });
       },
     });
