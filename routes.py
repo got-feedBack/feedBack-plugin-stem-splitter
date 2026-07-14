@@ -1003,10 +1003,19 @@ def setup(app: FastAPI, context: dict) -> None:
             # doesn't finish, the server sees its parent die moments later and reaps itself
             # and its workers. The hook is a fast path, not the guarantee — so it gets a
             # short leash.
-            done = threading.Thread(
-                target=lambda: demucs_server.stop_server(mgr.config_dir),
-                name="stem_splitter-shutdown-stop", daemon=True,
-            )
+            def _stop() -> None:
+                # The thread's exception would otherwise vanish into threading's default
+                # handler while the app is tearing down its logging — i.e. exactly when it is
+                # least likely to be seen. If stopping the server fails, that is worth a line:
+                # the watchdog will still reap it, but a repeated failure here is a signal.
+                try:
+                    demucs_server.stop_server(mgr.config_dir)
+                except Exception as e:
+                    log.warning("stem_splitter: stopping the managed server failed: %s "
+                                "(the launcher's watchdog will still reap it)", e)
+
+            done = threading.Thread(target=_stop, name="stem_splitter-shutdown-stop",
+                                    daemon=True)
             done.start()
             done.join(timeout=3.0)
             if done.is_alive():

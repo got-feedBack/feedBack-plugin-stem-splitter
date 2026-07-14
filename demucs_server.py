@@ -539,7 +539,44 @@ os.chdir(HERE)
 # and a crash runs no handlers at all. So the responsibility is inverted — the server
 # watches its parent and exits when the parent goes away. That works for a graceful quit, a
 # crash, a task-kill, and a power-user's `taskkill /F` alike.
-GRACE = 5.0     # seconds a worker gets on SIGTERM before it is killed outright
+GRACE = 5.0     # seconds a worker gets to exit on SIGTERM before it is killed outright
+
+
+def _descendants(pid):
+    """Every process descended from `pid`, via ps. No psutil (a plugin cannot add deps).
+
+    `ps -Ao pid=,ppid=` works on Linux and macOS alike.
+    """
+    try:
+        out = subprocess.run(["ps", "-Ao", "pid=,ppid="],
+                             capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return []
+    children = {{}}      # NB: doubled — this file is a .format() template
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        try:
+            child, parent = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        children.setdefault(parent, []).append(child)
+
+    found, stack = [], [pid]
+    while stack:
+        for kid in children.get(stack.pop(), []):
+            found.append(kid)
+            stack.append(kid)
+    return found
+
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
 
 
 def _die():
@@ -552,35 +589,36 @@ def _die():
             subprocess.run(["taskkill", "/PID", str(os.getpid()), "/T", "/F"],
                            capture_output=True, timeout=15)
         else:
-            # We were started with start_new_session, so this group is OURS alone —
-            # signalling it cannot touch the app.
+            # Signal the CHILDREN directly — never the process group.
             #
-            # Two things this has to get right:
+            # killpg would be tidier, but it signals every member of the group INCLUDING this
+            # process, so we would have to ignore SIGTERM in ourselves first... and
+            # signal.signal() may only be called from the main thread. This runs on the
+            # watchdog THREAD, so that call raises ValueError, the broad `except` swallows it,
+            # and we fall straight through to os._exit() having killed nothing at all. The
+            # workers survive — the exact leak this exists to prevent, silently, on POSIX only.
             #
-            # 1. Ignore SIGTERM in OURSELVES first. killpg signals every member of the group,
-            #    which includes this process — with the default handler we would die on our
-            #    own signal and never escalate, which is the entire reason we are here.
-            #
-            # 2. Escalate. A lone SIGTERM followed by an immediate exit is not a kill, it is a
-            #    request: a worker deep inside a torch inference can be slow to act on it, or
-            #    ignore it. If we exit at that moment there is nobody left to insist, and the
-            #    worker is orphaned — the exact leak this fix exists to close, moved down one
-            #    generation.
-            signal.signal(signal.SIGTERM, signal.SIG_IGN)
-            pgid = os.getpgid(0)
-            try:
-                os.killpg(pgid, signal.SIGTERM)
-            except Exception:
-                pass
-            # A fixed grace, deliberately: we cannot poll "is the group empty yet?" because we
-            # are IN the group, so it never is. The app is already gone and nothing is waiting
-            # on us, so a few seconds of patience costs nobody anything and lets a worker close
-            # its files.
-            time.sleep(GRACE)
-            try:
-                os.killpg(pgid, signal.SIGKILL)     # takes us with it, which is the point
-            except Exception:
-                pass
+            # Enumerating descendants avoids signals-to-self entirely and works from any
+            # thread.
+            kids = _descendants(os.getpid())
+            for kid in kids:
+                try:
+                    os.kill(kid, signal.SIGTERM)
+                except OSError:
+                    pass
+
+            # Give them GRACE to close their files, then insist. A worker deep in a torch
+            # inference can be slow to act on SIGTERM, and a lone SIGTERM followed by our exit
+            # is a request, not a kill.
+            deadline = time.time() + GRACE
+            while time.time() < deadline and any(_alive(k) for k in kids):
+                time.sleep(0.25)
+            for kid in kids:
+                if _alive(kid):
+                    try:
+                        os.kill(kid, signal.SIGKILL)
+                    except OSError:
+                        pass
     except Exception:
         pass
     os._exit(1)
