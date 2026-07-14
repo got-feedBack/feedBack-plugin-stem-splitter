@@ -553,13 +553,26 @@ class JobManager:
             return None
         if not self.local_server_url():
             return None   # a real remote server: not ours to set up
-        if demucs_server.models_downloaded(self.config_dir):
+        missing = demucs_server.missing_models(self.config_dir)
+        if not missing:
             return None
+        # Name them. "Its models aren't downloaded" reads as "nothing is downloaded" to someone
+        # who already paid for a 2 GB fetch once, and it hides the common case: everything is
+        # there except the aligner the old sweeper ate.
+        # Size what is ACTUALLY about to be fetched. A flat "~2 GB" overstates the aligner-only
+        # case — the one this release exists to fix — by 5×, and 2 GB is exactly the number that
+        # makes someone click Cancel on a 360 MB download.
+        size = demucs_server.download_size(missing)
         return {
             "needs_setup": True,
-            "message": "The local demucs server is running, but its models "
-                       "haven't been downloaded yet (~2 GB, one time). "
-                       "Download them now?",
+            "missing": missing,
+            "size": size,
+            # No "one time" — the server's own 24h cache sweeper can still delete the
+            # roformer checkpoint until the install picks up the upstream fix (Check for
+            # update, 0.3.3), and a user who was promised "one time" and then watched it
+            # re-download would be right to conclude we were lying to them.
+            "message": f"The local demucs server is running, but it still needs "
+                       f"{', '.join(missing)} ({size}). Download now?",
         }
 
 

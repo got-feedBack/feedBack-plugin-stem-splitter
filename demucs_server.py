@@ -412,15 +412,232 @@ def models_downloaded(config_dir: Path) -> bool:
     weights we already have is a RAM load (fine at launch); warming up weights we
     DON'T have would pull ~2 GB (never at launch).
 
-    We key off the roformer checkpoint because ``bs_roformer_sw`` is the model the
-    plugin actually splits with.
+    It used to key off the roformer checkpoint ALONE, reasoning that bs_roformer_sw is the
+    model we split with. That was wrong: warmup does not warm only the model we split with —
+    it warms whisperx and its wav2vec2 aligner too. So an install with the checkpoint but no
+    aligner reported "downloaded", started WITH warmup, and the server quietly pulled 361 MB
+    while the user watched the app open. Reported in the wild, and rightly.
+
+    So: all of them, or none of them. If anything is missing we start with --skip-warmup and
+    nothing is fetched until the user explicitly asks for it.
     """
-    roformer = cache_dir(config_dir) / "_roformer-models"
-    if roformer.is_dir() and any(roformer.glob("*.ckpt")):
-        return True
-    # Fall back to a demucs torch-hub checkpoint (TORCH_HOME -> cache/).
-    hub = cache_dir(config_dir) / "hub" / "checkpoints"
-    return hub.is_dir() and any(hub.glob("*.th"))
+    cache = cache_dir(config_dir)
+    return _has_roformer(cache) and _has_whisper(cache) and _has_aligner(cache)
+
+
+# A model file that exists but is TINY is a partial download, not a model. Every check below
+# requires plausible size as well as presence: "the file is there" is not the same claim as
+# "the weights are on disk", and the whole point of this gate is to promise the second one.
+_MIN_WEIGHT_BYTES = 50 * 1024 * 1024        # 50 MB — all three of these are 350 MB+
+
+
+def _big(p: Path) -> bool:
+    try:
+        return p.is_file() and p.stat().st_size >= _MIN_WEIGHT_BYTES
+    except OSError:
+        return False
+
+
+# Every predicate below is BEST-EFFORT, like _big(): a walk over a cache dir can raise (a
+# half-written download, a permissions problem, the server's own TTL sweep deleting underneath
+# us). models_downloaded() gates start_server() and the routes, so an OSError escaping one of
+# these would take the whole server lifecycle down over one unreadable directory. "Can't read
+# it" must mean "can't count it", not "crash".
+def _has_roformer(cache: Path) -> bool:
+    try:
+        d = cache / "_roformer-models"
+        return d.is_dir() and any(_big(f) for f in d.glob("*.ckpt"))
+    except OSError:
+        return False
+
+
+def _has_whisper(cache: Path) -> bool:
+    """The faster-whisper ASR snapshot, under HF_HOME.
+
+    NOT just "the models--org--repo directory exists". huggingface_hub creates that structure
+    (blobs/refs/snapshots) when the download BEGINS, so an interrupted fetch leaves the
+    directory behind — and a presence check would then report the weights as downloaded, start
+    the server WITH warmup, and have it resume the download at launch. Precisely the silent
+    startup fetch this gate exists to prevent, now with an empty shell to make it look fine.
+
+    So require the actual payload: a snapshot revision holding a plausibly-sized model.bin, and
+    no `.incomplete` markers anywhere in the repo dir.
+
+    (Read model.bin out of `snapshots/`, not `blobs/`: on Windows, huggingface_hub cannot
+    symlink, so it writes the files straight into snapshots and leaves blobs EMPTY. A
+    blobs-based check would report "missing" on every Windows install.)
+    """
+    try:
+        hub = cache / "huggingface" / "hub"
+        if not hub.is_dir():
+            return False
+        for repo in hub.glob("models--*faster-whisper*"):
+            try:
+                if any(repo.rglob("*.incomplete")):
+                    continue               # a download in progress, or an abandoned one
+                snaps = repo / "snapshots"
+                if not snaps.is_dir():
+                    continue
+                if any(_big(rev / "model.bin") for rev in snaps.iterdir() if rev.is_dir()):
+                    return True
+            except OSError:
+                continue                   # this one repo dir is unreadable; try the next
+    except OSError:
+        return False
+    return False
+
+
+def _aligner_under(torch_home: Path) -> bool:
+    """Is the wav2vec2 aligner present for a torch that runs with this TORCH_HOME?
+
+    torch.hub reads and writes ``$TORCH_HOME/hub/checkpoints``, so this answers the only
+    question that matters at launch: given this TORCH_HOME, will torch find the file — or
+    fetch it?
+    """
+    d = torch_home / "hub" / "checkpoints"
+    return d.is_dir() and any(_big(f) for f in d.glob("wav2vec2*"))
+
+
+def torch_home(cache: Path) -> Path:
+    """Which TORCH_HOME the server should run with.
+
+    Normally `cache/torch` (see _server_env for why it moved there). But _migrate_torch_home()
+    is best-effort — a locked file or a permissions problem leaves the aligner in the OLD layout
+    while TORCH_HOME points at the new one. _has_aligner() accepts either layout, so we'd report
+    the weights as present, start WITH warmup, and torch — looking only under the new
+    TORCH_HOME — would find nothing and pull 361 MB at launch. The exact silent startup download
+    this module promises never to do, arrived at through the failure path of the fix for it.
+
+    So: if the aligner is only in the old layout, run THIS server on the old TORCH_HOME. Slightly
+    worse (the old location is what the pre-fix sweeper eats), and strictly better than a
+    download the user didn't ask for. The migration is retried on every start, so a transient
+    lock heals itself on the next one.
+    """
+    new = cache / "torch"
+    try:
+        if _aligner_under(new) or not _aligner_under(cache):
+            return new
+        return cache               # the aligner is ONLY in the old layout: don't refetch it
+    except OSError:
+        return new
+
+
+def _has_aligner(cache: Path) -> bool:
+    """whisperx's wav2vec2 forced aligner, fetched through torch.hub.
+
+    Checks BOTH layouts. TORCH_HOME used to be the cache ROOT (so torch wrote to
+    ``cache/hub/``) and is now ``cache/torch`` (so it writes to ``cache/torch/hub/``) — see
+    _server_env for why that moved. An existing install has the old layout and must not be
+    told its weights are missing just because we moved the goalposts.
+    """
+    try:
+        for home in (cache / "torch", cache):
+            if _aligner_under(home):
+                return True
+    except OSError:
+        pass
+    return False
+
+
+def _migrate_torch_home(cache: Path) -> None:
+    """Move an old `cache/hub` to `cache/torch/hub`, once.
+
+    TORCH_HOME moved from the cache root to `cache/torch` so the sweeper stops eating the
+    aligner. Simply pointing torch at the new path would make it not find the 361 MB file and
+    download it again — re-downloading a file we already have, in a change whose entire
+    purpose is to stop re-downloading files we already have.
+
+    So move it instead. Same volume, so it's a rename: instant, and no bytes cross the wire.
+    """
+    old, new = cache / "hub", cache / "torch" / "hub"
+    if not old.is_dir():
+        return
+
+    try:
+        if not new.exists():
+            # Fast path: nothing at the destination, so move the whole tree in one rename.
+            new.parent.mkdir(parents=True, exist_ok=True)
+            old.rename(new)
+            log.info("stem_splitter: moved torch hub cache %s -> %s (keeps the sweeper off it)",
+                     old, new)
+            return
+
+        # The destination EXISTS. Bailing out here was a bug: `cache/torch/hub` can exist and be
+        # empty (an earlier run created it, or torch touched it), while the 361 MB aligner is
+        # still only in the old location. _has_aligner() accepts the old layout, so we would
+        # report the weights as present, start WITH warmup, and torch — looking under the NEW
+        # TORCH_HOME — would find nothing and re-download it at launch. The exact thing this
+        # change exists to stop, in the one case the fast path skips.
+        #
+        # So merge instead of bailing, and never clobber: a file that already exists at the
+        # destination is the one torch will use.
+        moved = 0
+        for src in old.rglob("*"):
+            if not src.is_file():
+                continue
+            dest = new / src.relative_to(old)
+            if dest.exists():
+                continue
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            src.replace(dest)
+            moved += 1
+        if moved:
+            log.info("stem_splitter: merged %d file(s) from %s into %s", moved, old, new)
+
+        # Tidy up whatever is left of the old tree (it may still hold files we deliberately
+        # did not clobber; rmdir only removes it if it is genuinely empty).
+        for d in sorted((p for p in old.rglob("*") if p.is_dir()), reverse=True):
+            try:
+                d.rmdir()
+            except OSError:
+                pass
+        try:
+            old.rmdir()
+        except OSError:
+            pass
+    except OSError as e:
+        # Not fatal, and NOT a re-download: torch_home() notices the aligner is still in the old
+        # layout and runs this server on the old TORCH_HOME rather than pointing torch somewhere
+        # the file isn't. The move is retried on the next start. Log it anyway — the fallback
+        # leaves the aligner where the pre-fix sweeper can still eat it.
+        log.warning("stem_splitter: could not move %s to %s (%s) - using the old TORCH_HOME for "
+                    "this run so the aligner is not re-downloaded; will retry on next start",
+                    old, new, e)
+
+
+def missing_models(config_dir: Path) -> list[str]:
+    """Which of them are absent — so the UI can name them, instead of saying 'not ready'."""
+    cache = cache_dir(config_dir)
+    out: list[str] = []
+    if not _has_roformer(cache):
+        out.append("bs_roformer_sw")
+    if not _has_whisper(cache):
+        out.append("whisperx")
+    if not _has_aligner(cache):
+        out.append("whisperx aligner")
+    return out
+
+
+# Approximate download size per model, MB. Only used to size the prompt — the point is the
+# ORDER OF MAGNITUDE, so the user can tell "grab a coffee" from "this is quick".
+_MODEL_MB = {
+    "bs_roformer_sw": 700,       # BS-Roformer-SW.ckpt
+    "whisperx": 1500,            # faster-whisper medium
+    "whisperx aligner": 360,     # wav2vec2 forced aligner
+}
+
+
+def download_size(missing: list[str]) -> str:
+    """Human-readable estimate for what's actually about to be fetched.
+
+    The prompt used to hard-code "~2 GB" no matter what was missing. In the case this release
+    is about — everything present except the 361 MB aligner the sweeper ate — that overstates
+    the download by 5×, which is exactly the number that makes someone click Cancel.
+    """
+    mb = sum(_MODEL_MB.get(m, 0) for m in missing)
+    if mb >= 1000:
+        return f"~{mb / 1000:.1f} GB".replace(".0 GB", " GB")
+    return f"~{mb} MB"
 
 
 # ── download + install (explicit, heavy) ─────────────────────────────────────
@@ -1147,8 +1364,31 @@ def _server_env(config_dir: Path) -> dict:
 
     cache = cache_dir(config_dir)
     cache.mkdir(parents=True, exist_ok=True)
+    _migrate_torch_home(cache)
+
     env["SLOPSMITH_DEMUCS_CACHE"] = str(cache)
-    env["TORCH_HOME"] = str(cache)
+    # TORCH_HOME = cache/torch, NOT the cache root.
+    #
+    # torch.hub writes to $TORCH_HOME/hub, so pointing it at the root put the 361 MB wav2vec2
+    # aligner in `cache/hub/`. The server's cache sweeper protects model dirs with a
+    # blacklist — {"torch", "huggingface", "locale"} — and `hub` is not on it, so the sweeper
+    # deleted the aligner every 24 hours and the next start silently re-downloaded it.
+    #
+    # The sweeper is being fixed upstream to only delete things that LOOK like stem caches,
+    # but that fix ships in server.py, which is downloaded at INSTALL time — so it cannot
+    # reach anyone who already installed. Landing the aligner under `torch/` fixes those
+    # users too, because every server version, old and new, preserves that name. It also
+    # matches what the container's compose file already does.
+    #
+    # No re-download: _migrate_torch_home() (called just above) MOVES the existing file into
+    # the new layout — a rename on the same volume, so nothing crosses the wire. _has_aligner()
+    # also still accepts the old location, so nothing reports "missing" mid-migration.
+    #
+    # And if that move FAILS (a locked file, a permissions problem), torch_home() hands back the
+    # OLD layout for this run rather than pointing torch somewhere the file isn't — because the
+    # alternative is a 361 MB fetch at launch, which is the one thing this module promises never
+    # to do. The migration retries on the next start.
+    env["TORCH_HOME"] = str(torch_home(cache))
     env["HF_HOME"] = str(cache / "huggingface")
     env["HUGGINGFACE_HUB_CACHE"] = str(cache / "huggingface" / "hub")
     env.setdefault("PYTHONUNBUFFERED", "1")
