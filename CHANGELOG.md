@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.3.4
+
+### Fixes
+
+- **A failed job now says why it failed.** ([#16](https://github.com/got-feedBack/feedBack-plugin-stem-splitter/issues/16))
+  The error line lived inside the job title's span, which is `nowrap` + `overflow:hidden` +
+  `text-overflow:ellipsis` — so the message was clipped to one line and the part explaining
+  *why* was exactly the part that got cut. The user could see that something had failed and
+  nothing about what.
+
+  A failed job now gets its own full-width block: wrapped, monospaced, scrollable if it's a
+  traceback, selectable, and with a **Copy** button — because where these end up is a bug report.
+  (The copy path falls back to `execCommand` on a plain-http origin, where `navigator.clipboard`
+  doesn't exist — which is exactly the NAS install whose users most need to paste an error.)
+
+- **Server error bodies are no longer cut off at 300 characters.** The bodies carrying the most
+  diagnosis are the ones that don't fit: a multi-field validation error, a 500 with a traceback
+  (where the *last* line is the answer), an HTML error page from a reverse proxy. They're kept
+  whole up to 4000 chars, and when a body genuinely has to be cut, it now says so and says how
+  much there was. A silently cut error is how "the error is truncated" becomes the bug report
+  instead of the actual bug.
+
 ## 0.3.3
 
 ### Update server

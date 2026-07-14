@@ -259,6 +259,27 @@ def _get_authed(url: str, server_url: str, headers: dict | None, timeout: float)
 
 # ── Engines ──────────────────────────────────────────────────────────────────
 
+# How much of a server error body to keep.
+#
+# 300 chars was enough for "Internal Server Error" and nothing else. A FastAPI 422 answers with a
+# JSON validation body naming the field it rejected — which is THE piece of information that
+# explains the failure — and it did not fit, so the queue showed a truncated error that said a
+# request had failed without saying why. A user reported exactly that (#16), and the underlying
+# bug (#17) stayed invisible behind the ellipsis.
+#
+# The cap exists so a server that answers with a 2 MB HTML error page can't push a novel into
+# the job record. 4000 chars holds any real API error whole.
+_MAX_ERR_BODY = 4000
+
+
+def _err_body(resp) -> str:
+    """The server's error body, whole if it plausibly is one, and marked when it isn't."""
+    text = resp.text or ""
+    if len(text) <= _MAX_ERR_BODY:
+        return text.strip()
+    return text[:_MAX_ERR_BODY].strip() + f"\n… [truncated, {len(text)} chars total]"
+
+
 def _run_remote(mix: Path, out_dir: Path, model: str, server_url: str,
                 api_key: str | None, stems: tuple[str, ...],
                 progress_cb: ProgressCB, cancel_cb: CancelCB = None) -> Path:
@@ -317,7 +338,7 @@ def _run_remote(mix: Path, out_dir: Path, model: str, server_url: str,
         code = resp.status_code if resp is not None else "no response"
         body = ""
         if resp is not None:
-            body = resp.text[:300]
+            body = _err_body(resp)
             # Read the body first, then hand the connection back to the pool. Raising
             # with the response still open holds it out of the pool until GC — and a
             # batch that exhausts the retries on 503 does this once per song.
@@ -345,12 +366,12 @@ def _run_remote(mix: Path, out_dir: Path, model: str, server_url: str,
                 # decode error; surface what actually happened instead.
                 raise RuntimeError(
                     f"split server job poll failed ({jresp.status_code}): "
-                    f"{jresp.text[:200]}")
+                    f"{_err_body(jresp)}")
             try:
                 jr = jresp.json()
             except ValueError as e:
                 raise RuntimeError(
-                    f"split server returned a non-JSON job response: {jresp.text[:200]}"
+                    f"split server returned a non-JSON job response: {_err_body(jresp)}"
                 ) from e
             status = jr.get("status")
             if status == "complete":
