@@ -17,10 +17,11 @@ song:
   could do.
 """
 import json
-from pathlib import Path
 import os
 import sys
 import unittest
+from contextlib import ExitStack
+from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -218,12 +219,16 @@ class TheWordsAreVerifiedNotAssumed(unittest.TestCase):
         manifest = {"lyrics": "lyrics.json",
                     "stems": [{"id": "vocals", "file": "stems/vocals.ogg"}]}
         lyrics = json.dumps([{"t": 0, "d": 1, "w": "hello"}]).encode()
-        with mock.patch.object(
-                realign.pak_io, "read_manifest", return_value=manifest),              mock.patch.object(
-                realign.pak_io, "read_member_bytes", return_value=lyrics),              mock.patch.object(
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(
+                realign.pak_io, "read_manifest", return_value=manifest))
+            stack.enter_context(mock.patch.object(
+                realign.pak_io, "read_member_bytes", return_value=lyrics))
+            stack.enter_context(mock.patch.object(
                 realign, "align_vocals_remote",
-                return_value=[{"t": 0.0, "d": 1.0, "w": "goodbye"}]),              mock.patch.object(
-                realign.pak_io, "repack") as repack:
+                return_value=[{"t": 0.0, "d": 1.0, "w": "goodbye"}]))
+            repack = stack.enter_context(mock.patch.object(realign.pak_io, "repack"))
+
             with self.assertRaises(RuntimeError):
                 realign.realign_pak("song.sloppak", server_url="http://s")
         repack.assert_not_called()
@@ -248,10 +253,19 @@ class WhatLandsInThePakKeepsEveryWord(unittest.TestCase):
             path = (add_files or {})["lyrics.json"]
             written["lyrics"] = json.loads(Path(path).read_text(encoding="utf-8"))
 
-        with mock.patch.object(realign.pak_io, "read_manifest", return_value=manifest),              mock.patch.object(realign.pak_io, "read_member_bytes",
-                               side_effect=[json.dumps(tokens).encode(), b"audio"]),              mock.patch.object(realign, "align_vocals_remote",
-                               return_value=[{"t": 10.0, "d": 0.4, "w": "hold"},
-                                             {"t": 11.0, "d": 0.6, "w": "closer"}]),              mock.patch.object(realign.pak_io, "repack", side_effect=capture):
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(
+                realign.pak_io, "read_manifest", return_value=manifest))
+            stack.enter_context(mock.patch.object(
+                realign.pak_io, "read_member_bytes",
+                side_effect=[json.dumps(tokens).encode(), b"audio"]))
+            stack.enter_context(mock.patch.object(
+                realign, "align_vocals_remote",
+                return_value=[{"t": 10.0, "d": 0.4, "w": "hold"},
+                              {"t": 11.0, "d": 0.6, "w": "closer"}]))
+            stack.enter_context(mock.patch.object(
+                realign.pak_io, "repack", side_effect=capture))
+
             self.assertTrue(realign.realign_pak("song.sloppak", server_url="http://s"))
 
         got = [tok["w"] for tok in written["lyrics"]]
