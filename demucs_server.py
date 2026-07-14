@@ -425,15 +425,52 @@ def models_downloaded(config_dir: Path) -> bool:
     return _has_roformer(cache) and _has_whisper(cache) and _has_aligner(cache)
 
 
+# A model file that exists but is TINY is a partial download, not a model. Every check below
+# requires plausible size as well as presence: "the file is there" is not the same claim as
+# "the weights are on disk", and the whole point of this gate is to promise the second one.
+_MIN_WEIGHT_BYTES = 50 * 1024 * 1024        # 50 MB — all three of these are 350 MB+
+
+
+def _big(p: Path) -> bool:
+    try:
+        return p.is_file() and p.stat().st_size >= _MIN_WEIGHT_BYTES
+    except OSError:
+        return False
+
+
 def _has_roformer(cache: Path) -> bool:
     d = cache / "_roformer-models"
-    return d.is_dir() and any(d.glob("*.ckpt"))
+    return d.is_dir() and any(_big(f) for f in d.glob("*.ckpt"))
 
 
 def _has_whisper(cache: Path) -> bool:
-    """The faster-whisper ASR snapshot, under HF_HOME."""
+    """The faster-whisper ASR snapshot, under HF_HOME.
+
+    NOT just "the models--org--repo directory exists". huggingface_hub creates that structure
+    (blobs/refs/snapshots) when the download BEGINS, so an interrupted fetch leaves the
+    directory behind — and a presence check would then report the weights as downloaded, start
+    the server WITH warmup, and have it resume the download at launch. Precisely the silent
+    startup fetch this gate exists to prevent, now with an empty shell to make it look fine.
+
+    So require the actual payload: a snapshot revision holding a plausibly-sized model.bin, and
+    no `.incomplete` markers anywhere in the repo dir.
+
+    (Read model.bin out of `snapshots/`, not `blobs/`: on Windows, huggingface_hub cannot
+    symlink, so it writes the files straight into snapshots and leaves blobs EMPTY. A
+    blobs-based check would report "missing" on every Windows install.)
+    """
     hub = cache / "huggingface" / "hub"
-    return hub.is_dir() and any(hub.glob("models--*faster-whisper*"))
+    if not hub.is_dir():
+        return False
+    for repo in hub.glob("models--*faster-whisper*"):
+        if any(repo.rglob("*.incomplete")):
+            continue                       # a download in progress, or an abandoned one
+        snaps = repo / "snapshots"
+        if not snaps.is_dir():
+            continue
+        if any(_big(rev / "model.bin") for rev in snaps.iterdir() if rev.is_dir()):
+            return True
+    return False
 
 
 def _has_aligner(cache: Path) -> bool:
@@ -445,7 +482,7 @@ def _has_aligner(cache: Path) -> bool:
     told its weights are missing just because we moved the goalposts.
     """
     for hub in (cache / "torch" / "hub" / "checkpoints", cache / "hub" / "checkpoints"):
-        if hub.is_dir() and any(hub.glob("wav2vec2*")):
+        if hub.is_dir() and any(_big(f) for f in hub.glob("wav2vec2*")):
             return True
     return False
 
@@ -461,13 +498,51 @@ def _migrate_torch_home(cache: Path) -> None:
     So move it instead. Same volume, so it's a rename: instant, and no bytes cross the wire.
     """
     old, new = cache / "hub", cache / "torch" / "hub"
-    if not old.is_dir() or new.exists():
+    if not old.is_dir():
         return
+
     try:
-        new.parent.mkdir(parents=True, exist_ok=True)
-        old.rename(new)
-        log.info("stem_splitter: moved torch hub cache %s -> %s (keeps the sweeper off it)",
-                 old, new)
+        if not new.exists():
+            # Fast path: nothing at the destination, so move the whole tree in one rename.
+            new.parent.mkdir(parents=True, exist_ok=True)
+            old.rename(new)
+            log.info("stem_splitter: moved torch hub cache %s -> %s (keeps the sweeper off it)",
+                     old, new)
+            return
+
+        # The destination EXISTS. Bailing out here was a bug: `cache/torch/hub` can exist and be
+        # empty (an earlier run created it, or torch touched it), while the 361 MB aligner is
+        # still only in the old location. _has_aligner() accepts the old layout, so we would
+        # report the weights as present, start WITH warmup, and torch — looking under the NEW
+        # TORCH_HOME — would find nothing and re-download it at launch. The exact thing this
+        # change exists to stop, in the one case the fast path skips.
+        #
+        # So merge instead of bailing, and never clobber: a file that already exists at the
+        # destination is the one torch will use.
+        moved = 0
+        for src in old.rglob("*"):
+            if not src.is_file():
+                continue
+            dest = new / src.relative_to(old)
+            if dest.exists():
+                continue
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            src.replace(dest)
+            moved += 1
+        if moved:
+            log.info("stem_splitter: merged %d file(s) from %s into %s", moved, old, new)
+
+        # Tidy up whatever is left of the old tree (it may still hold files we deliberately
+        # did not clobber; rmdir only removes it if it is genuinely empty).
+        for d in sorted((p for p in old.rglob("*") if p.is_dir()), reverse=True):
+            try:
+                d.rmdir()
+            except OSError:
+                pass
+        try:
+            old.rmdir()
+        except OSError:
+            pass
     except OSError as e:
         # Not fatal: torch will just re-fetch into the new location. Say so, rather than
         # letting a mystery 361 MB download look like a bug.

@@ -30,24 +30,42 @@ import demucs_server as ds  # noqa: E402
 class Cache:
     """Builds a cache dir with whichever weights you name."""
 
-    def __init__(self, td, roformer=False, whisper=False, aligner=False, old_aligner=False):
+    BIG = b"x" * (60 * 1024 * 1024)      # over _MIN_WEIGHT_BYTES
+    SMALL = b"x" * 1024                  # a partial download
+
+    def __init__(self, td, roformer=False, whisper=False, aligner=False, old_aligner=False,
+                 empty_new_hub=False, whisper_shell=False, whisper_incomplete=False,
+                 tiny_roformer=False):
         self.cfg = Path(td)
         c = ds.cache_dir(self.cfg)
         c.mkdir(parents=True, exist_ok=True)
-        if roformer:
+        if roformer or tiny_roformer:
             (c / "_roformer-models").mkdir(parents=True, exist_ok=True)
-            (c / "_roformer-models" / "BS-Roformer-SW.ckpt").write_bytes(b"x")
-        if whisper:
-            (c / "huggingface" / "hub" /
-             "models--Systran--faster-whisper-medium").mkdir(parents=True, exist_ok=True)
+            (c / "_roformer-models" / "BS-Roformer-SW.ckpt").write_bytes(
+                self.SMALL if tiny_roformer else self.BIG)
+        if whisper or whisper_shell or whisper_incomplete:
+            repo = c / "huggingface" / "hub" / "models--Systran--faster-whisper-medium"
+            (repo / "blobs").mkdir(parents=True, exist_ok=True)
+            (repo / "refs").mkdir(parents=True, exist_ok=True)
+            rev = repo / "snapshots" / "08e178d4"
+            rev.mkdir(parents=True, exist_ok=True)
+            if whisper:                          # a completed download
+                (rev / "model.bin").write_bytes(self.BIG)
+            if whisper_incomplete:               # interrupted: payload + a .incomplete marker
+                (rev / "model.bin").write_bytes(self.BIG)
+                (repo / "blobs" / "abc123.incomplete").write_bytes(self.SMALL)
+            # whisper_shell: the directory structure and nothing else — which is exactly what
+            # huggingface_hub leaves behind the moment a download STARTS.
         if aligner:
             d = c / "torch" / "hub" / "checkpoints"
             d.mkdir(parents=True, exist_ok=True)
-            (d / "wav2vec2_fairseq_base_ls960_asr_ls960.pth").write_bytes(b"x")
+            (d / "wav2vec2_fairseq_base_ls960_asr_ls960.pth").write_bytes(self.BIG)
         if old_aligner:                       # the pre-move layout
             d = c / "hub" / "checkpoints"
             d.mkdir(parents=True, exist_ok=True)
-            (d / "wav2vec2_fairseq_base_ls960_asr_ls960.pth").write_bytes(b"x")
+            (d / "wav2vec2_fairseq_base_ls960_asr_ls960.pth").write_bytes(self.BIG)
+        if empty_new_hub:                     # torch/hub exists but is EMPTY
+            (c / "torch" / "hub").mkdir(parents=True, exist_ok=True)
 
 
 class TheGateIsAllOrNothing(unittest.TestCase):
@@ -121,6 +139,79 @@ class TorchHomeMigration(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             c = Cache(td, aligner=True)
             ds._migrate_torch_home(ds.cache_dir(c.cfg))     # must not raise
+
+
+class PartialDownloadsAreNotWeights(unittest.TestCase):
+    """"The file is there" is not the same claim as "the weights are on disk", and this gate
+    promises the second one. A directory that exists because a download STARTED must not be
+    mistaken for one that exists because a download FINISHED."""
+
+    def test_whisper_directory_shell_is_not_enough(self):
+        """huggingface_hub creates models--org--repo/{blobs,refs,snapshots} when the download
+        BEGINS. A presence check would report the weights as ready, start the server WITH
+        warmup, and have it resume the download at launch — the exact silent startup fetch this
+        gate exists to prevent, now wearing a convincing disguise."""
+        with tempfile.TemporaryDirectory() as td:
+            c = Cache(td, roformer=True, aligner=True, whisper_shell=True)
+            self.assertFalse(ds._has_whisper(ds.cache_dir(c.cfg)))
+            self.assertFalse(ds.models_downloaded(c.cfg))
+            self.assertIn("whisperx", ds.missing_models(c.cfg))
+
+    def test_whisper_with_an_incomplete_marker_is_not_ready(self):
+        with tempfile.TemporaryDirectory() as td:
+            c = Cache(td, roformer=True, aligner=True, whisper_incomplete=True)
+            self.assertFalse(ds._has_whisper(ds.cache_dir(c.cfg)))
+
+    def test_a_truncated_roformer_checkpoint_is_not_ready(self):
+        # A 1 KB .ckpt is a failed download, not a 700 MB model.
+        with tempfile.TemporaryDirectory() as td:
+            c = Cache(td, tiny_roformer=True, whisper=True, aligner=True)
+            self.assertFalse(ds._has_roformer(ds.cache_dir(c.cfg)))
+            self.assertFalse(ds.models_downloaded(c.cfg))
+
+
+class MigrationWhenTheDestinationAlreadyExists(unittest.TestCase):
+    """The bug: _migrate_torch_home() bailed out whenever cache/torch/hub existed.
+
+    It can exist and be EMPTY (an earlier run created it) while the 361 MB aligner is still only
+    in the old location. _has_aligner() accepts the old layout, so we would report the weights
+    as present, start WITH warmup, and torch — looking under the NEW TORCH_HOME — would find
+    nothing and re-download at launch. The one case the fast path skips is the one that breaks.
+    """
+
+    def test_empty_destination_does_not_strand_the_aligner(self):
+        with tempfile.TemporaryDirectory() as td:
+            c = Cache(td, old_aligner=True, empty_new_hub=True)
+            cache = ds.cache_dir(c.cfg)
+            ds._migrate_torch_home(cache)
+            moved = (cache / "torch" / "hub" / "checkpoints" /
+                     "wav2vec2_fairseq_base_ls960_asr_ls960.pth")
+            self.assertTrue(moved.is_file(),
+                            "the aligner must be MOVED into the new layout, not left behind "
+                            "for torch to re-download")
+            self.assertTrue(ds._has_aligner(cache))
+
+    def test_a_file_already_at_the_destination_is_never_clobbered(self):
+        with tempfile.TemporaryDirectory() as td:
+            c = Cache(td, aligner=True, old_aligner=True)      # both layouts hold a file
+            cache = ds.cache_dir(c.cfg)
+            dest = (cache / "torch" / "hub" / "checkpoints" /
+                    "wav2vec2_fairseq_base_ls960_asr_ls960.pth")
+            before = dest.stat().st_size
+            ds._migrate_torch_home(cache)
+            self.assertEqual(dest.stat().st_size, before,
+                             "the file torch will actually use must not be overwritten")
+
+    def test_other_files_still_merge_across(self):
+        with tempfile.TemporaryDirectory() as td:
+            c = Cache(td, aligner=True)
+            cache = ds.cache_dir(c.cfg)
+            old = cache / "hub" / "checkpoints"
+            old.mkdir(parents=True, exist_ok=True)
+            (old / "some_other_model.pth").write_bytes(Cache.BIG)
+            ds._migrate_torch_home(cache)
+            self.assertTrue((cache / "torch" / "hub" / "checkpoints" /
+                             "some_other_model.pth").is_file())
 
 
 if __name__ == "__main__":
