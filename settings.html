@@ -456,7 +456,9 @@
       return;
     }
     $('ss-srv-progress').style.display = 'block';
-    setSrvBar(st.pct, st.phase || (st.active ? st.op : 'Done'));
+    // A snapshot is authoritative for whatever operation is live NOW (this fires on reconnect,
+    // possibly into a different op than the one whose floor we're carrying), so it resets.
+    setSrvBar(st.pct, st.phase || (st.active ? st.op : 'Done'), true);
     if (st.error) appendLog($('ss-srv-log'), '✗ ' + st.error);
     setServerButtons(!!st.active);
   }
@@ -495,7 +497,7 @@
           loadDocker();
         } else {
           appendLog($('ss-srv-log'), '✓ ' + m.op + ' done.');
-          setSrvBar(1, 'Done');
+          setSrvBar(1, 'Done', true);
           setServerButtons(false);
           if (m.status) renderServerStatus(m.status); else loadServerStatus();
         }
@@ -507,7 +509,7 @@
           loadDocker();
         } else {
           appendLog($('ss-srv-log'), '✗ ' + m.error);
-          setSrvBar(0, 'Failed');
+          setSrvBar(0, 'Failed', true);
           setServerButtons(false);
           loadServerStatus();
         }
@@ -608,9 +610,24 @@
     var d = disabled || !serverManageable;   // never re-enable an unsupported section
     SERVER_BTNS.forEach(function (id) { var el = $(id); if (el) el.disabled = d; });
   }
-  function setSrvBar(pct, phase) {
-    $('ss-srv-fill').style.width = Math.round((pct || 0) * 100) + '%';
-    $('ss-srv-pct').textContent = Math.round((pct || 0) * 100) + '%';
+  // The bar never runs backwards WITHIN an operation.
+  //
+  // The UI seeds a percentage for a step it is about to take (10% "Checking", 20% "Updating"),
+  // and then the server's own stream legitimately opens lower — update_server() emits 0.05 for
+  // "Stopping the server" when one is running. So the bar jumped forward and then back, which
+  // reads as the operation restarting. Enforcing it here rather than hand-tuning the seeds is
+  // the difference between fixing this and fixing it again the next time a step is inserted.
+  //
+  // `reset` starts a new operation (or reports a terminal state): that's the one time the bar
+  // is allowed to move down.
+  var _srvBarMax = 0;
+  function setSrvBar(pct, phase, reset) {
+    var p = pct || 0;
+    if (reset) _srvBarMax = p;
+    else if (p < _srvBarMax) p = _srvBarMax;
+    else _srvBarMax = p;
+    $('ss-srv-fill').style.width = Math.round(p * 100) + '%';
+    $('ss-srv-pct').textContent = Math.round(p * 100) + '%';
     if (phase) $('ss-srv-phase').textContent = phase;
   }
   function srvLog(line) { $('ss-srv-progress').style.display = 'block'; appendLog($('ss-srv-log'), line); }
@@ -916,20 +933,20 @@
     setServerButtons(true);
     $('ss-srv-progress').style.display = 'block';
     $('ss-srv-log').textContent = label + '…\n';
-    setSrvBar(0.02, label);
+    setSrvBar(0.02, label, true);
     connectWS();
     return j(path, { method: 'POST', headers: { 'Content-Type': 'application/json' },
                      body: JSON.stringify(body || {}) })
       .then(function (res) {
         if (res && res.ok === false && res.busy) {
           srvLog('… ' + res.message);
-          setSrvBar(0, 'Busy: ' + res.busy);
+          setSrvBar(0, 'Busy: ' + res.busy, true);
           setServerButtons(false);
         }
         return res;
       }).catch(function (err) {
         srvLog('✗ ' + label + ' failed: ' + err);
-        setSrvBar(0, 'Failed');
+        setSrvBar(0, 'Failed', true);
         setServerButtons(false);
       });
   }
@@ -941,14 +958,14 @@
     setServerButtons(true);
     $('ss-srv-progress').style.display = 'block';
     $('ss-srv-log').textContent = label + '…\n';
-    setSrvBar(0.02, label);
+    setSrvBar(0.02, label, true);
     connectWS();
     return j(path, { method: 'POST' }).then(function (res) {
       // The backend serialises lifecycle ops; if one is already running it says so
       // rather than racing (which would corrupt the shared subprocess/state file).
       if (res && res.ok === false && res.busy) {
         srvLog('… ' + res.message);
-        setSrvBar(0, 'Busy: ' + res.busy);
+        setSrvBar(0, 'Busy: ' + res.busy, true);
         setServerButtons(false);
         return res;
       }
@@ -956,13 +973,13 @@
       // stream over the WS and unlock on server_done/server_error.
       if (res && typeof res.installed !== 'undefined') {
         renderServerStatus(res);
-        setSrvBar(1, 'Done');
+        setSrvBar(1, 'Done', true);
         setServerButtons(false);
       }
       return res;
     }).catch(function (err) {
       srvLog('✗ ' + label + ' failed: ' + err);
-      setSrvBar(0, 'Failed');
+      setSrvBar(0, 'Failed', true);
       setServerButtons(false);
     });
   }
@@ -1016,7 +1033,7 @@
     $('ss-srv-progress').style.display = 'block';
     j('/server/health').then(function (r) {
       srvLog((r.ok ? '✓ ' : '✗ ') + r.url + ' → ' + JSON.stringify(r.health));
-      setSrvBar(r.ok ? 1 : 0, r.ok ? 'Healthy' : 'No response');
+      setSrvBar(r.ok ? 1 : 0, r.ok ? 'Healthy' : 'No response', true);
       return loadServerStatus();
     }).catch(function (e) { srvLog('✗ ' + e); })
       .finally(function () { setServerButtons(false); });
@@ -1196,18 +1213,18 @@
     setServerButtons(true);
     $('ss-srv-progress').style.display = 'block';
     $('ss-srv-log').textContent = 'Checking for a newer server revision…\n';
-    setSrvBar(0.1, 'Checking');
+    setSrvBar(0.1, 'Checking', true);
 
     j('/server/check_update').then(function (r) {
       if (!r || !r.installed) {
         srvLog('The server is not installed, so there is nothing to update.');
-        setSrvBar(0, 'Not installed');
+        setSrvBar(0, 'Not installed', true);
         setServerButtons(false);
         return;
       }
       if (r.latest == null) {
         srvLog('✗ ' + (r.reason || 'Could not reach GitHub.'));
-        setSrvBar(0, 'Offline');
+        setSrvBar(0, 'Offline', true);
         setServerButtons(false);
         return;
       }
@@ -1215,7 +1232,7 @@
       var latest = (r.latest || '').slice(0, 8);
       if (!r.update_available && !r.unknown) {
         srvLog('✓ Already up to date (' + have + ').');
-        setSrvBar(1, 'Up to date');
+        setSrvBar(1, 'Up to date', true);
         setServerButtons(false);
         return;
       }
@@ -1228,13 +1245,13 @@
       return j('/server/update', { method: 'POST' }).then(function (res) {
         if (res && res.ok === false && res.busy) {
           srvLog('… ' + (res.message || 'another server operation is running'));
-          setSrvBar(0, 'Busy');
+          setSrvBar(0, 'Busy', true);
           setServerButtons(false);
         }
       });
     }).catch(function (e) {
       srvLog('✗ ' + e);
-      setSrvBar(0, 'Failed');
+      setSrvBar(0, 'Failed', true);
       setServerButtons(false);
     });
   });
