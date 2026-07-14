@@ -762,6 +762,14 @@ def update_server(config_dir: Path, ref: str | None = None, port: int = DEFAULT_
                              warmup=models_downloaded(config_dir),
                              progress_cb=_scaled(progress_cb, 0.9, 0.1))
             except Exception as restart_error:
+                # The user's last message said we were putting their server back. If that ALSO
+                # failed, silence leaves them believing the old server is still up when it is
+                # actually down — the worst of the three possible states, and the only one they
+                # can't see. Every other failure branch here tells them; so does this one.
+                _emit(progress_cb,
+                      f"The server could not be restarted either ({restart_error}). It is now "
+                      f"stopped — use Start to bring it back.",
+                      1.0, "Failed")
                 log.warning("stem_splitter: update failed AND the server could not be "
                             "restarted: %s", restart_error)
         raise
@@ -836,7 +844,7 @@ def download_source(config_dir: Path, ref: str | None = None,
     sdir = src_dir(config_dir)
     sdir.mkdir(parents=True, exist_ok=True)
 
-    ref = (ref or DEFAULT_SOURCE_REF).strip() or DEFAULT_SOURCE_REF
+    ref = _norm_ref(ref)
     commit = _resolve_commit(ref)
     archive = commit or ref
     url = f"https://codeload.github.com/{SOURCE_REPO}/zip/{archive}"

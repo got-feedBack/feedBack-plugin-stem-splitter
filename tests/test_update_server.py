@@ -239,7 +239,7 @@ class StatusPollStaysCheap(unittest.TestCase):
         for name, m in (("_has_roformer", rof), ("_has_whisper", whi), ("_has_aligner", ali)):
             mine = [c for c in m.call_args_list if c.args and c.args[0] == cache]
             self.assertEqual(len(mine), 1,
-                             f"{name} ran {len(mine)}× in one poll — this is the hot path")
+                             f"{name} ran {len(mine)}x in one poll — this is the hot path")
         # and the flag must still agree with the per-model dict it is now derived from
         self.assertTrue(st["models_downloaded"])
         self.assertEqual(st["models_present"],

@@ -725,6 +725,25 @@
   var WARMUP_TONE = { ready: 'ok', skipped: 'ok', downloading: 'warn',
                       pending: 'off', failed: 'bad', evicted: 'off' };
 
+  // The server's warmup keys are NOT our models_present keys. It reports the default separator
+  // as `demucs` (the backend treats that as an alias for bs_roformer_sw — see _model_ready) and
+  // names the aligner differently again. A raw present[k] lookup misses, leaving the chip on
+  // "downloading" for a file sitting right there — which is the exact bug the loading-vs-
+  // downloading change exists to fix, reintroduced through a key mismatch.
+  var PRESENT_KEY = {
+    demucs: 'bs_roformer_sw',
+    bs_roformer_sw: 'bs_roformer_sw',
+    whisperx: 'whisperx',
+    whisperx_aligners: 'whisperx_aligners',
+    aligner: 'whisperx_aligners',
+    align: 'whisperx_aligners',
+  };
+
+  // An unmapped key falls back to the key itself rather than guessing.
+  function isPresent(present, key) {
+    return !!present[PRESENT_KEY[key] || key];
+  }
+
   function renderServerStatus(st) {
     lastServerStatus = st || null;
     var bar = $('ss-srv-chips'), note = $('ss-srv-note');
@@ -784,7 +803,7 @@
       // are being re-fetched when nothing is crossing the wire, which is exactly how a
       // 1-second RAM load gets reported as a bug. If we can see the file, say "loading".
       var label = v, tone = WARMUP_TONE[v] || 'off';
-      if (v === 'downloading' && present[k]) {
+      if (v === 'downloading' && isPresent(present, k)) {
         label = 'loading';
         tone = 'info';
       }
