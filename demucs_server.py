@@ -487,6 +487,41 @@ def _has_whisper(cache: Path) -> bool:
     return False
 
 
+def _aligner_under(torch_home: Path) -> bool:
+    """Is the wav2vec2 aligner present for a torch that runs with this TORCH_HOME?
+
+    torch.hub reads and writes ``$TORCH_HOME/hub/checkpoints``, so this answers the only
+    question that matters at launch: given this TORCH_HOME, will torch find the file — or
+    fetch it?
+    """
+    d = torch_home / "hub" / "checkpoints"
+    return d.is_dir() and any(_big(f) for f in d.glob("wav2vec2*"))
+
+
+def torch_home(cache: Path) -> Path:
+    """Which TORCH_HOME the server should run with.
+
+    Normally `cache/torch` (see _server_env for why it moved there). But _migrate_torch_home()
+    is best-effort — a locked file or a permissions problem leaves the aligner in the OLD layout
+    while TORCH_HOME points at the new one. _has_aligner() accepts either layout, so we'd report
+    the weights as present, start WITH warmup, and torch — looking only under the new
+    TORCH_HOME — would find nothing and pull 361 MB at launch. The exact silent startup download
+    this module promises never to do, arrived at through the failure path of the fix for it.
+
+    So: if the aligner is only in the old layout, run THIS server on the old TORCH_HOME. Slightly
+    worse (the old location is what the pre-fix sweeper eats), and strictly better than a
+    download the user didn't ask for. The migration is retried on every start, so a transient
+    lock heals itself on the next one.
+    """
+    new = cache / "torch"
+    try:
+        if _aligner_under(new) or not _aligner_under(cache):
+            return new
+        return cache               # the aligner is ONLY in the old layout: don't refetch it
+    except OSError:
+        return new
+
+
 def _has_aligner(cache: Path) -> bool:
     """whisperx's wav2vec2 forced aligner, fetched through torch.hub.
 
@@ -496,8 +531,8 @@ def _has_aligner(cache: Path) -> bool:
     told its weights are missing just because we moved the goalposts.
     """
     try:
-        for hub in (cache / "torch" / "hub" / "checkpoints", cache / "hub" / "checkpoints"):
-            if hub.is_dir() and any(_big(f) for f in hub.glob("wav2vec2*")):
+        for home in (cache / "torch", cache):
+            if _aligner_under(home):
                 return True
     except OSError:
         pass
@@ -1321,10 +1356,14 @@ def _server_env(config_dir: Path) -> dict:
     # matches what the container's compose file already does.
     #
     # No re-download: _migrate_torch_home() (called just above) MOVES the existing file into
-    # the new layout — a rename on the same volume, so nothing crosses the wire. Torch only
-    # re-fetches if that move fails, and it says so when it does. _has_aligner() also still
-    # accepts the old location, so nothing reports "missing" mid-migration.
-    env["TORCH_HOME"] = str(cache / "torch")
+    # the new layout — a rename on the same volume, so nothing crosses the wire. _has_aligner()
+    # also still accepts the old location, so nothing reports "missing" mid-migration.
+    #
+    # And if that move FAILS (a locked file, a permissions problem), torch_home() hands back the
+    # OLD layout for this run rather than pointing torch somewhere the file isn't — because the
+    # alternative is a 361 MB fetch at launch, which is the one thing this module promises never
+    # to do. The migration retries on the next start.
+    env["TORCH_HOME"] = str(torch_home(cache))
     env["HF_HOME"] = str(cache / "huggingface")
     env["HUGGINGFACE_HUB_CACHE"] = str(cache / "huggingface" / "hub")
     env.setdefault("PYTHONUNBUFFERED", "1")

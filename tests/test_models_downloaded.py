@@ -21,6 +21,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -236,6 +237,55 @@ class MigrationWhenTheDestinationAlreadyExists(unittest.TestCase):
             ds._migrate_torch_home(cache)
             self.assertTrue((cache / "torch" / "hub" / "checkpoints" /
                              "some_other_model.pth").is_file())
+
+
+class AFailedMigrationMustNotCauseADownload(unittest.TestCase):
+    """_migrate_torch_home() is best-effort — a locked file or a permissions problem leaves the
+    aligner in the OLD layout. TORCH_HOME pointed at the new layout unconditionally, and
+    _has_aligner() accepts either — so we'd report the weights as present, start WITH warmup,
+    and torch, looking only under the new TORCH_HOME, would pull 361 MB at launch.
+
+    The silent startup download this module exists to prevent, reached through the failure path
+    of the fix for it. TORCH_HOME now follows the file."""
+
+    def _torch_home(self, cfg):
+        with mock.patch.object(ds, "_migrate_torch_home"):      # pretend the move failed
+            env = ds._server_env(cfg)
+        return Path(env["TORCH_HOME"])
+
+    def test_torch_is_pointed_at_the_file_that_is_actually_there(self):
+        with tempfile.TemporaryDirectory() as td:
+            c = Cache(td, old_aligner=True)                     # only the old layout has it
+            cache = ds.cache_dir(c.cfg)
+            self.assertEqual(self._torch_home(c.cfg), cache,
+                             "with the aligner only in the old layout, pointing TORCH_HOME at "
+                             "the new one makes torch download 361 MB at launch")
+            self.assertTrue(ds._aligner_under(self._torch_home(c.cfg)),
+                            "whatever TORCH_HOME we hand torch, the file must be under it")
+
+    def test_the_new_layout_wins_once_the_file_is_there(self):
+        with tempfile.TemporaryDirectory() as td:
+            c = Cache(td, aligner=True)
+            self.assertEqual(self._torch_home(c.cfg), ds.cache_dir(c.cfg) / "torch")
+
+    def test_both_layouts_prefers_the_new_one(self):
+        with tempfile.TemporaryDirectory() as td:
+            c = Cache(td, aligner=True, old_aligner=True)
+            self.assertEqual(self._torch_home(c.cfg), ds.cache_dir(c.cfg) / "torch")
+
+    def test_a_fresh_install_uses_the_new_layout(self):
+        # Nothing downloaded yet: the aligner must land in the sweeper-safe location.
+        with tempfile.TemporaryDirectory() as td:
+            c = Cache(td)
+            self.assertEqual(self._torch_home(c.cfg), ds.cache_dir(c.cfg) / "torch")
+
+    def test_a_successful_migration_still_uses_the_new_layout(self):
+        # The normal path: the move works, so torch runs on the new TORCH_HOME as intended.
+        with tempfile.TemporaryDirectory() as td:
+            c = Cache(td, old_aligner=True)
+            env = ds._server_env(c.cfg)                         # migration NOT stubbed out
+            self.assertEqual(Path(env["TORCH_HOME"]), ds.cache_dir(c.cfg) / "torch")
+            self.assertTrue(ds._aligner_under(Path(env["TORCH_HOME"])))
 
 
 if __name__ == "__main__":
