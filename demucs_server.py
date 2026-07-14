@@ -703,28 +703,49 @@ def update_server(config_dir: Path, ref: str | None = None,
         raise RuntimeError("the server isn't installed, so there is nothing to update")
 
     was_running, _ = is_running(config_dir)
-    before = str(source_meta(config_dir).get("commit") or "")[:8]
+    before = str(source_meta(config_dir).get("commit") or "")     # FULL sha, not a prefix
 
     if was_running:
         _emit(progress_cb, "Stopping the server…", 0.05, "Updating")
         stop_server(config_dir)
 
-    _emit(progress_cb, "Fetching the latest server source…", 0.2, "Updating")
-    download_source(config_dir, ref=ref, progress_cb=progress_cb)
+    try:
+        _emit(progress_cb, "Fetching the latest server source…", 0.2, "Updating")
+        download_source(config_dir, ref=ref, progress_cb=progress_cb)
 
-    # The launcher and the driver bootstrap are generated from OUR templates, and a fresh
-    # source download overwrites the drivers — so both must be re-applied or the server comes
-    # back up unable to import its own dependencies.
-    write_launcher(config_dir)
-    patched = patch_driver_scripts(config_dir)
-    if patched:
-        _emit(progress_cb, f"Re-bootstrapped {', '.join(patched)}.", 0.8, "Updating")
+        # The launcher and the driver bootstrap are generated from OUR templates, and a fresh
+        # source download overwrites the drivers — so both must be re-applied or the server
+        # comes back up unable to import its own dependencies.
+        write_launcher(config_dir)
+        patched = patch_driver_scripts(config_dir)
+        if patched:
+            _emit(progress_cb, f"Re-bootstrapped {', '.join(patched)}.", 0.8, "Updating")
+    except Exception as e:
+        # We stopped a server that was WORKING, and the update failed. Leaving it down means a
+        # click that was meant to fix something has instead taken the user's server away — a
+        # strictly worse position than before they clicked, over a network blip.
+        #
+        # Put it back, then report the failure. The source may be half-updated, but the
+        # launcher and drivers are regenerated from our own templates on every start, so
+        # whatever is on disk is startable.
+        if was_running:
+            _emit(progress_cb, f"Update failed ({e}) — restarting the server as it was.",
+                  0.9, "Updating")
+            try:
+                start_server(config_dir, warmup=models_downloaded(config_dir),
+                             progress_cb=progress_cb)
+            except Exception as restart_error:
+                log.warning("stem_splitter: update failed AND the server could not be "
+                            "restarted: %s", restart_error)
+        raise
 
-    after = str(source_meta(config_dir).get("commit") or "")[:8]
+    after = str(source_meta(config_dir).get("commit") or "")
+    # Compare FULL shas. Two different commits can share an 8-char prefix, and reporting
+    # "already up to date" for an update that actually happened is a lie the user cannot check.
     changed = before != after
     _emit(progress_cb,
-          f"Updated {before or '?'} → {after or '?'}." if changed
-          else f"Already up to date ({after or '?'}).",
+          f"Updated {before[:8] or '?'} → {after[:8] or '?'}." if changed
+          else f"Already up to date ({after[:8] or '?'}).",
           0.85, "Updating")
 
     if was_running:
