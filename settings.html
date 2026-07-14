@@ -775,11 +775,21 @@
 
     // Per-model warmup detail (pending / downloading / ready / failed).
     var wu = (st.health || {}).warmup || {};
+    var present = st.models_present || {};
     Object.keys(wu).forEach(function (k) {
       var v = wu[k];
       if (typeof v !== 'string') return;
-      chips.push(chip(k + ': ' + v, WARMUP_TONE[v] || 'off',
-                      { live: v === 'downloading' , dot: v === 'downloading' }));
+      // The server says "downloading" while it warms a model — even when it is only loading
+      // a cached file from disk into VRAM. Shown verbatim, that tells the user their weights
+      // are being re-fetched when nothing is crossing the wire, which is exactly how a
+      // 1-second RAM load gets reported as a bug. If we can see the file, say "loading".
+      var label = v, tone = WARMUP_TONE[v] || 'off';
+      if (v === 'downloading' && present[k]) {
+        label = 'loading';
+        tone = 'info';
+      }
+      var busy = (v === 'downloading');
+      chips.push(chip(k + ': ' + label, tone, { live: busy, dot: busy }));
     });
 
     if (st.disk_bytes) chips.push(chip(gb(st.disk_bytes) + ' on disk', 'info'));

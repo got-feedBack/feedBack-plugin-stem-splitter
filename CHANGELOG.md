@@ -18,6 +18,21 @@
   The update runs only if there is genuinely something newer, so the button never restarts a
   healthy server for nothing.
 
+### Fixes
+
+- **The status chips said "downloading" when nothing was being downloaded.** The server marks
+  a model as `downloading` while it *warms up* — even when it is only loading a cached file
+  from disk into VRAM. So a few-second RAM load was displayed as a download, and users
+  reasonably concluded their weights had been thrown away and re-fetched. (Reported exactly
+  that way, and the user was right to believe the UI.)
+
+  `server_status()` now reports which weights are on disk, per model, and a warm-up of a file
+  we can already see reads **loading** (blue) rather than **downloading** (amber). A genuine
+  fetch still says downloading.
+
+  Done plugin-side on purpose: a server-side fix would have to reach people through a source
+  refresh, and the plugin already knows what is on disk.
+
 ## 0.3.2
 
 ### Fixes — no more model re-downloads at launch

@@ -1953,6 +1953,17 @@ def server_status(config_dir: Path) -> dict:
         "url": url if running else None,
         "health": health,
         "models_downloaded": models_downloaded(config_dir),
+        # Which weights are ALREADY on disk, per model. The server reports a model as
+        # "downloading" while it warms up — even when it is only loading a cached file from
+        # disk into VRAM. So the UI shows "downloading" during a pure RAM load, the user sees
+        # a download that isn't happening, and reasonably concludes their weights were thrown
+        # away again. (Reported exactly that way.) With this, the UI can say "loading" when it
+        # knows the file is right there.
+        "models_present": {
+            "bs_roformer_sw": _has_roformer(cache_dir(config_dir)),
+            "whisperx": _has_whisper(cache_dir(config_dir)),
+            "whisperx_aligners": _has_aligner(cache_dir(config_dir)),
+        },
         "models_ready": models_ready,
         "server_dir": str(server_dir(config_dir)),
         "disk_bytes": _server_disk_bytes(config_dir),
