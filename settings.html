@@ -492,6 +492,7 @@
       var m; try { m = JSON.parse(ev.data); } catch (e) { return; }
       var log = $('ss-install-log');
       if (m.type === 'jobs') {
+        renderQueueCount(m);                       // jobs started/finished anywhere, incl. here
         if (m.install) renderInstall(m.install);   // snapshot recovery
         if (m.server) renderServerOp(m.server);
       } else if (m.type === 'server') {
@@ -648,18 +649,24 @@
   // other side, because a user who has just configured a server wants to watch it work.
   // How many jobs are actually in flight. A bare "Open the queue" button tells you nothing about
   // whether there is anything IN it; "3 running" is the difference between a link and an answer.
+  function renderQueueCount(snap) {
+    var el = $('ss-queue-count');
+    if (!el) return;
+    var live = ((snap && snap.jobs) || []).filter(function (job) {
+      return job.status === 'running' || job.status === 'queued';
+    }).length;
+    el.hidden = !live;
+    el.textContent = live || '';
+  }
+
+  // One fetch for the initial paint; after that the badge rides the SAME `jobs` snapshots the
+  // WebSocket already delivers to this page (see ws.onmessage). A count that is only correct at
+  // the moment the panel opened is a count you cannot trust — and this page can sit open for the
+  // whole length of a job, which is exactly when someone is watching it.
   function refreshQueueCount() {
-    fetch(API + '/jobs').then(function (r) { return r.json(); }).then(function (snap) {
-      var jobs = (snap && snap.jobs) || [];
-      var live = jobs.filter(function (j) {
-        return j.status === 'running' || j.status === 'queued';
-      }).length;
-      var el = $('ss-queue-count');
-      if (!el) return;
-      if (!live) { el.hidden = true; return; }
-      el.hidden = false;
-      el.textContent = live;
-    }).catch(function () { /* the button still works; only the count is missing */ });
+    j('/jobs')
+      .then(renderQueueCount)
+      .catch(function () { /* the button still works; only the badge is missing */ });
   }
 
   function openQueue() {
