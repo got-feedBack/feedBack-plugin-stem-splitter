@@ -17,6 +17,9 @@
     missingStems: new Set(),
     missingLyrics: new Set(),
     missingVocals: new Set(),
+    // False until the three missing-sets have ALL loaded. Actions gated on a song HAVING
+    // something (re-align) must not fire while the sets are still empty-because-unknown.
+    missingReady: false,
     splitEngine: null,
     lyricsEngine: null,
     ws: null,
@@ -197,20 +200,35 @@
   }
 
   function refreshMissing() {
+    // A failed fetch is UNKNOWN, not "nothing is missing".
+    //
+    // Split and Transcribe are gated on PRESENCE in a missing-set, so an empty set means the
+    // action is disabled — a failed fetch is safe by accident. Re-align is gated on ABSENCE
+    // (it needs the lyrics and the stem to be there), so an empty set means ENABLED, and a
+    // failed fetch would offer a re-align on a song with neither. Same data, opposite default.
+    //
+    // So the sets are only trusted once they have all actually loaded. Until then re-align is
+    // greyed out — the right answer to "I don't know" is not "go ahead".
     return Promise.all([
-      api('/missing_stems').catch(function () { return { songs: [] }; }),
-      api('/missing_lyrics').catch(function () { return { songs: [] }; }),
+      api('/missing_stems'),
+      api('/missing_lyrics'),
       // Vocals SPECIFICALLY — not the same question as /missing_stems, which asks for songs
       // lacking any of the six instrument stems. A song with vocals but no piano is in that set,
       // and re-align works fine on it: all it needs is something to align against.
-      api('/missing_vocals').catch(function () { return { songs: [] }; }),
+      api('/missing_vocals'),
     ]).then(function (res) {
       state.missingStems = new Set((res[0].songs || []).map(function (s) { return s.filename; }));
       state.missingLyrics = new Set((res[1].songs || []).map(function (s) { return s.filename; }));
       state.missingVocals = new Set((res[2].songs || []).map(function (s) { return s.filename; }));
+      state.missingReady = true;
       var a = $('ss-missing-stems-n'), b = $('ss-missing-lyrics-n');
       if (a) a.textContent = state.missingStems.size;
       if (b) b.textContent = state.missingLyrics.size;
+    }).catch(function (e) {
+      // Keep whatever we last knew, but stop trusting it: an action that depends on a song
+      // HAVING something must not fire on a guess.
+      state.missingReady = false;
+      console.warn('[stem_splitter] could not refresh the missing-sets', e);
     });
   }
 
@@ -262,7 +280,13 @@
       // way, but a menu item that is clickable and then fails is a worse answer than one that
       // is greyed out.
       enabled: function (song) {
-        return !state.missingLyrics.has(song.filename) &&
+        // Unknown is not "yes". Before the sets load — or after a failed refresh — an
+        // absence-gated action would be enabled on every song, including ones with no lyrics
+        // and no stem, and the user's click would travel all the way to the backend to be told
+        // no. Split and Transcribe are gated on PRESENCE, so they default to disabled and never
+        // had this problem; this one is the mirror image and needs the guard.
+        return state.missingReady &&
+               !state.missingLyrics.has(song.filename) &&
                !state.missingVocals.has(song.filename);
       },
       run: function (song) {
