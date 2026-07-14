@@ -40,10 +40,18 @@ class TheSetupPromptNamesTheMissingWeights(unittest.TestCase):
         self.assertEqual(out["missing"], ["whisperx aligner"])
         self.assertIn("whisperx aligner", out["message"])
 
-    def test_a_fresh_install_names_them_all(self):
+    def test_the_size_is_what_is_actually_being_fetched(self):
+        # A flat "~2 GB" overstates the aligner-only case by 5×, and 2 GB is exactly the number
+        # that makes someone cancel a 360 MB download.
+        out = self._prompt(["whisperx aligner"])
+        self.assertIn("MB", out["size"])
+        self.assertNotIn("GB", out["message"])
+
+    def test_a_fresh_install_names_them_all_and_says_gigabytes(self):
         out = self._prompt(["bs_roformer_sw", "whisperx", "whisperx aligner"])
         for name in ("bs_roformer_sw", "whisperx", "whisperx aligner"):
             self.assertIn(name, out["message"])
+        self.assertIn("GB", out["size"])
 
     def test_a_forced_local_engine_is_never_blocked(self):
         # A user who forced demucs/audio-separator doesn't need the server's models at all, and

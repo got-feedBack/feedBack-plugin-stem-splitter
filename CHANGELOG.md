@@ -30,7 +30,7 @@ refreshes its server source (see the "Check for update" button, 0.3.3).
   failed migration must not turn into the 361 MB download it exists to prevent. It retries on
   the next start.
 
-- **The "needs setup" prompt now names what's missing** — "it still needs whisperx aligner"
+- **The "needs setup" prompt now names what is missing, and sizes it** — "it still needs whisperx aligner (~360 MB)"
   rather than "its models haven't been downloaded", which reads as *nothing* is downloaded to
   someone who already paid for the 2 GB fetch once, and hides the common case where everything
   is present except the aligner the sweeper ate.

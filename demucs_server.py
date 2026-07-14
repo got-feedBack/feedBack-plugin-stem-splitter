@@ -618,6 +618,28 @@ def missing_models(config_dir: Path) -> list[str]:
     return out
 
 
+# Approximate download size per model, MB. Only used to size the prompt — the point is the
+# ORDER OF MAGNITUDE, so the user can tell "grab a coffee" from "this is quick".
+_MODEL_MB = {
+    "bs_roformer_sw": 700,       # BS-Roformer-SW.ckpt
+    "whisperx": 1500,            # faster-whisper medium
+    "whisperx aligner": 360,     # wav2vec2 forced aligner
+}
+
+
+def download_size(missing: list[str]) -> str:
+    """Human-readable estimate for what's actually about to be fetched.
+
+    The prompt used to hard-code "~2 GB" no matter what was missing. In the case this release
+    is about — everything present except the 361 MB aligner the sweeper ate — that overstates
+    the download by 5×, which is exactly the number that makes someone click Cancel.
+    """
+    mb = sum(_MODEL_MB.get(m, 0) for m in missing)
+    if mb >= 1000:
+        return f"~{mb / 1000:.1f} GB".replace(".0 GB", " GB")
+    return f"~{mb} MB"
+
+
 # ── download + install (explicit, heavy) ─────────────────────────────────────
 
 def _emit(progress_cb: ProgressCB, line: str, pct: float, phase: str) -> None:

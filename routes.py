@@ -559,11 +559,16 @@ class JobManager:
         # Name them. "Its models aren't downloaded" reads as "nothing is downloaded" to someone
         # who already paid for a 2 GB fetch once, and it hides the common case: everything is
         # there except the aligner the old sweeper ate.
+        # Size what is ACTUALLY about to be fetched. A flat "~2 GB" overstates the aligner-only
+        # case — the one this release exists to fix — by 5×, and 2 GB is exactly the number that
+        # makes someone click Cancel on a 360 MB download.
+        size = demucs_server.download_size(missing)
         return {
             "needs_setup": True,
             "missing": missing,
+            "size": size,
             "message": f"The local demucs server is running, but it still needs "
-                       f"{', '.join(missing)} (~2 GB in total, one time). Download now?",
+                       f"{', '.join(missing)} ({size}, one time). Download now?",
         }
 
 
