@@ -287,14 +287,18 @@
         // success we didn't achieve just moves the failure to the moment they paste.
         var fail = function () {
           flash('Press Ctrl+C');
+          // This is the fallback for a copy that ALREADY failed, so it must not be the thing
+          // that throws: getSelection() returns null in some contexts (and the text stays
+          // selectable by hand regardless — .ss-err-text is fb-selectable). Best-effort only.
           var pre = row && row.querySelector('.ss-err-text');
-          if (pre && window.getSelection) {
-            var sel = window.getSelection();
+          var sel = window.getSelection ? window.getSelection() : null;
+          if (!pre || !sel) return;
+          try {
             var range = document.createRange();
             range.selectNodeContents(pre);
             sel.removeAllRanges();
             sel.addRange(range);
-          }
+          } catch (e) { /* the user can still select it themselves */ }
         };
         // navigator.clipboard is undefined on a non-secure origin (plain http to a NAS, which
         // is how plenty of people run this). Fall back rather than throwing into the console.
