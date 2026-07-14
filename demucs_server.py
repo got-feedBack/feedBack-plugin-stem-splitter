@@ -539,17 +539,48 @@ os.chdir(HERE)
 # and a crash runs no handlers at all. So the responsibility is inverted — the server
 # watches its parent and exits when the parent goes away. That works for a graceful quit, a
 # crash, a task-kill, and a power-user's `taskkill /F` alike.
+GRACE = 5.0     # seconds a worker gets on SIGTERM before it is killed outright
+
+
 def _die():
     """Take the whole process tree with us: a separation in flight has grandchildren
     (run_demucs.py / run_roformer.py), and orphaning THOSE just moves the leak."""
     try:
         if os.name == "nt":
+            # /T /F is already tree-wide and forceful; Windows has no SIGTERM to be polite
+            # with first.
             subprocess.run(["taskkill", "/PID", str(os.getpid()), "/T", "/F"],
                            capture_output=True, timeout=15)
         else:
-            # We were started with start_new_session, so our group is ours alone — killing
-            # it cannot touch the app.
-            os.killpg(os.getpgid(0), signal.SIGTERM)
+            # We were started with start_new_session, so this group is OURS alone —
+            # signalling it cannot touch the app.
+            #
+            # Two things this has to get right:
+            #
+            # 1. Ignore SIGTERM in OURSELVES first. killpg signals every member of the group,
+            #    which includes this process — with the default handler we would die on our
+            #    own signal and never escalate, which is the entire reason we are here.
+            #
+            # 2. Escalate. A lone SIGTERM followed by an immediate exit is not a kill, it is a
+            #    request: a worker deep inside a torch inference can be slow to act on it, or
+            #    ignore it. If we exit at that moment there is nobody left to insist, and the
+            #    worker is orphaned — the exact leak this fix exists to close, moved down one
+            #    generation.
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            pgid = os.getpgid(0)
+            try:
+                os.killpg(pgid, signal.SIGTERM)
+            except Exception:
+                pass
+            # A fixed grace, deliberately: we cannot poll "is the group empty yet?" because we
+            # are IN the group, so it never is. The app is already gone and nothing is waiting
+            # on us, so a few seconds of patience costs nobody anything and lets a worker close
+            # its files.
+            time.sleep(GRACE)
+            try:
+                os.killpg(pgid, signal.SIGKILL)     # takes us with it, which is the point
+            except Exception:
+                pass
     except Exception:
         pass
     os._exit(1)
