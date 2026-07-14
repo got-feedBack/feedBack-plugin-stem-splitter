@@ -647,6 +647,16 @@ def _emit(progress_cb: ProgressCB, line: str, pct: float, phase: str) -> None:
         progress_cb({"line": line, "pct": max(0.0, min(1.0, pct)), "phase": phase})
 
 
+def _norm_ref(ref: str | None) -> str:
+    """The one place a ref is normalized.
+
+    check_update() trimmed and defaulted; update_server() passed the raw settings value straight
+    through. Same input, two behaviours — so a ref with stray whitespace could report an update
+    available and then fail to apply it, which reads as "the update button is broken".
+    """
+    return (ref or DEFAULT_SOURCE_REF).strip() or DEFAULT_SOURCE_REF
+
+
 def source_meta(config_dir: Path) -> dict:
     """What source is actually installed (ref + commit)."""
     try:
@@ -664,7 +674,7 @@ def check_update(config_dir: Path, ref: str | None = None) -> dict:
     """
     if not installed(config_dir):
         return {"installed": False, "update_available": False}
-    ref = (ref or DEFAULT_SOURCE_REF).strip() or DEFAULT_SOURCE_REF
+    ref = _norm_ref(ref)
     meta = source_meta(config_dir)
     have = str(meta.get("commit") or "")
     latest = _resolve_commit(ref)
@@ -710,7 +720,13 @@ def update_server(config_dir: Path, ref: str | None = None, port: int = DEFAULT_
     if not installed(config_dir):
         raise RuntimeError("the server isn't installed, so there is nothing to update")
 
-    was_running, _ = is_running(config_dir)
+    ref = _norm_ref(ref)      # exactly as check_update() does it, or "check" and "apply" differ
+
+    # The port it is ACTUALLY on, not just the one the settings say. Those disagree whenever the
+    # user edits the port without restarting — and putting the server back somewhere other than
+    # where we found it is precisely the failure this argument was threaded through to avoid.
+    was_running, live_port = is_running(config_dir)
+    port = _as_port(live_port, port) if was_running else port
     before = str(source_meta(config_dir).get("commit") or "")     # FULL sha, not a prefix
 
     if was_running:
@@ -719,7 +735,9 @@ def update_server(config_dir: Path, ref: str | None = None, port: int = DEFAULT_
 
     try:
         _emit(progress_cb, "Fetching the latest server source…", 0.2, "Updating")
-        download_source(config_dir, ref=ref, progress_cb=progress_cb)
+        # Scaled into [0.2, 0.75): download_source() reports its OWN 0→1, so forwarding our
+        # callback verbatim would slam the bar back to 2% one line after we said 20%.
+        download_source(config_dir, ref=ref, progress_cb=_scaled(progress_cb, 0.2, 0.55))
 
         # The launcher and the driver bootstrap are generated from OUR templates, and a fresh
         # source download overwrites the drivers — so both must be re-applied or the server
@@ -741,7 +759,8 @@ def update_server(config_dir: Path, ref: str | None = None, port: int = DEFAULT_
                   0.9, "Updating")
             try:
                 start_server(config_dir, port=port, device=device, model=model,
-                             warmup=models_downloaded(config_dir), progress_cb=progress_cb)
+                             warmup=models_downloaded(config_dir),
+                             progress_cb=_scaled(progress_cb, 0.9, 0.1))
             except Exception as restart_error:
                 log.warning("stem_splitter: update failed AND the server could not be "
                             "restarted: %s", restart_error)
@@ -774,13 +793,14 @@ def update_server(config_dir: Path, ref: str | None = None, port: int = DEFAULT_
 
     if was_running:
         _emit(progress_cb, "Restarting the server…", 0.92, "Updating")
-        # On the port it was ACTUALLY running on. Restarting on DEFAULT_PORT would move a
-        # server the user had deliberately configured elsewhere — or collide with whatever is
-        # on 7865 — leaving a working setup down or unreachable, after a click meant to help.
-        # Warmup only if the weights are already on disk: an update must never become a
-        # surprise multi-GB download.
+        # `port` is the live one (resolved from is_running above), falling back to the configured
+        # one. Restarting on DEFAULT_PORT would move a server the user had deliberately put
+        # elsewhere — or collide with whatever is on 7865 — leaving a working setup down or
+        # unreachable, after a click meant to help. Warmup only if the weights are already on
+        # disk: an update must never become a surprise multi-GB download.
         start_server(config_dir, port=port, device=device, model=model,
-                     warmup=models_downloaded(config_dir), progress_cb=progress_cb)
+                     warmup=models_downloaded(config_dir),
+                     progress_cb=_scaled(progress_cb, 0.92, 0.08))
 
     _emit(progress_cb, "Done.", 1.0, "Done")
     st = server_status(config_dir)

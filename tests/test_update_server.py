@@ -21,17 +21,17 @@ class _Stubbed:
     """update_server() with everything that touches the network, the disk, or a process stubbed
     out — so what's under test is the ORCHESTRATION: what it emits, and what it hands to start."""
 
-    def __init__(self, td, was_running=True, before="a" * 40, after="b" * 40):
+    def __init__(self, td, was_running=True, before="a" * 40, after="b" * 40, live_port=None):
         self.cfg = Path(td)
         self.progress = []          # every (pct, phase) emitted, in order
         self.started = []           # every start_server(**kwargs)
         self._commits = [before, after]
         self.patches = [
             mock.patch.object(ds, "installed", return_value=True),
-            mock.patch.object(ds, "is_running", return_value=(was_running, 123)),
+            mock.patch.object(ds, "is_running", return_value=(was_running, live_port)),
             mock.patch.object(ds, "source_meta", side_effect=self._commit),
             mock.patch.object(ds, "stop_server"),
-            mock.patch.object(ds, "download_source"),
+            mock.patch.object(ds, "download_source", side_effect=self._download),
             mock.patch.object(ds, "write_launcher"),
             mock.patch.object(ds, "patch_driver_scripts", return_value=["run_demucs.py"]),
             mock.patch.object(ds, "verify_install"),
@@ -43,8 +43,22 @@ class _Stubbed:
     def _commit(self, *_a, **_k):
         return {"commit": self._commits.pop(0) if len(self._commits) > 1 else self._commits[0]}
 
-    def _start(self, config_dir, **kw):
+    # download_source() and start_server() are whole operations with their OWN 0→1 progress.
+    # Stubbing them silent hid a real bug: update_server forwarded its callback into them
+    # verbatim, so the bar leapt back to 2% right after we reported 20%. A stub that emits
+    # nothing cannot see that — so these emit like the real thing.
+    def _sub_progress(self, cb):
+        if cb:
+            cb({"line": "starting…", "pct": 0.02, "phase": "sub"})
+            cb({"line": "halfway…", "pct": 0.5, "phase": "sub"})
+            cb({"line": "done", "pct": 1.0, "phase": "sub"})
+
+    def _download(self, config_dir, ref=None, progress_cb=None):
+        self._sub_progress(progress_cb)
+
+    def _start(self, config_dir, progress_cb=None, **kw):
         self.started.append(kw)
+        self._sub_progress(progress_cb)
         return {}
 
     def _cb(self, ev):
@@ -56,7 +70,11 @@ class _Stubbed:
         try:
             return ds.update_server(self.cfg, progress_cb=self._cb, **kw)
         finally:
-            for p in self.patches:
+            # LIFO. A test that patches the same attribute twice (the failure cases below do)
+            # has the second patch capture the FIRST MOCK as its original — so unwinding in
+            # start order restores a MagicMock onto the module and leaks it into every test
+            # that runs after.
+            for p in reversed(self.patches):
                 p.stop()
 
 
@@ -119,6 +137,66 @@ class TheServerComesBackWhereItWas(unittest.TestCase):
             out = s.run()
         self.assertTrue(out.get("needs_reinstall"))
         self.assertEqual(s.started, [], "a server that can't import its deps must not be started")
+
+
+    def test_the_live_port_beats_the_configured_one(self):
+        """The settings say 7865, the server is actually on 9001 (the user edited the port and
+        never restarted). Putting it back on 7865 moves a running server — or collides with
+        whatever is there — which is the exact failure the port argument exists to prevent."""
+        with tempfile.TemporaryDirectory() as td:
+            s = _Stubbed(td, live_port=9001)
+            s.run(port=7865)
+        self.assertEqual(s.started[0]["port"], 9001,
+                         "the server must come back where it was, not where the settings guess")
+
+
+class RefNormalization(unittest.TestCase):
+    """check_update() trimmed the ref; update_server() passed the raw settings value through.
+
+    Same input, two behaviours: a ref with stray whitespace reports an update available and then
+    fails to apply it — which the user reads as "the update button is broken"."""
+
+    def test_check_and_apply_normalize_identically(self):
+        with tempfile.TemporaryDirectory() as td:
+            s = _Stubbed(td)
+            seen = {}
+            s.patches.append(mock.patch.object(
+                ds, "download_source",
+                side_effect=lambda cfg, ref=None, progress_cb=None: seen.setdefault("ref", ref)))
+            s.run(ref="  main\n")
+
+            with mock.patch.object(ds, "installed", return_value=True), \
+                 mock.patch.object(ds, "source_meta", return_value={"commit": "x" * 40}), \
+                 mock.patch.object(ds, "_resolve_commit", return_value="y" * 40) as res:
+                ds.check_update(s.cfg, ref="  main\n")
+
+        self.assertEqual(seen["ref"], "main")
+        self.assertEqual(res.call_args.args[0], "main")
+
+    def test_an_empty_ref_falls_back_to_the_default(self):
+        with tempfile.TemporaryDirectory() as td:
+            s = _Stubbed(td)
+            seen = {}
+            s.patches.append(mock.patch.object(
+                ds, "download_source",
+                side_effect=lambda cfg, ref=None, progress_cb=None: seen.setdefault("ref", ref)))
+            s.run(ref="   ")
+        self.assertEqual(seen["ref"], ds.DEFAULT_SOURCE_REF)
+
+
+class TheStubsDoNotLeak(unittest.TestCase):
+    """A patch stopped out of order restores a MagicMock onto the module — and every test that
+    runs afterwards silently exercises the mock instead of the code."""
+
+    def test_the_module_is_intact_after_a_double_patched_run(self):
+        real_download, real_verify = ds.download_source, ds.verify_install
+        with tempfile.TemporaryDirectory() as td:
+            s = _Stubbed(td)
+            s.patches.append(
+                mock.patch.object(ds, "verify_install", side_effect=RuntimeError("no sphn")))
+            s.run()
+        self.assertIs(ds.download_source, real_download)
+        self.assertIs(ds.verify_install, real_verify)
 
 
 class CheckUpdateContract(unittest.TestCase):
