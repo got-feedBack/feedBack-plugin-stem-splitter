@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.3.3
+
+### Update server
+
+- **New: "Check for update" in the managed-server card.** The server's `server.py` is
+  downloaded at *install* time and never touched again — so a bug fixed upstream could not
+  reach anyone who had already installed. The only route was to uninstall and re-download
+  several GB of wheels for a one-line change, which nobody does, so in practice the fix
+  simply never landed.
+
+  It re-fetches the source only (a few hundred KB), re-applies the launcher and driver
+  bootstrap, and restarts the server if it was running. Dependencies and the model cache are
+  untouched, so nothing is re-downloaded.
+
+  Checking hits GitHub, so it happens only on a click — the status poll stays offline.
+  The update runs only if there is genuinely something newer, so the button never restarts a
+  healthy server for nothing.
+
 ## 0.3.2
 
 ### Fixes — no more model re-downloads at launch

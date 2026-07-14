@@ -188,6 +188,7 @@
          LABEL is what clicking will do. -->
     <button class="ss-actionbtn red" id="ss-srv-toggle"><i class="dot"></i><span id="ss-srv-toggle-label">Start server</span></button>
     <button class="ss-actionbtn grey" id="ss-srv-test">Test status</button>
+    <button class="ss-actionbtn grey" id="ss-srv-update">Check for update</button>
     <button class="ss-actionbtn grey" id="ss-srv-uninstall">Uninstall server</button>
   </div>
 
@@ -598,7 +599,8 @@
     el.addEventListener('change', queueServerSave);
     if (el.tagName === 'INPUT' && el.type === 'text') el.addEventListener('input', queueServerSave);
   });
-  var SERVER_BTNS = ['ss-srv-install', 'ss-srv-toggle', 'ss-srv-test', 'ss-srv-uninstall'];
+  var SERVER_BTNS = ['ss-srv-install', 'ss-srv-toggle', 'ss-srv-test', 'ss-srv-update',
+                   'ss-srv-uninstall'];
   var serverManageable = true;   // false when the backend says it can't manage a server here
   var serverBusy = false;        // an install/start/stop/prepare is in flight
   function setServerButtons(disabled) {
@@ -1147,6 +1149,65 @@
       });
     }).catch(function (e) { dkLog('✗ ' + e); })
       .finally(function () { setDkButtons(false); });
+  });
+
+
+  // ── Update the server source ───────────────────────────────────────────────
+  //
+  // server.py is downloaded at INSTALL time and never touched again, so a bug fixed upstream
+  // cannot reach anyone who already installed — short of uninstalling and re-downloading
+  // several GB of wheels for a one-line change, which nobody does. In practice the fix never
+  // lands. (The cache sweeper that deletes model weights daily is exactly that: fixed
+  // upstream, unreachable in the field.)
+  //
+  // Two steps on purpose: CHECK hits the network, so it only happens on a click — the status
+  // poll must stay offline. Then update only if there is actually something newer, so the
+  // button doesn't restart a healthy server for nothing.
+  $('ss-srv-update').addEventListener('click', function () {
+    setServerButtons(true);
+    $('ss-srv-progress').style.display = 'block';
+    $('ss-srv-log').textContent = 'Checking for a newer server revision…\n';
+    setSrvBar(0.1, 'Checking');
+
+    j('/server/check_update').then(function (r) {
+      if (!r || !r.installed) {
+        srvLog('The server is not installed, so there is nothing to update.');
+        setSrvBar(0, 'Not installed');
+        setServerButtons(false);
+        return;
+      }
+      if (r.latest == null) {
+        srvLog('✗ ' + (r.reason || 'Could not reach GitHub.'));
+        setSrvBar(0, 'Offline');
+        setServerButtons(false);
+        return;
+      }
+      var have = (r.commit || '').slice(0, 8) || 'unknown';
+      var latest = (r.latest || '').slice(0, 8);
+      if (!r.update_available && !r.unknown) {
+        srvLog('✓ Already up to date (' + have + ').');
+        setSrvBar(1, 'Up to date');
+        setServerButtons(false);
+        return;
+      }
+      srvLog(r.unknown
+        ? 'This install predates commit tracking, so its revision is unknown — updating to '
+          + latest + '.'
+        : 'Update available: ' + have + ' → ' + latest + '. Updating…');
+      setSrvBar(0.2, 'Updating');
+      connectWS();
+      return j('/server/update', { method: 'POST' }).then(function (res) {
+        if (res && res.ok === false && res.busy) {
+          srvLog('… ' + (res.message || 'another server operation is running'));
+          setSrvBar(0, 'Busy');
+          setServerButtons(false);
+        }
+      });
+    }).catch(function (e) {
+      srvLog('✗ ' + e);
+      setSrvBar(0, 'Failed');
+      setServerButtons(false);
+    });
   });
 
   loadConfig();

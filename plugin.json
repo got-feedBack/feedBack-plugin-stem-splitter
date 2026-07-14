@@ -1,7 +1,7 @@
 {
   "id": "stem_splitter",
   "name": "Stem Splitter",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Split feedpak stems and transcribe lyrics — remote server or opt-in local engine.",
   "bundled": true,
   "script": "screen.js",

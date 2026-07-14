@@ -656,6 +656,90 @@ def source_meta(config_dir: Path) -> dict:
         return {}
 
 
+def check_update(config_dir: Path, ref: str | None = None) -> dict:
+    """Is a newer server revision available?
+
+    Hits the network (one GitHub API call), so it is NEVER called from the status poll —
+    only from an explicit click. `server_status()` stays offline and cheap.
+    """
+    if not installed(config_dir):
+        return {"installed": False, "update_available": False}
+    ref = (ref or DEFAULT_SOURCE_REF).strip() or DEFAULT_SOURCE_REF
+    meta = source_meta(config_dir)
+    have = str(meta.get("commit") or "")
+    latest = _resolve_commit(ref)
+    if not latest:
+        return {"installed": True, "ref": ref, "commit": have, "latest": None,
+                "update_available": False,
+                "reason": "Could not reach GitHub to check for a newer revision."}
+    return {
+        "installed": True,
+        "ref": ref,
+        "commit": have,
+        "latest": latest,
+        "update_available": bool(have) and have != latest,
+        # No recorded commit means the install predates commit-pinning: we cannot prove it's
+        # current, so offer the update rather than claiming it's fine.
+        "unknown": not have,
+    }
+
+
+def update_server(config_dir: Path, ref: str | None = None,
+                  progress_cb: ProgressCB = None) -> dict:
+    """Re-fetch the server SOURCE at `ref` and restart it if it was running.
+
+    Why this exists: server.py is downloaded at INSTALL time and never touched again, so a
+    bug fixed upstream cannot reach anyone who already installed — they would have to
+    uninstall and re-download several GB of wheels to pick up a one-line change. That is not
+    a thing anyone will do, so in practice the fix never lands. (The 24h cache sweeper that
+    deletes model weights daily is exactly this: fixed upstream, unreachable in the field.)
+
+    This updates ONLY the source: a few hundred KB. It does not touch pylibs (the deps are
+    pinned by requirements.txt, which we re-fetch — if THAT changes, verify_install() will say
+    so and the user can reinstall) and it does not touch the model cache, so nothing is
+    re-downloaded.
+    """
+    if not installed(config_dir):
+        raise RuntimeError("the server isn't installed, so there is nothing to update")
+
+    was_running, _ = is_running(config_dir)
+    before = str(source_meta(config_dir).get("commit") or "")[:8]
+
+    if was_running:
+        _emit(progress_cb, "Stopping the server…", 0.05, "Updating")
+        stop_server(config_dir)
+
+    _emit(progress_cb, "Fetching the latest server source…", 0.2, "Updating")
+    download_source(config_dir, ref=ref, progress_cb=progress_cb)
+
+    # The launcher and the driver bootstrap are generated from OUR templates, and a fresh
+    # source download overwrites the drivers — so both must be re-applied or the server comes
+    # back up unable to import its own dependencies.
+    write_launcher(config_dir)
+    patched = patch_driver_scripts(config_dir)
+    if patched:
+        _emit(progress_cb, f"Re-bootstrapped {', '.join(patched)}.", 0.8, "Updating")
+
+    after = str(source_meta(config_dir).get("commit") or "")[:8]
+    changed = before != after
+    _emit(progress_cb,
+          f"Updated {before or '?'} → {after or '?'}." if changed
+          else f"Already up to date ({after or '?'}).",
+          0.85, "Updating")
+
+    if was_running:
+        _emit(progress_cb, "Restarting the server…", 0.9, "Updating")
+        # Warmup only if the weights are already on disk — an update must never turn into a
+        # surprise multi-GB download.
+        start_server(config_dir, warmup=models_downloaded(config_dir),
+                     progress_cb=progress_cb)
+
+    _emit(progress_cb, "Done.", 1.0, "Done")
+    st = server_status(config_dir)
+    st["updated"] = changed
+    return st
+
+
 def _resolve_commit(ref: str) -> str | None:
     """Resolve a ref to an immutable commit SHA. None if GitHub can't be reached
     (we then fall back to the branch archive rather than failing the install)."""

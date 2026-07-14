@@ -734,6 +734,29 @@ def setup(app: FastAPI, context: dict) -> None:
             return _busy()
         return demucs_server.stop_server(mgr.config_dir)
 
+    @app.get(f"{P}/server/check_update")
+    def get_server_check_update():
+        """Explicit only — this hits GitHub. server_status() stays offline and cheap, because
+        it is polled every few seconds and must never do network I/O."""
+        s = mgr.read_settings()
+        return demucs_server.check_update(mgr.config_dir, ref=s.get("local_server_ref") or None)
+
+    @app.post(f"{P}/server/update")
+    def post_server_update():
+        """Re-fetch the server SOURCE (a few hundred KB) and restart it.
+
+        server.py is downloaded at INSTALL time and never touched again, so a bug fixed
+        upstream cannot reach anyone who already installed — short of uninstalling and
+        re-downloading several GB of wheels for a one-line change, which nobody will do. In
+        practice the fix simply never lands. This is the path that lets it.
+        """
+        s = mgr.read_settings()
+        ref = s.get("local_server_ref") or None
+        if not mgr.run_server_op("update", lambda cb: demucs_server.update_server(
+                mgr.config_dir, ref=ref, progress_cb=cb)):
+            return _busy()
+        return {"ok": True}
+
     # ── managed sibling container (Docker socket) ────────────────────────────
     #
     # A containerized feedBack cannot start a process on its host - that is a namespace
