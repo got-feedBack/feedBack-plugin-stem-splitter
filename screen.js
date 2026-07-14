@@ -97,7 +97,7 @@
     return post(kind, body).then(function (res) {
       if (!res || !res.needs_setup) return res;
       if (!window.confirm(res.message + '\n\nThe download runs in the background; your '
-                          + (kind === 'split' ? 'split' : 'transcription')
+                          + kindNoun(kind)
                           + ' starts automatically when it finishes.')) {
         toast('Cancelled', 'Models are needed before this can run.');
         return res;

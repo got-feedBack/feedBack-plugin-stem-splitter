@@ -95,14 +95,8 @@ def lyrics_to_text(tokens: list[dict]) -> str:
     return "\n".join(" ".join(ln) for ln in lines if ln)
 
 
-def segments_to_lyrics(segments: list[dict]) -> list[dict]:
-    """/align word-granularity output -> sloppak tokens.
-
-    The server marks the FIRST word of each line with `new_line`. sloppak marks the LAST syllable
-    of a line with a `+` suffix. So the break has to be moved back one token — writing `+` on the
-    word the server flagged would end every line one word early, and the renderer would show the
-    break in the wrong place on every single line.
-    """
+def segments_to_words(segments: list[dict]) -> list[dict]:
+    """/align word-granularity output -> a plain timed word list. Nothing sloppak-shaped yet."""
     words: list[dict] = []
     for seg in segments or []:
         if not isinstance(seg, dict):
@@ -115,16 +109,114 @@ def segments_to_lyrics(segments: list[dict]) -> list[dict]:
             "t": round(float(start), 3),
             "d": round(max(0.0, float(end) - float(start)), 3),
             "w": text,
-            "_nl": bool(seg.get("new_line")),
         })
+    return words
 
-    out: list[dict] = []
-    for i, w in enumerate(words):
-        nxt = words[i + 1] if i + 1 < len(words) else None
-        text = w["w"]
-        if nxt is not None and nxt["_nl"]:
-            text += "+"                    # this word is the LAST of its line
-        out.append({"t": w["t"], "d": w["d"], "w": text})
+
+def _token_words(tokens: list[dict]) -> list[tuple[str, list[int]]]:
+    """Group the pak's SYLLABLE tokens into words: [(comparable_word, [token indices]), ...]."""
+    words: list[tuple[str, list[int]]] = []
+    buf, idx = "", []
+    for i, tok in enumerate(tokens):
+        if not isinstance(tok, dict):
+            continue
+        raw = str(tok.get("w") or "")
+        if not raw:
+            continue
+        body = raw[:-1] if raw.endswith("+") else raw
+        joins = body.endswith("-")
+        if joins:
+            body = body[:-1]
+        buf += body
+        idx.append(i)
+        if not joins:
+            key = _words(buf)
+            words.append((key[0] if key else "", list(idx)))
+            buf, idx = "", []
+    if idx:
+        key = _words(buf)
+        words.append((key[0] if key else "", list(idx)))
+    return words
+
+
+def retime_tokens(tokens: list[dict], aligned: list[dict]) -> list[dict]:
+    """Rebuild the pak's lyrics from ITS OWN tokens, changing only `t` and `d`.
+
+    This is the whole feature, and the earlier version got it subtly wrong: it built the new
+    lyrics out of the words the SERVER returned. Forced alignment legitimately drops a word it
+    can't place — so every dropped word was silently deleted from the user's song. A re-align
+    that quietly loses "dancer" from the chorus has not kept the promise; it has broken it in a
+    way nobody notices until they play the song.
+
+    So the output is the user's tokens, in the user's order, with the user's exact text —
+    including the `-` joins and `+` line breaks, which means the line structure they authored
+    survives too, rather than being replaced by wherever the aligner decided a line was. Only the
+    numbers move.
+
+    An unaligned word keeps its place and is given a plausible span, interpolated across the gap
+    between the neighbours that DID align. It is better to sing a word slightly early than to
+    lose it.
+    """
+    groups = _token_words(tokens)
+    got = [dict(w, _k=(_words(w["w"])[:1] or [""])[0]) for w in aligned]
+
+    # Match aligned words onto the original words, in order (the same subsequence rule the guard
+    # enforces): the aligner may skip, never invent or reorder.
+    spans: list[tuple[float, float] | None] = [None] * len(groups)
+    gi = 0
+    for w in got:
+        while gi < len(groups) and groups[gi][0] != w["_k"]:
+            gi += 1
+        if gi >= len(groups):
+            break
+        spans[gi] = (float(w["t"]), float(w["t"]) + float(w["d"]))
+        gi += 1
+
+    anchored = [i for i, s in enumerate(spans) if s is not None]
+    if not anchored:
+        raise RuntimeError("no word in your lyrics could be matched to the aligner's output")
+
+    # Fill the unaligned words by interpolation, so they keep their place in the song.
+    _AVG = 0.35          # seconds; only used at the very edges, where there is nothing to divide
+    for i in range(len(groups)):
+        if spans[i] is not None:
+            continue
+        prev = max((a for a in anchored if a < i), default=None)
+        nxt = min((a for a in anchored if a > i), default=None)
+        if prev is not None and nxt is not None:
+            # Share the gap between the neighbours among the unaligned run.
+            run = [j for j in range(prev + 1, nxt) if spans[j] is None]
+            start, end = spans[prev][1], spans[nxt][0]
+            width = max(0.0, end - start) / max(1, len(run))
+            for k, j in enumerate(run):
+                spans[j] = (start + k * width, start + (k + 1) * width)
+        elif nxt is not None:                       # unaligned words before the first anchor
+            run = [j for j in range(0, nxt) if spans[j] is None]
+            end = spans[nxt][0]
+            width = min(_AVG, end / max(1, len(run))) if end > 0 else 0.0
+            for k, j in enumerate(run):
+                spans[j] = (max(0.0, end - (len(run) - k) * width),
+                            max(0.0, end - (len(run) - k - 1) * width))
+        else:                                       # ...and after the last one
+            run = [j for j in range(prev + 1, len(groups)) if spans[j] is None]
+            start = spans[prev][1]
+            for k, j in enumerate(run):
+                spans[j] = (start + k * _AVG, start + (k + 1) * _AVG)
+
+    # Split each word's span across its syllables, proportional to their length — a long syllable
+    # gets a long slice, which is closer to how they are actually sung than an even split.
+    out = [dict(t) for t in tokens if isinstance(t, dict)]
+    for (_key, idxs), span in zip(groups, spans):
+        start, end = span
+        total = max(0.0, end - start)
+        sizes = [max(1, len(str(out[i].get("w") or "").rstrip("+").rstrip("-"))) for i in idxs]
+        span_total = sum(sizes)
+        cursor = start
+        for i, size in zip(idxs, sizes):
+            share = total * (size / span_total) if span_total else 0.0
+            out[i]["t"] = round(cursor, 3)
+            out[i]["d"] = round(share, 3)
+            cursor += share
     return out
 
 
@@ -220,7 +312,11 @@ def _content_type(path: Path) -> str:
 def align_vocals_remote(vocals: Path, text: str, server_url: str, *,
                         language: str | None = None, api_key: str | None = None,
                         timeout: int = 300, progress_cb: ProgressCB = None) -> list[dict]:
-    """POST the stem AND the lyrics to `/align`, ask for word granularity."""
+    """POST the stem AND the lyrics to `/align`. Returns the server's TIMED WORDS.
+
+    Deliberately not sloppak tokens: the pak's lyrics get rebuilt from the pak's OWN tokens (see
+    retime_tokens). Nothing the server says about the text is written to disk — only its numbers.
+    """
     import requests
 
     server_url = server_url.rstrip("/")
@@ -274,7 +370,7 @@ def align_vocals_remote(vocals: Path, text: str, server_url: str, *,
     finally:
         resp.close()
 
-    return segments_to_lyrics(segments)
+    return segments_to_words(segments)
 
 
 def realign_pak(pak_path: Path, *, server_url: str | None = None, api_key: str | None = None,
@@ -344,11 +440,11 @@ def realign_pak(pak_path: Path, *, server_url: str | None = None, api_key: str |
         if cancel_cb:
             cancel_cb()
 
-        lyrics = align_vocals_remote(
+        aligned = align_vocals_remote(
             vocals, text, server_url, language=language, api_key=api_key,
             progress_cb=progress_cb,
         )
-        if not lyrics:
+        if not aligned:
             # The words went in and nothing came back with a timestamp. Do NOT write that:
             # replacing a song's lyrics with an empty file, on a "re-align" click, would destroy
             # the one thing the user was trying to keep.
@@ -357,10 +453,15 @@ def realign_pak(pak_path: Path, *, server_url: str | None = None, api_key: str |
                 "may be in a different language than the audio"
             )
 
-        # The whole promise of this feature, checked rather than assumed. A server that hands
-        # back different words — normalized, re-tokenized, or simply misbehaving — must not be
-        # allowed to overwrite the user's lyrics with them.
-        _verify_words_survived(text, lyrics)
+        # The whole promise, checked rather than assumed: a server that hands back different
+        # words — normalized, re-tokenized, or simply misbehaving — must not get anywhere near
+        # the user's lyrics.
+        _verify_words_survived(text, aligned)
+
+        # Rebuild from the ORIGINAL tokens. The server's words are used for their timings and
+        # nothing else, so a word the aligner failed to place keeps its text, its place in the
+        # line, and an interpolated span — rather than being quietly deleted from the song.
+        lyrics = retime_tokens(tokens, aligned)
 
         if cancel_cb:
             cancel_cb()
@@ -374,5 +475,6 @@ def realign_pak(pak_path: Path, *, server_url: str | None = None, api_key: str |
         # source, and every other key are exactly as they were. Only the timings moved.
         pak_io.repack(pak_path, add_files={str(lyrics_rel): out})
 
-    log.info("stem_splitter: re-aligned %d syllables in %s", len(lyrics), pak_path.name)
+    log.info("stem_splitter: re-aligned %d of %d syllables in %s (%d words timed by the aligner)",
+             len(lyrics), len(tokens), pak_path.name, len(aligned))
     return True

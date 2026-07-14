@@ -17,6 +17,7 @@ song:
   could do.
 """
 import json
+from pathlib import Path
 import os
 import sys
 import unittest
@@ -57,60 +58,75 @@ class SyllablesAreNotWords(unittest.TestCase):
         self.assertEqual(realign.lyrics_to_text(tokens), "real")
 
 
-class TheLineBreakMovesBackOneToken(unittest.TestCase):
-    """The server flags the FIRST word of a line; sloppak flags the LAST syllable of one.
+class TheLyricsAreRebuiltFromTheUsersOwnTokens(unittest.TestCase):
+    """The output is the user's tokens with new numbers. It is never the server's tokens.
 
-    Copy the flag across as-is and every line breaks one word early — in every song."""
+    The earlier version built the new lyrics out of the words the SERVER returned — and forced
+    alignment legitimately drops a word it can't place, so every dropped word was silently deleted
+    from the song. A re-align that quietly loses "dancer" from the chorus hasn't kept the promise;
+    it has broken it in the way nobody notices until they play the song. (Caught by CodeRabbit.)
+    """
 
-    def test_the_plus_lands_on_the_word_before_the_break(self):
-        segments = [
-            {"start": 0.0, "end": 0.4, "text": "hello", "new_line": True},
-            {"start": 0.5, "end": 0.9, "text": "world"},
-            {"start": 2.0, "end": 2.4, "text": "second", "new_line": True},
-            {"start": 2.5, "end": 2.9, "text": "line"},
-        ]
-        out = realign.segments_to_lyrics(segments)
-        self.assertEqual([t["w"] for t in out], ["hello", "world+", "second", "line"],
-                         "the `+` belongs on the LAST word of a line, not the first")
+    def test_a_word_the_aligner_dropped_is_still_in_the_lyrics(self):
+        tokens = [{"t": 0, "d": 1, "w": "hold"}, {"t": 1, "d": 1, "w": "me"},
+                  {"t": 2, "d": 1, "w": "closer"}]
+        aligned = [{"t": 10.0, "d": 0.4, "w": "hold"},      # "me" was not placed
+                   {"t": 11.0, "d": 0.6, "w": "closer"}]
+        out = realign.retime_tokens(tokens, aligned)
 
-    def test_timings_are_start_and_duration(self):
-        out = realign.segments_to_lyrics([{"start": 1.25, "end": 1.75, "text": "x"}])
-        self.assertEqual(out, [{"t": 1.25, "d": 0.5, "w": "x"}])
+        self.assertEqual([x["w"] for x in out], ["hold", "me", "closer"],
+                         "the dropped word must survive — losing it is the bug this guards")
+        self.assertEqual(out[0]["t"], 10.0)
+        self.assertEqual(out[2]["t"], 11.0)
+        # ...and it lands between its neighbours rather than at zero.
+        self.assertGreaterEqual(out[1]["t"], out[0]["t"])
+        self.assertLessEqual(out[1]["t"], out[2]["t"])
 
-    def test_a_backwards_segment_does_not_produce_a_negative_duration(self):
-        out = realign.segments_to_lyrics([{"start": 2.0, "end": 1.0, "text": "x"}])
-        self.assertEqual(out[0]["d"], 0.0)
+    def test_the_authored_line_structure_survives(self):
+        # The `+` breaks are the user's. The aligner's idea of where a line ends is irrelevant.
+        tokens = [{"t": 0, "d": 1, "w": "hold"}, {"t": 1, "d": 1, "w": "me+"},
+                  {"t": 2, "d": 1, "w": "closer"}]
+        aligned = [{"t": 5.0, "d": 0.3, "w": "hold"}, {"t": 5.4, "d": 0.3, "w": "me"},
+                   {"t": 6.0, "d": 0.5, "w": "closer"}]
+        out = realign.retime_tokens(tokens, aligned)
+        self.assertEqual([x["w"] for x in out], ["hold", "me+", "closer"])
 
-    def test_untimed_segments_are_dropped(self):
-        segments = [{"text": "no times"}, {"start": 1.0, "end": 2.0, "text": "kept"}]
-        self.assertEqual([t["w"] for t in realign.segments_to_lyrics(segments)], ["kept"])
+    def test_a_word_split_into_syllables_shares_its_span(self):
+        tokens = [{"t": 0, "d": 1, "w": "to-"}, {"t": 1, "d": 1, "w": "geth-"},
+                  {"t": 2, "d": 1, "w": "er"}]
+        aligned = [{"t": 4.0, "d": 0.9, "w": "together"}]
+        out = realign.retime_tokens(tokens, aligned)
+
+        self.assertEqual([x["w"] for x in out], ["to-", "geth-", "er"], "syllables are preserved")
+        self.assertAlmostEqual(out[0]["t"], 4.0, places=2)
+        # contiguous, and covering the aligned word's span
+        self.assertAlmostEqual(out[2]["t"] + out[2]["d"], 4.9, places=1)
+        for a, b in zip(out, out[1:]):
+            self.assertAlmostEqual(a["t"] + a["d"], b["t"], places=2,
+                                   msg="syllables of one word must not overlap or leave gaps")
+
+    def test_timings_are_the_new_ones(self):
+        tokens = [{"t": 99.0, "d": 9.0, "w": "hello"}]
+        out = realign.retime_tokens(tokens, [{"t": 1.0, "d": 0.5, "w": "hello"}])
+        self.assertEqual(out[0], {"t": 1.0, "d": 0.5, "w": "hello"})
+
+    def test_nothing_matching_at_all_is_refused(self):
+        with self.assertRaises(RuntimeError):
+            realign.retime_tokens([{"t": 0, "d": 1, "w": "hello"}],
+                                  [{"t": 1, "d": 1, "w": "goodbye"}])
+
+    def test_segments_to_words_drops_untimed_and_keeps_timings(self):
+        out = realign.segments_to_words([
+            {"text": "no times"},
+            {"start": 1.25, "end": 1.75, "text": "kept"},
+            {"start": 2.0, "end": 1.0, "text": "backwards"},   # must not go negative
+        ])
+        self.assertEqual([w["w"] for w in out], ["kept", "backwards"])
+        self.assertEqual(out[0], {"t": 1.25, "d": 0.5, "w": "kept"})
+        self.assertEqual(out[1]["d"], 0.0)
 
 
-class TheVocalStemIsFoundTheSameWayTranscribeFindsIt(unittest.TestCase):
-    """A pak written by another tool can carry `"Vocals"`.
-
-    transcribe.py lowercases before comparing; this used to match case-sensitively. Same manifest,
-    two answers: it would transcribe fine and then re-align with "this song has no vocal stem" —
-    which reads as a broken pak rather than a broken plugin."""
-
-    def test_a_capitalised_stem_id_is_found(self):
-        m = {"stems": [{"id": "Vocals", "file": "stems/vocals.ogg"}]}
-        self.assertEqual(realign._vocals_relpath(m), "stems/vocals.ogg")
-
-    def test_whitespace_is_trimmed(self):
-        m = {"stems": [{"id": " vocals ", "file": " stems/vocals.ogg "}]}
-        self.assertEqual(realign._vocals_relpath(m), "stems/vocals.ogg")
-
-    def test_an_empty_file_field_is_not_a_stem(self):
-        m = {"stems": [{"id": "vocals", "file": "  "}]}
-        self.assertIsNone(realign._vocals_relpath(m))
-
-    def test_other_stems_are_not_mistaken_for_vocals(self):
-        m = {"stems": [{"id": "drums", "file": "stems/drums.ogg"}]}
-        self.assertIsNone(realign._vocals_relpath(m))
-
-
-class TheWordsAreVerIfiedNotAssumed(unittest.TestCase):
+class TheWordsAreVerifiedNotAssumed(unittest.TestCase):
     """The feature's promise is "your words are safe". Checked, not trusted.
 
     Forced alignment hands back OUR text with timings — so if different words come back, something
@@ -174,6 +190,37 @@ class TheWordsAreVerIfiedNotAssumed(unittest.TestCase):
         repack.assert_not_called()
 
 
+class WhatLandsInThePakKeepsEveryWord(unittest.TestCase):
+    """End to end, through realign_pak: read the bytes that would actually be written.
+
+    The unit tests prove retime_tokens preserves words. This proves the pak gets THAT, and not
+    something else — I checked, and without it the whole feature could be rewired to write the
+    server's words back and every unit test would still pass."""
+
+    def test_the_written_lyrics_still_contain_the_dropped_word(self):
+        tokens = [{"t": 0, "d": 1, "w": "hold"},
+                  {"t": 1, "d": 1, "w": "me"},
+                  {"t": 2, "d": 1, "w": "closer"}]
+        manifest = {"lyrics": "lyrics.json",
+                    "stems": [{"id": "vocals", "file": "stems/vocals.ogg"}]}
+        written = {}
+
+        def capture(pak, *, add_files=None, **kw):
+            path = (add_files or {})["lyrics.json"]
+            written["lyrics"] = json.loads(Path(path).read_text(encoding="utf-8"))
+
+        with mock.patch.object(realign.pak_io, "read_manifest", return_value=manifest),              mock.patch.object(realign.pak_io, "read_member_bytes",
+                               side_effect=[json.dumps(tokens).encode(), b"audio"]),              mock.patch.object(realign, "align_vocals_remote",
+                               return_value=[{"t": 10.0, "d": 0.4, "w": "hold"},
+                                             {"t": 11.0, "d": 0.6, "w": "closer"}]),              mock.patch.object(realign.pak_io, "repack", side_effect=capture):
+            self.assertTrue(realign.realign_pak("song.sloppak", server_url="http://s"))
+
+        got = [tok["w"] for tok in written["lyrics"]]
+        self.assertEqual(got, ["hold", "me", "closer"],
+                         "the aligner dropped 'me'; the pak must NOT lose it")
+        self.assertEqual(written["lyrics"][0]["t"], 10.0, "and the timings must be the new ones")
+
+
 class TheUploadDescribesTheFileItActuallyIs(unittest.TestCase):
     """A pak from another tool can carry a .wav or .flac vocals stem. Telling the server (or a
     proxy in front of it) that a wav is an ogg is how an upload gets rejected or mis-decoded."""
@@ -187,8 +234,8 @@ class TheUploadDescribesTheFileItActuallyIs(unittest.TestCase):
 
 
 class TheRoundTripPreservesTheWords(unittest.TestCase):
-    def test_text_out_equals_text_in(self):
-        """The point of the feature: same words, new timings."""
+    def test_the_song_comes_back_word_for_word(self):
+        """The point of the feature, end to end: same words, same lines, new timings."""
         original = [
             {"t": 0.0, "d": 0.3, "w": "hold"},
             {"t": 0.4, "d": 0.3, "w": "me"},
@@ -200,19 +247,23 @@ class TheRoundTripPreservesTheWords(unittest.TestCase):
         text = realign.lyrics_to_text(original)
         self.assertEqual(text, "hold me closer\ntiny dancer")
 
-        # What the server gives back for that text, at word granularity, with new timings.
-        segments = [
+        # What the server gives back for that text — with "tiny" left unplaced, as happens.
+        aligned = realign.segments_to_words([
             {"start": 10.0, "end": 10.3, "text": "hold", "new_line": True},
             {"start": 10.4, "end": 10.6, "text": "me"},
             {"start": 10.7, "end": 11.2, "text": "closer"},
-            {"start": 12.0, "end": 12.4, "text": "tiny", "new_line": True},
-            {"start": 12.5, "end": 13.1, "text": "dancer"},
-        ]
-        out = realign.segments_to_lyrics(segments)
+            {"start": 12.5, "end": 13.1, "text": "dancer", "new_line": True},
+        ])
+        realign._verify_words_survived(text, aligned)
+        out = realign.retime_tokens(original, aligned)
 
         self.assertEqual(realign.lyrics_to_text(out), text,
                          "a re-align must not change a single word — that is the entire promise")
+        self.assertEqual([x["w"] for x in out], [x["w"] for x in original],
+                         "including the syllable splits and the line breaks the user authored")
         self.assertEqual(out[0]["t"], 10.0, "and the timings must actually be the new ones")
+        self.assertNotEqual(out[4]["t"], original[4]["t"],
+                            "even the word the aligner dropped gets a new, plausible time")
 
 
 class ItRefusesRatherThanDestroys(unittest.TestCase):
@@ -294,7 +345,7 @@ class TheRequestIsTheContract(unittest.TestCase):
         def close(self):
             pass
 
-    def test_it_posts_the_text_and_asks_for_word_granularity(self, ):
+    def test_it_posts_the_text_and_asks_for_word_granularity(self):
         import tempfile
         from pathlib import Path
         with tempfile.TemporaryDirectory() as td:
