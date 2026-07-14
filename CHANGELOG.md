@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.3.3
+
+### Update server
+
+- **New: "Check for update" in the managed-server card.** The server's `server.py` is
+  downloaded at *install* time and never touched again — so a bug fixed upstream could not
+  reach anyone who had already installed. The only route was to uninstall and re-download
+  several GB of wheels for a one-line change, which nobody does, so in practice the fix
+  simply never landed.
+
+  It re-fetches the source only (a few hundred KB), re-applies the launcher and driver
+  bootstrap, and restarts the server if it was running. Dependencies and the model cache are
+  untouched, so nothing is re-downloaded.
+
+  Checking hits GitHub, so it happens only on a click — the status poll stays offline.
+  The update runs only if there is genuinely something newer, so the button never restarts a
+  healthy server for nothing.
+
+### Fixes
+
+- **The status chips said "downloading" when nothing was being downloaded.** The server marks
+  a model as `downloading` while it *warms up* — even when it is only loading a cached file
+  from disk into VRAM. So a few-second RAM load was displayed as a download, and users
+  reasonably concluded their weights had been thrown away and re-fetched. (Reported exactly
+  that way, and the user was right to believe the UI.)
+
+  `server_status()` now reports which weights are on disk, per model, and a warm-up of a file
+  we can already see reads **loading** (blue) rather than **downloading** (amber). A genuine
+  fetch still says downloading.
+
+  Done plugin-side on purpose: a server-side fix would have to reach people through a source
+  refresh, and the plugin already knows what is on disk.
+
 ## 0.3.2
 
 ### Fixes — no more model re-downloads at launch
