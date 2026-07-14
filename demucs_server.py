@@ -613,12 +613,17 @@ def _die():
             deadline = time.time() + GRACE
             while time.time() < deadline and any(_alive(k) for k in kids):
                 time.sleep(0.25)
-            for kid in kids:
-                if _alive(kid):
-                    try:
-                        os.kill(kid, signal.SIGKILL)
-                    except OSError:
-                        pass
+
+            # RE-ENUMERATE before the kill. Reusing the list we snapshotted five seconds ago
+            # means SIGKILLing pids that may no longer be ours: a worker exits, the OS recycles
+            # its pid, and we shoot whatever inherited it. Rare, but the failure mode is
+            # "killed an unrelated process on the user's machine", which is not a thing to
+            # leave to chance. Asking the OS again costs one `ps`.
+            for kid in _descendants(os.getpid()):
+                try:
+                    os.kill(kid, signal.SIGKILL)
+                except OSError:
+                    pass
     except Exception:
         pass
     os._exit(1)
@@ -627,17 +632,42 @@ def _die():
 def _watch_parent(ppid):
     if os.name == "nt":
         import ctypes
+        from ctypes import wintypes
+
         SYNCHRONIZE = 0x00100000
-        kernel32 = ctypes.windll.kernel32
+        INFINITE = 0xFFFFFFFF
+        WAIT_OBJECT_0 = 0x0
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        # DECLARE THE SIGNATURES. Without restype, ctypes assumes a function returns a 32-bit
+        # C int — but a HANDLE on 64-bit Windows is 64 bits wide, so the handle gets TRUNCATED.
+        # WaitForSingleObject is then handed a garbage handle, fails immediately instead of
+        # blocking, and the watchdog concludes the parent has died... two seconds after the
+        # server started. It would kill the server on startup, every time, on any machine
+        # unlucky enough to get a handle above 2^31. That it works today is luck (handles are
+        # usually small), not correctness.
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
         h = kernel32.OpenProcess(SYNCHRONIZE, False, ppid)
         if not h:
             _die()                       # parent already gone before we got here
         try:
-            kernel32.WaitForSingleObject(h, 0xFFFFFFFF)
+            rc = kernel32.WaitForSingleObject(h, INFINITE)
+            if rc != WAIT_OBJECT_0:
+                # Not the parent exiting — the wait itself failed. Killing the server on the
+                # strength of a failed syscall would be worse than leaking it: log and stay up.
+                # The app's shutdown hook still stops us on a clean quit.
+                err = ctypes.get_last_error()
+                print(f"[stem_splitter] parent watch failed (rc={{rc}}, err={{err}}); "
+                      f"leaving the server running", flush=True)
+                return
         finally:
-            # The wait is what this thread exists for, so the handle is only held for the
-            # server's lifetime — but "we're about to exit anyway" is exactly the reasoning
-            # that leaves handles lying around in code that later gets reused.
             kernel32.CloseHandle(h)
     else:
         # Reparented to init (or to a subreaper) once the parent dies.

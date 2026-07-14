@@ -990,8 +990,12 @@ def setup(app: FastAPI, context: dict) -> None:
     @app.on_event("shutdown")
     def _stop_managed_server() -> None:
         try:
-            running, _ = demucs_server.is_running(mgr.config_dir)
-            if not running:
+            # CHEAP check only. is_running() may probe /health over HTTP (it does that to adopt
+            # an orphan from a previous session), and a blocking request during shutdown delays
+            # the app's exit before we even reach the 3s leash below. The state file is enough
+            # to know whether we ever started one; the background thread does the real work,
+            # and stop_server() is a no-op if there is nothing to stop.
+            if not demucs_server.state_file(mgr.config_dir).exists():
                 return
             log.info("stem_splitter: app is shutting down - stopping the managed server")
 
