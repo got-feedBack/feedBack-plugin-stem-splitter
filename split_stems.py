@@ -261,14 +261,16 @@ def _get_authed(url: str, server_url: str, headers: dict | None, timeout: float)
 
 # How much of a server error body to keep.
 #
-# 300 chars was enough for "Internal Server Error" and nothing else. A FastAPI 422 answers with a
-# JSON validation body naming the field it rejected — which is THE piece of information that
-# explains the failure — and it did not fit, so the queue showed a truncated error that said a
-# request had failed without saying why. A user reported exactly that (#16), and the underlying
-# bug (#17) stayed invisible behind the ellipsis.
+# To be precise about what this did and didn't cause: the truncation a user actually reported
+# (#16) was the UI's ellipsis, not this cap — a bare FastAPI 422 body is ~139 chars and fit
+# inside 300 fine. This is the truncation BEHIND that one, and it bites the errors that carry
+# the most diagnosis, because those are the long ones: a multi-field validation body, a 500
+# whose traceback answers on its LAST line, an HTML error page from a reverse proxy. 300 chars
+# keeps the header and throws away the answer.
 #
-# The cap exists so a server that answers with a 2 MB HTML error page can't push a novel into
-# the job record. 4000 chars holds any real API error whole.
+# The cap still exists so a server answering with a 2 MB HTML page can't push a novel into the
+# job record — which is persisted to disk and re-read on every load. 4000 chars holds any real
+# API error whole, and _err_body() says so when it has to cut.
 _MAX_ERR_BODY = 4000
 
 

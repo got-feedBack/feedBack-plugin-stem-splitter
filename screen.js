@@ -276,14 +276,32 @@
 
     host.querySelectorAll('[data-copy]').forEach(function (b) {
       b.addEventListener('click', function () {
-        var text = b.closest('.ss-job')._errText || '';
-        var done = function () { b.textContent = 'Copied'; setTimeout(function () { b.textContent = 'Copy'; }, 1500); };
+        var row = b.closest('.ss-job');
+        var text = (row && row._errText) || '';
+        var flash = function (label) {
+          b.textContent = label;
+          setTimeout(function () { b.textContent = 'Copy'; }, 1500);
+        };
+        var done = function () { flash('Copied'); };
+        // If we couldn't copy, say so — and select the text so Ctrl+C still works. Claiming
+        // success we didn't achieve just moves the failure to the moment they paste.
+        var fail = function () {
+          flash('Press Ctrl+C');
+          var pre = row && row.querySelector('.ss-err-text');
+          if (pre && window.getSelection) {
+            var sel = window.getSelection();
+            var range = document.createRange();
+            range.selectNodeContents(pre);
+            sel.removeAllRanges();
+            sel.addRange(range);
+          }
+        };
         // navigator.clipboard is undefined on a non-secure origin (plain http to a NAS, which
         // is how plenty of people run this). Fall back rather than throwing into the console.
         if (navigator.clipboard && navigator.clipboard.writeText) {
-          navigator.clipboard.writeText(text).then(done, function () { fallbackCopy(text, done); });
+          navigator.clipboard.writeText(text).then(done, function () { fallbackCopy(text, done, fail); });
         } else {
-          fallbackCopy(text, done);
+          fallbackCopy(text, done, fail);
         }
       });
     });
@@ -301,7 +319,7 @@
   // navigator.clipboard only exists on a secure origin. A NAS or LAN install served over plain
   // http has no clipboard API at all, and that is exactly the deployment whose users most need
   // to paste an error into an issue.
-  function fallbackCopy(text, done) {
+  function fallbackCopy(text, done, fail) {
     var ta = document.createElement('textarea');
     ta.value = text;
     ta.setAttribute('readonly', '');
@@ -309,8 +327,14 @@
     ta.style.opacity = '0';
     document.body.appendChild(ta);
     ta.select();
-    try { document.execCommand('copy'); done(); } catch (e) { /* selection stands; Ctrl+C works */ }
+    var ok = false;
+    // execCommand returns FALSE on failure rather than throwing, so a bare try/catch would
+    // report success while the clipboard still held whatever was there before. Telling someone
+    // their error is copied when it isn't is worse than telling them it failed: they paste the
+    // wrong thing into the issue and don't find out until someone asks them to try again.
+    try { ok = document.execCommand('copy') === true; } catch (e) { ok = false; }
     document.body.removeChild(ta);
+    if (ok) done(); else fail();
   }
 
   // ── websocket ──────────────────────────────────────────────────────────────
