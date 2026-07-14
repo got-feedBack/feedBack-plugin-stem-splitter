@@ -43,11 +43,28 @@
 .stem-splitter .ss-pill.transcribe { background: rgba(168,85,247,.22); color: #d8b4fe; }
 
 .stem-splitter .ss-job {
-  display: flex; align-items: center; gap: .75rem;
   padding: .5rem .25rem; border-bottom: 1px solid rgba(148,163,184,.1);
 }
 .stem-splitter .ss-job:last-child { border-bottom: 0; }
+.stem-splitter .ss-job-main { display: flex; align-items: center; gap: .75rem; }
 .stem-splitter .ss-job .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* The error is the point of a failed row, so it does NOT live inside .name (nowrap + ellipsis
+   clipped it to one line — the part saying WHY was the part that got cut). Full width, wrapped,
+   selectable, copyable: these end up pasted into bug reports. */
+.stem-splitter .ss-job-error {
+  display: flex; align-items: flex-start; gap: .5rem;
+  margin: .35rem 0 .1rem 0; padding: .5rem .6rem;
+  background: rgba(248,113,113,.08); border-left: 2px solid #f87171; border-radius: 4px;
+}
+.stem-splitter .ss-err-text {
+  flex: 1; min-width: 0; margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .75rem; line-height: 1.45;
+  color: #fca5a5;
+  white-space: pre-wrap; overflow-wrap: anywhere;   /* long URLs / JSON bodies must not overflow */
+  max-height: 11rem; overflow-y: auto;              /* a huge traceback scrolls, never eats the page */
+}
+.stem-splitter .ss-err-copy { flex: 0 0 auto; }
 .stem-splitter .ss-job .msg { color: #94a3b8; font-size: .8rem; }
 .stem-splitter .ss-status { font-size: .78rem; font-weight: 600; }
 .stem-splitter .ss-status.running { color: #60a5fa; }

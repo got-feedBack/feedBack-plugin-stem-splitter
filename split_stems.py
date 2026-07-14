@@ -259,6 +259,29 @@ def _get_authed(url: str, server_url: str, headers: dict | None, timeout: float)
 
 # ── Engines ──────────────────────────────────────────────────────────────────
 
+# How much of a server error body to keep.
+#
+# To be precise about what this did and didn't cause: the truncation a user actually reported
+# (#16) was the UI's ellipsis, not this cap — a bare FastAPI 422 body is ~139 chars and fit
+# inside 300 fine. This is the truncation BEHIND that one, and it bites the errors that carry
+# the most diagnosis, because those are the long ones: a multi-field validation body, a 500
+# whose traceback answers on its LAST line, an HTML error page from a reverse proxy. 300 chars
+# keeps the header and throws away the answer.
+#
+# The cap still exists so a server answering with a 2 MB HTML page can't push a novel into the
+# job record — which is persisted to disk and re-read on every load. 4000 chars holds any real
+# API error whole, and _err_body() says so when it has to cut.
+_MAX_ERR_BODY = 4000
+
+
+def _err_body(resp) -> str:
+    """The server's error body, whole if it plausibly is one, and marked when it isn't."""
+    text = resp.text or ""
+    if len(text) <= _MAX_ERR_BODY:
+        return text.strip()
+    return text[:_MAX_ERR_BODY].strip() + f"\n… [truncated, {len(text)} chars total]"
+
+
 def _run_remote(mix: Path, out_dir: Path, model: str, server_url: str,
                 api_key: str | None, stems: tuple[str, ...],
                 progress_cb: ProgressCB, cancel_cb: CancelCB = None) -> Path:
@@ -317,7 +340,7 @@ def _run_remote(mix: Path, out_dir: Path, model: str, server_url: str,
         code = resp.status_code if resp is not None else "no response"
         body = ""
         if resp is not None:
-            body = resp.text[:300]
+            body = _err_body(resp)
             # Read the body first, then hand the connection back to the pool. Raising
             # with the response still open holds it out of the pool until GC — and a
             # batch that exhausts the retries on 503 does this once per song.
@@ -345,12 +368,12 @@ def _run_remote(mix: Path, out_dir: Path, model: str, server_url: str,
                 # decode error; surface what actually happened instead.
                 raise RuntimeError(
                     f"split server job poll failed ({jresp.status_code}): "
-                    f"{jresp.text[:200]}")
+                    f"{_err_body(jresp)}")
             try:
                 jr = jresp.json()
             except ValueError as e:
                 raise RuntimeError(
-                    f"split server returned a non-JSON job response: {jresp.text[:200]}"
+                    f"split server returned a non-JSON job response: {_err_body(jresp)}"
                 ) from e
             status = jr.get("status")
             if status == "complete":

@@ -247,14 +247,67 @@
       var label = j.title
         ? j.title + (j.artist ? ' — ' + j.artist : '')
         : baseName(j.filename);
+      // A failed job's error is the whole reason the row is worth reading, and it used to be
+      // clipped to one ellipsised line inside .name (nowrap + overflow:hidden) — so the part
+      // that says WHY was exactly the part that got cut. Errors now get their own full-width
+      // block below the row: wrapped, selectable, and copyable, because where these end up is
+      // a bug report.
+      var failed = j.status === 'failed';
+      var detail = failed ? (j.error || j.message || '') : '';
+
       row.innerHTML =
-        '<span class="ss-pill ' + (j.kind === 'split' ? 'split' : 'transcribe') + '">' + j.kind + '</span>' +
-        '<span class="name" title="' + esc(j.filename) + '">' + esc(label) +
-        '<br><span class="msg">' + esc(j.message || '') + '</span></span>' +
-        '<div class="ss-bar"><i style="width:' + pct + '%"></i></div>' +
-        '<span class="ss-status ' + esc(j.status) + '">' + esc(j.status) + '</span>' +
-        '<button class="ss-btn secondary" data-del="' + esc(j.id) + '">✕</button>';
+        '<div class="ss-job-main">' +
+          '<span class="ss-pill ' + (j.kind === 'split' ? 'split' : 'transcribe') + '">' + j.kind + '</span>' +
+          '<span class="name" title="' + esc(j.filename) + '">' + esc(label) +
+          (failed ? '' : '<br><span class="msg">' + esc(j.message || '') + '</span>') + '</span>' +
+          '<div class="ss-bar"><i style="width:' + pct + '%"></i></div>' +
+          '<span class="ss-status ' + esc(j.status) + '">' + esc(j.status) + '</span>' +
+          '<button class="ss-btn secondary" data-del="' + esc(j.id) + '">✕</button>' +
+        '</div>' +
+        (detail
+          ? '<div class="ss-job-error">' +
+              '<pre class="ss-err-text fb-selectable">' + esc(detail) + '</pre>' +
+              '<button class="ss-btn secondary ss-err-copy" data-copy="' + esc(j.id) + '">Copy</button>' +
+            '</div>'
+          : '');
+      if (detail) row._errText = detail;
       host.appendChild(row);
+    });
+
+    host.querySelectorAll('[data-copy]').forEach(function (b) {
+      b.addEventListener('click', function () {
+        var row = b.closest('.ss-job');
+        var text = (row && row._errText) || '';
+        var flash = function (label) {
+          b.textContent = label;
+          setTimeout(function () { b.textContent = 'Copy'; }, 1500);
+        };
+        var done = function () { flash('Copied'); };
+        // If we couldn't copy, say so — and select the text so Ctrl+C still works. Claiming
+        // success we didn't achieve just moves the failure to the moment they paste.
+        var fail = function () {
+          flash('Press Ctrl+C');
+          // This is the fallback for a copy that ALREADY failed, so it must not be the thing
+          // that throws: getSelection() returns null in some contexts (and the text stays
+          // selectable by hand regardless — .ss-err-text is fb-selectable). Best-effort only.
+          var pre = row && row.querySelector('.ss-err-text');
+          var sel = window.getSelection ? window.getSelection() : null;
+          if (!pre || !sel) return;
+          try {
+            var range = document.createRange();
+            range.selectNodeContents(pre);
+            sel.removeAllRanges();
+            sel.addRange(range);
+          } catch (e) { /* the user can still select it themselves */ }
+        };
+        // navigator.clipboard is undefined on a non-secure origin (plain http to a NAS, which
+        // is how plenty of people run this). Fall back rather than throwing into the console.
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(done, function () { fallbackCopy(text, done, fail); });
+        } else {
+          fallbackCopy(text, done, fail);
+        }
+      });
     });
     host.querySelectorAll('[data-del]').forEach(function (b) {
       b.addEventListener('click', function () {
@@ -266,6 +319,27 @@
   function baseName(p) { return String(p || '').split(/[\\/]/).pop(); }
   function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) {
     return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); }
+
+  // navigator.clipboard only exists on a secure origin. A NAS or LAN install served over plain
+  // http has no clipboard API at all, and that is exactly the deployment whose users most need
+  // to paste an error into an issue.
+  function fallbackCopy(text, done, fail) {
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    var ok = false;
+    // execCommand returns FALSE on failure rather than throwing, so a bare try/catch would
+    // report success while the clipboard still held whatever was there before. Telling someone
+    // their error is copied when it isn't is worse than telling them it failed: they paste the
+    // wrong thing into the issue and don't find out until someone asks them to try again.
+    try { ok = document.execCommand('copy') === true; } catch (e) { ok = false; }
+    document.body.removeChild(ta);
+    if (ok) done(); else fail();
+  }
 
   // ── websocket ──────────────────────────────────────────────────────────────
   function connectWS() {
