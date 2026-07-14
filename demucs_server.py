@@ -513,7 +513,11 @@ _LAUNCHER_TEMPLATE = '''\
 # do nothing.
 import os
 import runpy
+import signal
+import subprocess
 import sys
+import threading
+import time
 
 PYLIBS = {pylibs!r}
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -521,6 +525,166 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PYLIBS)     # server's deps win over the app's site-packages
 sys.path.insert(0, HERE)       # so `import run_demucs` etc. resolve
 os.chdir(HERE)
+
+
+# ── Die with the app that started us ────────────────────────────────────────
+#
+# We are spawned DETACHED (own process group / session) so a crash or a Ctrl-C in the app
+# cannot take the server down mid-separation. The cost of that is real: nothing then stops
+# us when the app exits normally either, and we outlive it — holding the port, ~1 GB of RAM
+# once warm, and the GPU. Observed in the wild: a server still listening 36 hours after the
+# app was closed (got-feedBack/feedBack-plugin-stem-splitter#12).
+#
+# An in-process shutdown hook in the APP cannot be relied on: it is killed hard on Windows,
+# and a crash runs no handlers at all. So the responsibility is inverted — the server
+# watches its parent and exits when the parent goes away. That works for a graceful quit, a
+# crash, a task-kill, and a power-user's `taskkill /F` alike.
+GRACE = 5.0     # seconds a worker gets to exit on SIGTERM before it is killed outright
+
+
+def _descendants(pid):
+    """Every process descended from `pid`, via ps. No psutil (a plugin cannot add deps).
+
+    `ps -Ao pid=,ppid=` works on Linux and macOS alike.
+    """
+    try:
+        out = subprocess.run(["ps", "-Ao", "pid=,ppid="],
+                             capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return []
+    children = {{}}      # NB: doubled — this file is a .format() template
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        try:
+            child, parent = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        children.setdefault(parent, []).append(child)
+
+    found, stack = [], [pid]
+    while stack:
+        for kid in children.get(stack.pop(), []):
+            found.append(kid)
+            stack.append(kid)
+    return found
+
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _die():
+    """Take the whole process tree with us: a separation in flight has grandchildren
+    (run_demucs.py / run_roformer.py), and orphaning THOSE just moves the leak."""
+    try:
+        if os.name == "nt":
+            # /T /F is already tree-wide and forceful; Windows has no SIGTERM to be polite
+            # with first.
+            subprocess.run(["taskkill", "/PID", str(os.getpid()), "/T", "/F"],
+                           capture_output=True, timeout=15)
+        else:
+            # Signal the CHILDREN directly — never the process group.
+            #
+            # killpg would be tidier, but it signals every member of the group INCLUDING this
+            # process, so we would have to ignore SIGTERM in ourselves first... and
+            # signal.signal() may only be called from the main thread. This runs on the
+            # watchdog THREAD, so that call raises ValueError, the broad `except` swallows it,
+            # and we fall straight through to os._exit() having killed nothing at all. The
+            # workers survive — the exact leak this exists to prevent, silently, on POSIX only.
+            #
+            # Enumerating descendants avoids signals-to-self entirely and works from any
+            # thread.
+            kids = _descendants(os.getpid())
+            for kid in kids:
+                try:
+                    os.kill(kid, signal.SIGTERM)
+                except OSError:
+                    pass
+
+            # Give them GRACE to close their files, then insist. A worker deep in a torch
+            # inference can be slow to act on SIGTERM, and a lone SIGTERM followed by our exit
+            # is a request, not a kill.
+            deadline = time.time() + GRACE
+            while time.time() < deadline and any(_alive(k) for k in kids):
+                time.sleep(0.25)
+
+            # RE-ENUMERATE before the kill. Reusing the list we snapshotted five seconds ago
+            # means SIGKILLing pids that may no longer be ours: a worker exits, the OS recycles
+            # its pid, and we shoot whatever inherited it. Rare, but the failure mode is
+            # "killed an unrelated process on the user's machine", which is not a thing to
+            # leave to chance. Asking the OS again costs one `ps`.
+            for kid in _descendants(os.getpid()):
+                try:
+                    os.kill(kid, signal.SIGKILL)
+                except OSError:
+                    pass
+    except Exception:
+        pass
+    os._exit(1)
+
+
+def _watch_parent(ppid):
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        SYNCHRONIZE = 0x00100000
+        INFINITE = 0xFFFFFFFF
+        WAIT_OBJECT_0 = 0x0
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        # DECLARE THE SIGNATURES. Without restype, ctypes assumes a function returns a 32-bit
+        # C int — but a HANDLE on 64-bit Windows is 64 bits wide, so the handle gets TRUNCATED.
+        # WaitForSingleObject is then handed a garbage handle, fails immediately instead of
+        # blocking, and the watchdog concludes the parent has died... two seconds after the
+        # server started. It would kill the server on startup, every time, on any machine
+        # unlucky enough to get a handle above 2^31. That it works today is luck (handles are
+        # usually small), not correctness.
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        h = kernel32.OpenProcess(SYNCHRONIZE, False, ppid)
+        if not h:
+            _die()                       # parent already gone before we got here
+        try:
+            rc = kernel32.WaitForSingleObject(h, INFINITE)
+            if rc != WAIT_OBJECT_0:
+                # Not the parent exiting — the wait itself failed. Killing the server on the
+                # strength of a failed syscall would be worse than leaking it: log and stay up.
+                # The app's shutdown hook still stops us on a clean quit.
+                err = ctypes.get_last_error()
+                print(f"[stem_splitter] parent watch failed (rc={{rc}}, err={{err}}); "
+                      f"leaving the server running", flush=True)
+                return
+        finally:
+            kernel32.CloseHandle(h)
+    else:
+        # Reparented to init (or to a subreaper) once the parent dies.
+        while os.getppid() == ppid:
+            time.sleep(2)
+    _die()
+
+
+_ppid = os.environ.get("STEM_SPLITTER_PARENT_PID")
+try:
+    _ppid = int(_ppid) if _ppid else os.getppid()
+except (TypeError, ValueError):
+    _ppid = os.getppid()
+
+if _ppid and _ppid > 1:
+    threading.Thread(target=_watch_parent, args=(_ppid,), daemon=True).start()
+
 
 server = os.path.join(HERE, "server.py")
 sys.argv = [server] + sys.argv[1:]
@@ -1105,8 +1269,15 @@ def start_server(config_dir: Path, port: int = DEFAULT_PORT, device: str = "",
     else:
         popen_kwargs["start_new_session"] = True  # setsid -> own session + pgid
 
+    # The launcher watches THIS pid and exits when it dies (see _LAUNCHER_TEMPLATE). Pass it
+    # explicitly rather than letting the child call os.getppid(): if the interpreter is ever
+    # reached through a shim, the child's parent is the shim, and the server would sit
+    # watching a process that exits immediately - or worse, one that never does.
+    env = _server_env(config_dir)
+    env["STEM_SPLITTER_PARENT_PID"] = str(os.getpid())
+
     proc = subprocess.Popen(
-        cmd, cwd=str(src_dir(config_dir)), env=_server_env(config_dir),
+        cmd, cwd=str(src_dir(config_dir)), env=env,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, bufsize=1, **popen_kwargs,
     )

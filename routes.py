@@ -975,4 +975,63 @@ def setup(app: FastAPI, context: dict) -> None:
 
     threading.Thread(target=_autostart, name="stem_splitter-autostart", daemon=True).start()
 
+    # ── Stop the managed server when the app stops ────────────────────────────
+    #
+    # The server is spawned DETACHED (its own process group / session) so a crash or a
+    # Ctrl-C in the app can't kill it mid-separation. The cost is that nothing stops it when
+    # the app exits normally either: it outlives the app, holding its port, ~1 GB of RAM once
+    # warm, and the GPU. In the wild it was found still listening 36 hours after the app was
+    # closed (#12).
+    #
+    # This handles the GRACEFUL path. It is NOT the whole fix, and must not be treated as
+    # such: a hard kill (Windows) or a crash runs no handler at all. The load-bearing half is
+    # the parent-death watchdog inside the launcher — the server watches the app and exits
+    # when the app goes away, whatever the reason. Belt and braces, in that order.
+    @app.on_event("shutdown")
+    def _stop_managed_server() -> None:
+        try:
+            # CHEAP check only. is_running() may probe /health over HTTP (it does that to adopt
+            # an orphan from a previous session), and a blocking request during shutdown delays
+            # the app's exit before we even reach the 3s leash below. The state file is enough
+            # to know whether we ever started one; the background thread does the real work,
+            # and stop_server() is a no-op if there is nothing to stop.
+            if not demucs_server.state_file(mgr.config_dir).exists():
+                return
+            log.info("stem_splitter: app is shutting down - stopping the managed server")
+
+            # This DOES block the shutdown handler — for at most 3 seconds. Bounded, not
+            # unbounded; blocking all the same. Saying otherwise would send whoever next
+            # investigates a slow quit looking somewhere else.
+            #
+            # Why block at all: stopping the server cleanly here is tidier than having it
+            # reap itself a moment later. Why only 3s: stop_server() can take ~30s on Windows
+            # (taskkill's timeout plus the escalation waits), and making the user stare at a
+            # window that won't close is a poor trade for tidiness.
+            #
+            # We can afford to give up early precisely BECAUSE the watchdog exists: if this
+            # doesn't finish, the server sees its parent die moments later and reaps itself
+            # and its workers. The hook is a fast path, not the guarantee — hence the short
+            # leash.
+            def _stop() -> None:
+                # The thread's exception would otherwise vanish into threading's default
+                # handler while the app is tearing down its logging — i.e. exactly when it is
+                # least likely to be seen. If stopping the server fails, that is worth a line:
+                # the watchdog will still reap it, but a repeated failure here is a signal.
+                try:
+                    demucs_server.stop_server(mgr.config_dir)
+                except Exception as e:
+                    log.warning("stem_splitter: stopping the managed server failed: %s "
+                                "(the launcher's watchdog will still reap it)", e)
+
+            done = threading.Thread(target=_stop, name="stem_splitter-shutdown-stop",
+                                    daemon=True)
+            done.start()
+            done.join(timeout=3.0)
+            if done.is_alive():
+                log.info("stem_splitter: server still stopping after 3s - leaving it to the "
+                         "launcher's parent-death watchdog")
+        except Exception as e:
+            # Never let this block, or break, the app's shutdown.
+            log.warning("stem_splitter: could not stop the managed server on shutdown: %s", e)
+
     log.info("stem_splitter: routes registered")
