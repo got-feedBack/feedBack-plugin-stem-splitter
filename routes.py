@@ -24,6 +24,7 @@ from fastapi import Body, FastAPI, Request, WebSocket, WebSocketDisconnect
 import demucs_server
 import docker_sidecar
 import engine_install
+import realign
 
 # Hoisted: ruff B008 rightly objects to Body() being called in an argument
 # default. Both sidecar routes take an optional JSON body.
@@ -433,6 +434,24 @@ class JobManager:
                 whisperx_model=settings.get("whisperx_model", "medium"),
                 language=settings.get("language") or None,
                 engine_dir=edir, models_dir=mdir, split_kwargs=split_kwargs,
+                cancel_cb=cancel_cb, progress_cb=cb,
+            )
+        elif job["kind"] == "realign":
+            # Re-time the lyrics the pak ALREADY has. Deliberately server-only: /align is the
+            # endpoint for "here are the words, when are they sung", and the local whisperx path
+            # has no equivalent entry point today. Say so plainly rather than silently falling
+            # back to transcription, which would REPLACE the user's words with Whisper's guesses
+            # — the exact thing they clicked re-align to avoid.
+            lyr_server = self._lyrics_server_url()
+            if not lyr_server:
+                raise RuntimeError(
+                    "re-aligning needs a demucs/WhisperX server — configure one in the plugin "
+                    "settings (the local engine cannot re-align, only transcribe)"
+                )
+            self._update(job["id"], message="Re-aligning existing lyrics")
+            realign.realign_pak(
+                pak_path, server_url=lyr_server, api_key=api_key,
+                language=settings.get("language") or None,
                 cancel_cb=cancel_cb, progress_cb=cb,
             )
         else:
@@ -889,6 +908,11 @@ def setup(app: FastAPI, context: dict) -> None:
     def post_transcribe(body: dict):
         return _enqueue_many("transcribe", body or {})
 
+    @app.post(f"{P}/realign")
+    def post_realign(body: dict):
+        """Re-time existing lyrics against the vocal stem. Never changes the words."""
+        return _enqueue_many("realign", body or {})
+
     # ── missing detection ────────────────────────────────────────────────────
     def _query(**kwargs):
         if not mgr.meta_db:
@@ -922,6 +946,18 @@ def setup(app: FastAPI, context: dict) -> None:
     @app.get(f"{P}/missing_lyrics")
     def missing_lyrics():
         songs = _query(has_lyrics=0)
+        return {"songs": [{"filename": s.get("filename"), "title": s.get("title"),
+                           "artist": s.get("artist")} for s in songs]}
+
+    @app.get(f"{P}/missing_vocals")
+    def missing_vocals():
+        """Songs with no VOCALS stem specifically.
+
+        Not the same question as /missing_stems, which asks for songs lacking any of the six
+        instrument stems — a song with vocals but no piano is in that set, and re-align works
+        perfectly well on it. Re-align needs exactly one thing: something to align against.
+        """
+        songs = _query(stems_lacks=["vocals"])
         return {"songs": [{"filename": s.get("filename"), "title": s.get("title"),
                            "artist": s.get("artist")} for s in songs]}
 

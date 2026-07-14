@@ -16,6 +16,7 @@
   var state = {
     missingStems: new Set(),
     missingLyrics: new Set(),
+    missingVocals: new Set(),
     splitEngine: null,
     lyricsEngine: null,
     ws: null,
@@ -188,9 +189,14 @@
     return Promise.all([
       api('/missing_stems').catch(function () { return { songs: [] }; }),
       api('/missing_lyrics').catch(function () { return { songs: [] }; }),
+      // Vocals SPECIFICALLY — not the same question as /missing_stems, which asks for songs
+      // lacking any of the six instrument stems. A song with vocals but no piano is in that set,
+      // and re-align works fine on it: all it needs is something to align against.
+      api('/missing_vocals').catch(function () { return { songs: [] }; }),
     ]).then(function (res) {
       state.missingStems = new Set((res[0].songs || []).map(function (s) { return s.filename; }));
       state.missingLyrics = new Set((res[1].songs || []).map(function (s) { return s.filename; }));
+      state.missingVocals = new Set((res[2].songs || []).map(function (s) { return s.filename; }));
       var a = $('ss-missing-stems-n'), b = $('ss-missing-lyrics-n');
       if (a) a.textContent = state.missingStems.size;
       if (b) b.textContent = state.missingLyrics.size;
@@ -228,6 +234,38 @@
         if (!state.lyricsEngine) { toast('No lyrics engine', 'Open Stem Splitter settings to configure a server or download whisperx.', 'warn'); return; }
         enqueue('transcribe', song.filename).then(function (r) {
           if (r && r.enqueued) toast('Transcription queued', song.filename);
+        });
+      },
+    });
+    reg.register({
+      id: 'stem_splitter.realign',
+      pluginId: 'stem_splitter',
+      label: 'Re-align lyrics to vocals',
+      placement: 'menu',
+      order: 32,
+      applies: function (song) { return !!(song && song.filename); },
+      // Needs BOTH: lyrics to re-time, and a vocal stem to time them against. The mirror image
+      // of Transcribe on the first count — that one needs lyrics to be MISSING, this one needs
+      // them present (words already right, timings wrong: the case where transcribing again
+      // would "fix" the timing by throwing the correct words away). The backend refuses either
+      // way, but a menu item that is clickable and then fails is a worse answer than one that
+      // is greyed out.
+      enabled: function (song) {
+        return !state.missingLyrics.has(song.filename) &&
+               !state.missingVocals.has(song.filename);
+      },
+      run: function (song) {
+        // Server-only: /align is "here are the words, when are they sung", and the local engine
+        // has no equivalent entry point. Falling back to transcription would replace the user's
+        // lyrics with Whisper's guesses — precisely what they clicked re-align to avoid.
+        if (state.lyricsEngine !== 'remote') {
+          toast('Re-align needs a server',
+                'Re-aligning keeps your words and only fixes their timing, which needs a demucs/WhisperX server. The local engine can transcribe, but not re-align. Configure a server in Stem Splitter settings.',
+                'warn');
+          return;
+        }
+        enqueue('realign', song.filename).then(function (r) {
+          if (r && r.enqueued) toast('Re-align queued', song.filename);
         });
       },
     });
