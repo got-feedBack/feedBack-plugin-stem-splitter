@@ -669,8 +669,11 @@ def check_update(config_dir: Path, ref: str | None = None) -> dict:
     have = str(meta.get("commit") or "")
     latest = _resolve_commit(ref)
     if not latest:
+        # `unknown` on every path that reports an install: a caller reading it to decide whether
+        # to offer an update to an install with no recorded commit must get the same signal here
+        # as everywhere else, not a missing key.
         return {"installed": True, "ref": ref, "commit": have, "latest": None,
-                "update_available": False,
+                "update_available": False, "unknown": not have,
                 "reason": "Could not reach GitHub to check for a newer revision."}
     return {
         "installed": True,
@@ -767,7 +770,7 @@ def update_server(config_dir: Path, ref: str | None = None, port: int = DEFAULT_
     _emit(progress_cb,
           f"Updated {before[:8] or '?'} → {after[:8] or '?'}." if changed
           else f"Already up to date ({after[:8] or '?'}).",
-          0.85, "Updating")
+          0.88, "Updating")     # after the 0.86 dependency check — the bar must never go back
 
     if was_running:
         _emit(progress_cb, "Restarting the server…", 0.92, "Updating")
@@ -1990,6 +1993,23 @@ def server_status(config_dir: Path) -> dict:
             models_ready = _model_ready(health.get("warmup") or {}, DEFAULT_MODEL)
 
     manageable, manage_reason = can_manage(config_dir)
+
+    # Which weights are ALREADY on disk, per model. The server reports a model as "downloading"
+    # while it warms up — even when it is only loading a cached file from disk into VRAM. So the
+    # UI showed "downloading" during a pure RAM load, the user saw a download that wasn't
+    # happening, and reasonably concluded their weights had been thrown away again. (Reported
+    # exactly that way.) With this, the UI can say "loading" when it knows the file is right there.
+    #
+    # Walk the cache ONCE. models_downloaded() is just the AND of these three, and this is the
+    # poll endpoint — hit every few seconds, and _has_whisper() rglob()s the whole snapshot tree.
+    # Calling both would do every check twice per poll. Deriving the flag from the dict also
+    # makes the two fields consistent by construction rather than by two walks agreeing.
+    cache = cache_dir(config_dir)
+    present = {
+        "bs_roformer_sw": _has_roformer(cache),
+        "whisperx": _has_whisper(cache),
+        "whisperx_aligners": _has_aligner(cache),
+    }
     return {
         "installed": installed(config_dir),
         "running": running,
@@ -1997,18 +2017,8 @@ def server_status(config_dir: Path) -> dict:
         "port": port,
         "url": url if running else None,
         "health": health,
-        "models_downloaded": models_downloaded(config_dir),
-        # Which weights are ALREADY on disk, per model. The server reports a model as
-        # "downloading" while it warms up — even when it is only loading a cached file from
-        # disk into VRAM. So the UI shows "downloading" during a pure RAM load, the user sees
-        # a download that isn't happening, and reasonably concludes their weights were thrown
-        # away again. (Reported exactly that way.) With this, the UI can say "loading" when it
-        # knows the file is right there.
-        "models_present": {
-            "bs_roformer_sw": _has_roformer(cache_dir(config_dir)),
-            "whisperx": _has_whisper(cache_dir(config_dir)),
-            "whisperx_aligners": _has_aligner(cache_dir(config_dir)),
-        },
+        "models_downloaded": all(present.values()),
+        "models_present": present,
         "models_ready": models_ready,
         "server_dir": str(server_dir(config_dir)),
         "disk_bytes": _server_disk_bytes(config_dir),
