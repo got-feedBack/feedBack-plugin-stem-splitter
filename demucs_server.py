@@ -697,40 +697,61 @@ def check_update(config_dir: Path, ref: str | None = None) -> dict:
     }
 
 
-def _snapshot_source(config_dir: Path) -> Path | None:
+def _source_meta_file(config_dir: Path) -> Path:
+    return server_dir(config_dir) / "source.json"
+
+
+def _snapshot_source(config_dir: Path) -> Path:
     """Copy the installed source aside so a failed update can be undone.
 
     download_source() overwrites the tree in place, so without this the moment we discover the
     new revision can't run here, the old working one is already gone — and the user is left with
     a stopped server and a source that crash-loops. It's a few hundred KB; the insurance is free.
 
-    Returns None if the snapshot couldn't be taken; the update then proceeds without a safety
-    net (which is exactly the old behaviour) rather than refusing to run.
+    **source.json goes in the snapshot too.** It records which commit is installed, and
+    download_source() rewrites it. Restoring the tree without it would leave the recorded commit
+    pointing at the revision we just REJECTED, so check_update() would report "up to date" and
+    stop offering the update — the old source running under a new name, and the user with no way
+    to reach the fix. The rollback has to be of the install, not of a directory.
+
+    Raises if the snapshot can't be taken. An update with no way back is exactly the thing this
+    exists to prevent, so not being able to take it means not updating — the server is still
+    running and untouched at this point, so refusing costs nothing.
     """
     src = src_dir(config_dir)
-    if not src.is_dir():
-        return None
     backup = src.with_name(src.name + ".bak")
     try:
         if backup.exists():
-            shutil.rmtree(backup, ignore_errors=True)
-        shutil.copytree(src, backup)
+            shutil.rmtree(backup)
+        backup.mkdir(parents=True, exist_ok=True)
+        if src.is_dir():
+            shutil.copytree(src, backup / "src")
+        meta = _source_meta_file(config_dir)
+        if meta.is_file():
+            shutil.copy2(meta, backup / "source.json")
         return backup
     except OSError as e:
-        log.warning("stem_splitter: could not snapshot the server source (%s) - an update that "
-                    "fails will not be able to roll back", e)
-        return None
+        shutil.rmtree(backup, ignore_errors=True)
+        raise RuntimeError(
+            f"could not snapshot the installed server source ({e}), so an update could not be "
+            f"undone if it failed. Nothing was changed; the server is still running.") from e
 
 
 def _restore_source(config_dir: Path, backup: Path | None) -> bool:
-    """Put the snapshot back. True if the old source is now on disk."""
+    """Put the snapshot back — tree AND recorded commit. True if the old install is back."""
     if not backup or not backup.is_dir():
         return False
-    src = src_dir(config_dir)
+    src, meta = src_dir(config_dir), _source_meta_file(config_dir)
     try:
-        if src.exists():
-            shutil.rmtree(src, ignore_errors=True)
-        shutil.copytree(backup, src)
+        if (backup / "src").is_dir():
+            if src.exists():
+                shutil.rmtree(src)
+            shutil.copytree(backup / "src", src)
+        saved_meta = backup / "source.json"
+        if saved_meta.is_file():
+            shutil.copy2(saved_meta, meta)
+        elif meta.exists():
+            meta.unlink()      # there was no source.json before; there must not be one now
         return True
     except OSError as e:
         log.warning("stem_splitter: could not restore the previous server source: %s", e)
@@ -738,6 +759,9 @@ def _restore_source(config_dir: Path, backup: Path | None) -> bool:
 
 
 def _discard_snapshot(backup: Path | None) -> None:
+    """Drop the snapshot. Only ever called once the install on disk is one we're happy with —
+    a failed restore KEEPS the backup, because at that point it is the only complete copy of a
+    working install the user has."""
     if backup:
         shutil.rmtree(backup, ignore_errors=True)
 
@@ -757,15 +781,22 @@ def update_server(config_dir: Path, ref: str | None = None, port: int = DEFAULT_
     touch the model cache, so nothing is re-downloaded.
 
     But a new source revision can require a dependency the installed pylibs tree does not have.
-    So after refreshing, the imports are re-checked (verify_install). If they no longer hold, we
-    say so plainly and do NOT restart: a server that cannot import its own dependencies would
-    just crash-loop, and "it keeps restarting" is a far worse message than "the update needs new
-    dependencies — click Install server".
+    So after refreshing, the imports are re-checked (verify_install). If they no longer hold, the
+    update is ROLLED BACK — old source, old recorded commit, server restarted — and we say so.
+    A server that cannot import its own dependencies would only crash-loop, and the user must
+    never end up worse off for having clicked a button meant to help them.
     """
     if not installed(config_dir):
         raise RuntimeError("the server isn't installed, so there is nothing to update")
 
     ref = _norm_ref(ref)      # exactly as check_update() does it, or "check" and "apply" differ
+
+    # BEFORE anything is touched, and before the server is stopped: no snapshot, no update. An
+    # in-place overwrite we cannot undo is precisely the failure the snapshot exists to prevent,
+    # so proceeding without one would be trading a certain small annoyance ("couldn't update")
+    # for a rare catastrophic one ("your server is gone and the source on disk can't run").
+    # Nothing has been disturbed at this point, so refusing is free.
+    backup = _snapshot_source(config_dir)
 
     # The port it is ACTUALLY on, not just the one the settings say. Those disagree whenever the
     # user edits the port without restarting — and putting the server back somewhere other than
@@ -777,12 +808,6 @@ def update_server(config_dir: Path, ref: str | None = None, port: int = DEFAULT_
     if was_running:
         _emit(progress_cb, "Stopping the server…", 0.05, "Updating")
         stop_server(config_dir)
-
-    # download_source() overwrites the source tree IN PLACE, so by the time we discover the new
-    # revision needs a dependency this install doesn't have, the old — working — source is gone.
-    # The user is then stranded: their server is stopped, and the only source on disk is one that
-    # cannot run. Snapshot first. It's a few hundred KB.
-    backup = _snapshot_source(config_dir)
 
     try:
         _emit(progress_cb, "Fetching the latest server source…", 0.2, "Updating")
@@ -805,8 +830,15 @@ def update_server(config_dir: Path, ref: str | None = None, port: int = DEFAULT_
         # Put the OLD source back first (the fetch may have left a half-extracted tree), then
         # restart, then report. The launcher and drivers are regenerated from our own templates
         # on every start, so the restored tree is startable.
-        _restore_source(config_dir, backup)
-        _discard_snapshot(backup)
+        #
+        # KEEP the backup if the restore fails: at that moment it is the only complete copy of a
+        # working install the user has, and deleting it would turn a bad day into an unrecoverable
+        # one. It sits next to src/ as src.bak and the next update overwrites it.
+        if _restore_source(config_dir, backup):
+            _discard_snapshot(backup)
+        else:
+            log.warning("stem_splitter: keeping %s - it is the only intact copy of the previous "
+                        "server source", backup)
         if was_running:
             _emit(progress_cb, f"Update failed ({e}) — restarting the server as it was.",
                   0.9, "Updating")
@@ -835,7 +867,8 @@ def update_server(config_dir: Path, ref: str | None = None, port: int = DEFAULT_
     except Exception as e:
         # The new source can't run here. Don't leave it on disk: rolling forward would strand the
         # user with a stopped server and the only source on disk being one that crash-loops.
-        # Put the old source back and start it, so a failed update costs them nothing but time.
+        # Put the old source back — tree AND recorded commit — and start it, so a failed update
+        # costs them nothing but time.
         rolled_back = _restore_source(config_dir, backup)
         restored = False
         if rolled_back and was_running:
@@ -859,13 +892,21 @@ def update_server(config_dir: Path, ref: str | None = None, port: int = DEFAULT_
                    f"models' to repair the install.")
         _emit(progress_cb, msg, 1.0, "Needs reinstall")
 
+        # Keep the snapshot if the restore failed — it is then the only intact copy of a working
+        # install the user has.
+        if rolled_back:
+            _discard_snapshot(backup)
+        else:
+            log.warning("stem_splitter: keeping %s - it is the only intact copy of the previous "
+                        "server source", backup)
+
         st = server_status(config_dir, model=model)
         st["updated"] = not rolled_back      # rolled back => the source is what it was
         st["rolled_back"] = rolled_back
         st["needs_reinstall"] = True
         return st
-    finally:
-        _discard_snapshot(backup)
+    else:
+        _discard_snapshot(backup)     # the update stuck; the old source is no longer needed
 
     after = str(source_meta(config_dir).get("commit") or "")
     # Compare FULL shas. Two different commits can share an 8-char prefix, and reporting
@@ -888,7 +929,7 @@ def update_server(config_dir: Path, ref: str | None = None, port: int = DEFAULT_
                      progress_cb=_scaled(progress_cb, 0.92, 0.08))
 
     _emit(progress_cb, "Done.", 1.0, "Done")
-    st = server_status(config_dir)
+    st = server_status(config_dir, model=model)
     st["updated"] = changed
     return st
 
@@ -1531,7 +1572,7 @@ def setup_server(config_dir: Path, port: int = DEFAULT_PORT, device: str = "",
                    progress_cb=_scaled(progress_cb, 0.55, 0.45))
 
     _emit(progress_cb, "Server installed, running and warmed up.", 1.0, "Done")
-    return server_status(config_dir)
+    return server_status(config_dir, model=model)
 
 
 def uninstall_server(config_dir: Path) -> dict:
@@ -1712,7 +1753,7 @@ def start_server(config_dir: Path, port: int = DEFAULT_PORT, device: str = "",
     running, live_port = is_running(config_dir, port)
     if running:
         _emit(progress_cb, f"Server already running on port {live_port}.", 1.0, "Running")
-        return server_status(config_dir)
+        return server_status(config_dir, model=model)
 
     if warmup is None:
         warmup = models_downloaded(config_dir)
@@ -1811,7 +1852,7 @@ def start_server(config_dir: Path, port: int = DEFAULT_PORT, device: str = "",
         ok, _payload = server_health(url, timeout=1.0)
         if ok:
             _emit(progress_cb, f"Server is up at {url}", 1.0, "Running")
-            return server_status(config_dir)
+            return server_status(config_dir, model=model)
         time.sleep(0.5)
 
     raise RuntimeError(f"server did not answer /health on {url} within 20s")
@@ -2071,7 +2112,7 @@ def prepare_models(config_dir: Path, port: int = DEFAULT_PORT, device: str = "",
                 raise RuntimeError(f"model warmup failed: {wu}")
             if _model_ready(wu, model):
                 _emit(progress_cb, "Models ready.", 1.0, "Done")
-                return server_status(config_dir)
+                return server_status(config_dir, model=model)
             _emit(progress_cb, f"warmup: {wu}", 0.6, "Downloading models")
         time.sleep(5)
 

@@ -154,16 +154,24 @@ class TheServerComesBackWhereItWas(unittest.TestCase):
             s.run()
         self.assertEqual(s.started, [], "updating must not start a server the user had stopped")
 
-    def test_deps_that_no_longer_import_do_not_get_restarted(self):
-        # A server that can't import its own dependencies would only crash-loop. "It keeps
-        # restarting" is a far worse message than "the update needs new dependencies".
+    def test_a_new_source_that_cannot_import_is_never_started(self):
+        """The NEW source must not be started — it would only crash-loop, and "it keeps
+        restarting" is a far worse message than "the update needs new dependencies".
+
+        What does get started is the OLD source, put back by the rollback (see
+        AFailedUpdateLeavesNothingBroken): the user clicked a button and ends up exactly where
+        they were, which is the whole point."""
         with tempfile.TemporaryDirectory() as td:
             s = _Stubbed(td)
             s.patches.append(
                 mock.patch.object(ds, "verify_install", side_effect=RuntimeError("no sphn")))
+            s.patches.append(mock.patch.object(ds, "_restore_source", return_value=True))
             out = s.run()
         self.assertTrue(out.get("needs_reinstall"))
-        self.assertEqual(s.started, [], "a server that can't import its deps must not be started")
+        self.assertTrue(out.get("rolled_back"))
+        self.assertEqual(len(s.started), 1,
+                         "the rolled-back server must be running again — leaving it stopped is "
+                         "the failure this rollback exists to prevent")
 
 
     def test_the_live_port_beats_the_configured_one(self):
@@ -285,17 +293,20 @@ class AFailedUpdateLeavesNothingBroken(unittest.TestCase):
     having clicked, and not recoverable from the button they clicked. Snapshot, then roll back.
     """
 
-    def _install(self, td, body="OLD"):
+    def _install(self, td, body="OLD", commit="a" * 40):
         src = ds.src_dir(Path(td))
         src.mkdir(parents=True, exist_ok=True)
         (src / "server.py").write_text(body, encoding="utf-8")
+        ds._source_meta_file(Path(td)).write_text(
+            json.dumps({"repo": "x", "ref": "main", "commit": commit}), encoding="utf-8")
         return src
 
     def _run(self, td, download, verify, was_running=True):
         started = []
+        # source_meta() is NOT stubbed: it reads source.json, which is exactly what has to roll
+        # back with the tree, so the test must see the real file.
         with mock.patch.object(ds, "installed", return_value=True), \
              mock.patch.object(ds, "is_running", return_value=(was_running, 7865)), \
-             mock.patch.object(ds, "source_meta", return_value={"commit": "a" * 40}), \
              mock.patch.object(ds, "stop_server"), \
              mock.patch.object(ds, "download_source", side_effect=download), \
              mock.patch.object(ds, "write_launcher"), \
@@ -311,17 +322,23 @@ class AFailedUpdateLeavesNothingBroken(unittest.TestCase):
                 out = e
         return out, started
 
-    def _overwrite(self, td):
+    def _overwrite(self, td, commit="b" * 40):
+        """What download_source() really does: rewrite the tree AND record the new commit."""
         def download(config_dir, ref=None, progress_cb=None):
             (ds.src_dir(Path(td)) / "server.py").write_text("NEW", encoding="utf-8")
+            ds._source_meta_file(Path(td)).write_text(
+                json.dumps({"repo": "x", "ref": "main", "commit": commit}), encoding="utf-8")
         return download
+
+    def _boom(self, msg="no sphn"):
+        def verify(cfg, progress_cb=None):
+            raise RuntimeError(msg)
+        return verify
 
     def test_a_source_that_cannot_import_is_rolled_back(self):
         with tempfile.TemporaryDirectory() as td:
             src = self._install(td)
-            out, started = self._run(
-                td, self._overwrite(td),
-                verify=lambda cfg, progress_cb=None: (_ for _ in ()).throw(RuntimeError("no sphn")))
+            out, started = self._run(td, self._overwrite(td), verify=self._boom())
 
             self.assertEqual((src / "server.py").read_text(encoding="utf-8"), "OLD",
                              "the working source must be back on disk — rolling forward strands "
@@ -330,6 +347,49 @@ class AFailedUpdateLeavesNothingBroken(unittest.TestCase):
             self.assertTrue(out["needs_reinstall"])
             self.assertFalse(out["updated"], "nothing was updated: we put it back")
             self.assertEqual(len(started), 1, "the server it was running must be running again")
+
+    def test_the_recorded_commit_is_rolled_back_with_the_tree(self):
+        """source.json is part of the install, not decoration.
+
+        download_source() rewrites it. Restore the tree but not the commit, and check_update()
+        believes the REJECTED revision is installed — so it reports "up to date" and stops
+        offering the update. The old source runs under a new name, and the fix the user was
+        trying to reach becomes unreachable from the button that exists to reach it."""
+        with tempfile.TemporaryDirectory() as td:
+            self._install(td, commit="a" * 40)
+            self._run(td, self._overwrite(td, commit="b" * 40), verify=self._boom())
+
+            self.assertEqual(ds.source_meta(Path(td)).get("commit"), "a" * 40,
+                             "the recorded commit must be the one actually on disk, or the "
+                             "update we just rejected looks installed and is never offered again")
+
+    def test_no_snapshot_means_no_update(self):
+        # An in-place overwrite we cannot undo is the exact failure the snapshot prevents. Better
+        # to refuse: nothing has been touched yet, so refusing costs only the click.
+        with tempfile.TemporaryDirectory() as td:
+            src = self._install(td)
+            with mock.patch.object(ds, "_snapshot_source",
+                                   side_effect=RuntimeError("disk full")), \
+                 mock.patch.object(ds, "installed", return_value=True), \
+                 mock.patch.object(ds, "stop_server") as stop, \
+                 mock.patch.object(ds, "download_source") as dl:
+                with self.assertRaises(RuntimeError):
+                    ds.update_server(Path(td))
+            stop.assert_not_called()
+            dl.assert_not_called()
+            self.assertEqual((src / "server.py").read_text(encoding="utf-8"), "OLD")
+
+    def test_a_failed_restore_keeps_the_backup(self):
+        # At that moment the snapshot is the ONLY intact copy of a working install. Deleting it
+        # turns a bad day into an unrecoverable one.
+        with tempfile.TemporaryDirectory() as td:
+            src = self._install(td)
+            with mock.patch.object(ds, "_restore_source", return_value=False):
+                out, _ = self._run(td, self._overwrite(td), verify=self._boom())
+            self.assertFalse(out["rolled_back"])
+            self.assertTrue(src.with_name(src.name + ".bak").is_dir(),
+                            "the backup must survive a failed restore — it is the only copy of "
+                            "the user's working install left")
 
     def test_a_failed_fetch_is_rolled_back_too(self):
         # A half-extracted tree is the same trap as a source that can't import.
