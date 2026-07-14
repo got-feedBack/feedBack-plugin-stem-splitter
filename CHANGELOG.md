@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.3.2
+
+### Fixes — green at shutdown now means green at startup
+
+- **The server no longer re-downloads model weights at launch.** `models_downloaded()` — the
+  gate that decides warmup-vs-skip-warmup — checked only the *roformer* checkpoint, on the
+  reasoning that `bs_roformer_sw` is the model we split with. But warmup doesn't warm only
+  that model: it warms whisperx and its wav2vec2 aligner too. So an install with the
+  checkpoint but no aligner reported "downloaded", started **with** warmup, and the server
+  quietly fetched 361 MB while the user watched the app open — precisely the thing this
+  plugin promises never to do. The gate is now all-or-nothing.
+
+- **`TORCH_HOME` moved to `cache/torch`.** `torch.hub` writes to `$TORCH_HOME/hub`, so
+  pointing it at the cache root put the aligner in `cache/hub/` — a name the demucs server's
+  cache sweeper does not protect, so it deleted the 361 MB file every 24 hours. `torch/` is
+  preserved by *every* server version, so this fixes existing installs too, which a
+  server-side fix cannot reach (server.py is downloaded at install time). It also matches
+  what the container's compose file already does.
+
+  The existing file is **moved, not re-fetched** — a rename on the same volume, so no bytes
+  cross the wire.
+
+- `missing_models()` names *which* weights are absent, so the UI can say "whisperx aligner is
+  missing" rather than "not ready".
+
 ## 0.3.1
 
 ### Fixes
