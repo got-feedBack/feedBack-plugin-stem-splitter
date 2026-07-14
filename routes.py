@@ -999,14 +999,19 @@ def setup(app: FastAPI, context: dict) -> None:
                 return
             log.info("stem_splitter: app is shutting down - stopping the managed server")
 
-            # BOUNDED, not blocking. stop_server() can take ~30s on Windows (taskkill's
-            # timeout plus the escalation waits), and making the user stare at a window that
-            # won't close is a poor trade for tidiness.
+            # This DOES block the shutdown handler — for at most 3 seconds. Bounded, not
+            # unbounded; blocking all the same. Saying otherwise would send whoever next
+            # investigates a slow quit looking somewhere else.
+            #
+            # Why block at all: stopping the server cleanly here is tidier than having it
+            # reap itself a moment later. Why only 3s: stop_server() can take ~30s on Windows
+            # (taskkill's timeout plus the escalation waits), and making the user stare at a
+            # window that won't close is a poor trade for tidiness.
             #
             # We can afford to give up early precisely BECAUSE the watchdog exists: if this
             # doesn't finish, the server sees its parent die moments later and reaps itself
-            # and its workers. The hook is a fast path, not the guarantee — so it gets a
-            # short leash.
+            # and its workers. The hook is a fast path, not the guarantee — hence the short
+            # leash.
             def _stop() -> None:
                 # The thread's exception would otherwise vanish into threading's default
                 # handler while the app is tearing down its logging — i.e. exactly when it is
