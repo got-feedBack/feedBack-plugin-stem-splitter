@@ -14,11 +14,15 @@
   Re-align sends the lyrics you already have to the server's `/align` endpoint — *"here are the
   words, when is each one sung?"* — and rewrites **only** the timings. It never invents a word.
 
-  Enabled only when the song has both lyrics to re-time and a vocal stem to time them against;
-  greyed out otherwise, rather than failing after the click. It needs a demucs/WhisperX server:
-  the local engine can transcribe but has no alignment entry point, and silently falling back to
-  transcription would replace your words with Whisper's guesses — exactly what you clicked
-  re-align to avoid.
+  Enabled only when the song has both lyrics to re-time and a vocal stem to time them against —
+  greyed out otherwise, since there is nothing a click could do about a missing stem.
+
+  A missing *server* is different, and follows what Split and Transcribe already do: the item
+  stays clickable and tells you what's wrong ("re-aligning needs a demucs/WhisperX server"),
+  because a greyed-out item with no explanation teaches you nothing about how to fix it. Re-align
+  is server-only on purpose — the local engine can transcribe but has no alignment entry point,
+  and silently falling back to transcription would replace your words with Whisper's guesses,
+  which is exactly what you clicked re-align to avoid.
 
   The manifest is not touched. `lyrics_source` is a closed vocabulary in the feedpak spec
   (authored | transcribed | user), and re-aligning doesn't change where the words came from —
