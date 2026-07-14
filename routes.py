@@ -553,13 +553,17 @@ class JobManager:
             return None
         if not self.local_server_url():
             return None   # a real remote server: not ours to set up
-        if demucs_server.models_downloaded(self.config_dir):
+        missing = demucs_server.missing_models(self.config_dir)
+        if not missing:
             return None
+        # Name them. "Its models aren't downloaded" reads as "nothing is downloaded" to someone
+        # who already paid for a 2 GB fetch once, and it hides the common case: everything is
+        # there except the aligner the old sweeper ate.
         return {
             "needs_setup": True,
-            "message": "The local demucs server is running, but its models "
-                       "haven't been downloaded yet (~2 GB, one time). "
-                       "Download them now?",
+            "missing": missing,
+            "message": f"The local demucs server is running, but it still needs "
+                       f"{', '.join(missing)} (~2 GB in total, one time). Download now?",
         }
 
 

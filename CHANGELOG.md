@@ -2,7 +2,12 @@
 
 ## 0.3.2
 
-### Fixes — green at shutdown now means green at startup
+### Fixes — no more model re-downloads at launch
+
+Two of the three causes of the nightly ~1 GB re-download are fixed here. The third — the demucs
+server's 24h cache sweeper deleting the roformer checkpoint — is fixed in the *server*, and
+server.py is downloaded at install time, so that fix only reaches an existing install once it
+refreshes its server source (see the "Check for update" button, 0.3.3).
 
 - **The server no longer re-downloads model weights at launch.** `models_downloaded()` — the
   gate that decides warmup-vs-skip-warmup — checked only the *roformer* checkpoint, on the
@@ -20,10 +25,15 @@
   what the container's compose file already does.
 
   The existing file is **moved, not re-fetched** — a rename on the same volume, so no bytes
-  cross the wire.
+  cross the wire. If that move fails (a locked file, a permissions problem), the server runs on
+  the *old* `TORCH_HOME` for that run rather than pointing torch somewhere the file isn't — a
+  failed migration must not turn into the 361 MB download it exists to prevent. It retries on
+  the next start.
 
-- `missing_models()` names *which* weights are absent, so the UI can say "whisperx aligner is
-  missing" rather than "not ready".
+- **The "needs setup" prompt now names what's missing** — "it still needs whisperx aligner"
+  rather than "its models haven't been downloaded", which reads as *nothing* is downloaded to
+  someone who already paid for the 2 GB fetch once, and hides the common case where everything
+  is present except the aligner the sweeper ate.
 
 ## 0.3.1
 

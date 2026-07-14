@@ -596,10 +596,13 @@ def _migrate_torch_home(cache: Path) -> None:
         except OSError:
             pass
     except OSError as e:
-        # Not fatal: torch will just re-fetch into the new location. Say so, rather than
-        # letting a mystery 361 MB download look like a bug.
-        log.warning("stem_splitter: could not move %s to %s (%s) - torch will re-download "
-                    "its aligner once", old, new, e)
+        # Not fatal, and NOT a re-download: torch_home() notices the aligner is still in the old
+        # layout and runs this server on the old TORCH_HOME rather than pointing torch somewhere
+        # the file isn't. The move is retried on the next start. Log it anyway — the fallback
+        # leaves the aligner where the pre-fix sweeper can still eat it.
+        log.warning("stem_splitter: could not move %s to %s (%s) - using the old TORCH_HOME for "
+                    "this run so the aligner is not re-downloaded; will retry on next start",
+                    old, new, e)
 
 
 def missing_models(config_dir: Path) -> list[str]:
