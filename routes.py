@@ -994,9 +994,26 @@ def setup(app: FastAPI, context: dict) -> None:
             if not running:
                 return
             log.info("stem_splitter: app is shutting down - stopping the managed server")
-            demucs_server.stop_server(mgr.config_dir)
+
+            # BOUNDED, not blocking. stop_server() can take ~30s on Windows (taskkill's
+            # timeout plus the escalation waits), and making the user stare at a window that
+            # won't close is a poor trade for tidiness.
+            #
+            # We can afford to give up early precisely BECAUSE the watchdog exists: if this
+            # doesn't finish, the server sees its parent die moments later and reaps itself
+            # and its workers. The hook is a fast path, not the guarantee — so it gets a
+            # short leash.
+            done = threading.Thread(
+                target=lambda: demucs_server.stop_server(mgr.config_dir),
+                name="stem_splitter-shutdown-stop", daemon=True,
+            )
+            done.start()
+            done.join(timeout=3.0)
+            if done.is_alive():
+                log.info("stem_splitter: server still stopping after 3s - leaving it to the "
+                         "launcher's parent-death watchdog")
         except Exception as e:
-            # Never let this block the app's shutdown.
+            # Never let this block, or break, the app's shutdown.
             log.warning("stem_splitter: could not stop the managed server on shutdown: %s", e)
 
     log.info("stem_splitter: routes registered")

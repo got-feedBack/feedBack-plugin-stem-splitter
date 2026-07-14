@@ -559,10 +559,17 @@ def _watch_parent(ppid):
     if os.name == "nt":
         import ctypes
         SYNCHRONIZE = 0x00100000
-        h = ctypes.windll.kernel32.OpenProcess(SYNCHRONIZE, False, ppid)
+        kernel32 = ctypes.windll.kernel32
+        h = kernel32.OpenProcess(SYNCHRONIZE, False, ppid)
         if not h:
             _die()                       # parent already gone before we got here
-        ctypes.windll.kernel32.WaitForSingleObject(h, 0xFFFFFFFF)
+        try:
+            kernel32.WaitForSingleObject(h, 0xFFFFFFFF)
+        finally:
+            # The wait is what this thread exists for, so the handle is only held for the
+            # server's lifetime — but "we're about to exit anyway" is exactly the reasoning
+            # that leaves handles lying around in code that later gets reused.
+            kernel32.CloseHandle(h)
     else:
         # Reparented to init (or to a subreaper) once the parent dies.
         while os.getppid() == ppid:
