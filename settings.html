@@ -38,6 +38,18 @@
 #ss-settings .ss-actionbtn.blue  { background: #2563eb; }
 #ss-settings .ss-actionbtn.grey  { background: rgba(148,163,184,.2); color: #e2e8f0; }
 #ss-settings .ss-actionbtn.amber { background: #a16207; }
+
+/* The way through to the queue (#18). Sits directly under the title, because a user who lands in
+   Settings and can't get to their running jobs from here has to go hunting for them. */
+#ss-settings .ss-queue-link {
+  display: flex; align-items: center; gap: .6rem; flex-wrap: wrap;
+  margin: .25rem 0 1rem 0;
+}
+#ss-settings .ss-queue-count {
+  min-width: 1.25rem; padding: 0 .35rem; border-radius: 999px;
+  background: #2563eb; color: #fff; font-size: .72rem; font-weight: 700;
+  text-align: center;
+}
 #ss-settings .ss-actionbtn[disabled] { opacity: .45; cursor: not-allowed; }
 #ss-settings .ss-actionbtn.busy .dot { animation: ss-pulse 1.4s ease-in-out infinite; }
 
@@ -99,6 +111,14 @@
 <div class="stem-splitter-settings" id="ss-settings">
   <h2 class="ss-title">Stem Splitter</h2>
   <p class="ss-subtitle">Split stems and transcribe lyrics — using a server, or on this machine.</p>
+
+  <!-- The jobs run in the background and the queue is the only place their progress is visible.
+       Landing in Settings and having no way through to it is how "where did my split go?" starts,
+       so the way out is on the way in. (#18) -->
+  <div class="ss-queue-link">
+    <button class="ss-actionbtn grey" id="ss-open-queue">📋 Open the queue<span id="ss-queue-count" class="ss-queue-count" hidden></span></button>
+    <span class="ss-h-note">watch splits, transcriptions and re-aligns as they run</span>
+  </div>
 
   <section class="ss-section engines">
     <h3>Engines <span class="ss-h-note">which engine runs the work</span></h3>
@@ -527,6 +547,9 @@
     ws.onerror = function () { try { ws.close(); } catch (e) {} };
   }
 
+  $('ss-open-queue').addEventListener('click', openQueue);
+  refreshQueueCount();
+
   $('ss-set-save').addEventListener('click', save);
   $('ss-dl-all').addEventListener('click', function () { install('all'); });
   $('ss-dl-as').addEventListener('click', function () { install('audio-separator'); });
@@ -621,6 +644,30 @@
   // `reset` starts a new operation (or reports a terminal state): that's the one time the bar
   // is allowed to move down.
   var _srvBarMax = 0;
+  // Settings -> queue. The queue's own header has a Settings button; this is that door from the
+  // other side, because a user who has just configured a server wants to watch it work.
+  // How many jobs are actually in flight. A bare "Open the queue" button tells you nothing about
+  // whether there is anything IN it; "3 running" is the difference between a link and an answer.
+  function refreshQueueCount() {
+    fetch(API + '/jobs').then(function (r) { return r.json(); }).then(function (snap) {
+      var jobs = (snap && snap.jobs) || [];
+      var live = jobs.filter(function (j) {
+        return j.status === 'running' || j.status === 'queued';
+      }).length;
+      var el = $('ss-queue-count');
+      if (!el) return;
+      if (!live) { el.hidden = true; return; }
+      el.hidden = false;
+      el.textContent = live;
+    }).catch(function () { /* the button still works; only the count is missing */ });
+  }
+
+  function openQueue() {
+    var fb = window.feedBack;
+    if (fb && fb.navigate) fb.navigate('plugin-stem_splitter');
+    else if (window.showScreen) window.showScreen('plugin-stem_splitter');
+  }
+
   function setSrvBar(pct, phase, reset) {
     var p = pct || 0;
     if (reset) _srvBarMax = p;
