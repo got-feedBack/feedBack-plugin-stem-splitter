@@ -110,6 +110,82 @@ class TheVocalStemIsFoundTheSameWayTranscribeFindsIt(unittest.TestCase):
         self.assertIsNone(realign._vocals_relpath(m))
 
 
+class TheWordsAreVerIfiedNotAssumed(unittest.TestCase):
+    """The feature's promise is "your words are safe". Checked, not trusted.
+
+    Forced alignment hands back OUR text with timings — so if different words come back, something
+    is wrong (a misbehaving server, a proxy, an endpoint that isn't /align), and we are one repack
+    away from overwriting the user's lyrics with them."""
+
+    def _aligned(self, words):
+        return [{"t": float(i), "d": 0.5, "w": w} for i, w in enumerate(words)]
+
+    def test_the_same_words_pass(self):
+        realign._verify_words_survived("hold me closer", self._aligned(["hold", "me", "closer"]))
+
+    def test_punctuation_and_case_are_not_changes(self):
+        # "Closer," for "closer" is not a changed lyric. Refusing over it would fire on every song.
+        realign._verify_words_survived("hold me closer", self._aligned(["Hold", "me", "Closer,"]))
+
+    def test_line_and_join_suffixes_are_ignored(self):
+        realign._verify_words_survived("hold me closer", self._aligned(["hold", "me+", "closer"]))
+
+    def test_a_dropped_word_is_tolerated(self):
+        # The aligner legitimately fails to place the odd word (a shout, a word under a cymbal).
+        realign._verify_words_survived(
+            "hold me closer tiny dancer", self._aligned(["hold", "me", "closer", "dancer"]))
+
+    def test_an_invented_word_is_refused(self):
+        """The one that matters: a server returning words we never sent is not aligning, and
+        writing that back would destroy the lyrics this feature exists to protect."""
+        with self.assertRaises(RuntimeError) as e:
+            realign._verify_words_survived(
+                "hold me closer tiny dancer",
+                self._aligned(["hold", "me", "closer", "tony", "danza"]))
+        self.assertIn("not in your lyrics", str(e.exception))
+        self.assertIn("Transcribe", str(e.exception), "point at the button that DOES replace words")
+
+    def test_reordered_words_are_refused(self):
+        with self.assertRaises(RuntimeError):
+            realign._verify_words_survived(
+                "hold me closer", self._aligned(["closer", "me", "hold"]))
+
+    def test_a_mostly_empty_alignment_is_refused(self):
+        # Two words out of ten is not an alignment; writing it back would gut the song while
+        # reporting success.
+        original = "one two three four five six seven eight nine ten"
+        with self.assertRaises(RuntimeError) as e:
+            realign._verify_words_survived(original, self._aligned(["one", "ten"]))
+        self.assertIn("only placed", str(e.exception))
+
+    def test_nothing_at_all_is_refused(self):
+        with self.assertRaises(RuntimeError):
+            realign._verify_words_survived("hold me closer", [])
+
+    def test_the_guard_runs_before_the_repack(self):
+        """A guard that fires after the write is not a guard."""
+        manifest = {"lyrics": "lyrics.json",
+                    "stems": [{"id": "vocals", "file": "stems/vocals.ogg"}]}
+        with mock.patch.object(realign.pak_io, "read_manifest", return_value=manifest),              mock.patch.object(realign.pak_io, "read_member_bytes",
+                               return_value=json.dumps([{"t": 0, "d": 1, "w": "hello"}]).encode()),              mock.patch.object(realign, "align_vocals_remote",
+                               return_value=[{"t": 0.0, "d": 1.0, "w": "goodbye"}]),              mock.patch.object(realign.pak_io, "repack") as repack:
+            with self.assertRaises(RuntimeError):
+                realign.realign_pak("song.sloppak", server_url="http://s")
+        repack.assert_not_called()
+
+
+class TheUploadDescribesTheFileItActuallyIs(unittest.TestCase):
+    """A pak from another tool can carry a .wav or .flac vocals stem. Telling the server (or a
+    proxy in front of it) that a wav is an ogg is how an upload gets rejected or mis-decoded."""
+
+    def test_content_type_follows_the_suffix(self):
+        from pathlib import Path as P
+        self.assertEqual(realign._content_type(P("v.wav")), "audio/wav")
+        self.assertEqual(realign._content_type(P("v.flac")), "audio/flac")
+        self.assertEqual(realign._content_type(P("v.ogg")), "audio/ogg")
+        self.assertEqual(realign._content_type(P("v.weird")), "application/octet-stream")
+
+
 class TheRoundTripPreservesTheWords(unittest.TestCase):
     def test_text_out_equals_text_in(self):
         """The point of the feature: same words, new timings."""

@@ -128,6 +128,65 @@ def segments_to_lyrics(segments: list[dict]) -> list[dict]:
     return out
 
 
+def _words(text: str) -> list[str]:
+    """Comparable words: case- and punctuation-insensitive.
+
+    The aligner is allowed to hand back "Closer," for "closer" — that is not a changed lyric, and
+    refusing over it would make the guard below fire on every real song.
+    """
+    out: list[str] = []
+    for w in (text or "").split():
+        w = w.strip(".,!?;:\"'()[]-—…").lower()
+        if w:
+            out.append(w)
+    return out
+
+
+# How much of the original the aligner has to actually time before we believe it. Forced
+# alignment legitimately drops the odd word it can't place (a shout, a word buried under a
+# cymbal), so demanding 100% would refuse good results. But a handful of words out of a whole
+# song is not an alignment, it is noise — and writing THAT back would gut the lyrics while
+# reporting success.
+_MIN_COVERAGE = 0.5
+
+
+def _verify_words_survived(original: str, aligned: list[dict]) -> None:
+    """The promise of this feature is that it does not touch your words. Check it.
+
+    Forced alignment returns OUR text with timings, so the words coming back must be the words
+    that went in. What it may legitimately do is DROP one it couldn't place. What it must never
+    do is invent one, reorder them, or hand back a tenth of the song — and if any of that
+    happens, the right answer is to refuse, because we are about to overwrite the user's lyrics
+    with whatever this is.
+    """
+    want = _words(original)
+    got = _words(" ".join(str(t.get("w") or "").rstrip("+").rstrip("-") for t in aligned))
+    if not got:
+        raise RuntimeError("the aligner returned no words at all")
+
+    # Every returned word must appear, in order, in the original: a subsequence. That admits
+    # dropped words and refuses invented or reordered ones.
+    i = 0
+    for w in got:
+        while i < len(want) and want[i] != w:
+            i += 1
+        if i >= len(want):
+            raise RuntimeError(
+                "the aligner returned words that are not in your lyrics, so this is not a "
+                "re-align — refusing to overwrite them. (Use 'Transcribe lyrics' if you meant "
+                "to replace the words.)"
+            )
+        i += 1
+
+    coverage = len(got) / max(1, len(want))
+    if coverage < _MIN_COVERAGE:
+        raise RuntimeError(
+            f"the aligner only placed {len(got)} of {len(want)} words "
+            f"({coverage:.0%}) — refusing to overwrite your lyrics with a partial result. "
+            f"The vocal stem may not match these lyrics, or the language may be wrong."
+        )
+
+
 def _vocals_relpath(manifest: dict) -> str | None:
     """The vocal stem's path, matched exactly as transcribe.py matches it.
 
@@ -142,6 +201,20 @@ def _vocals_relpath(manifest: dict) -> str | None:
             if isinstance(f, str) and f.strip():
                 return f.strip()
     return None
+
+
+# Match split_stems._run_remote: the content-type follows the FILE, not a guess. A pak from
+# another tool can carry a .wav or .flac vocals stem, and telling a server (or a proxy in front
+# of it) that a wav is an ogg is how you get a rejected upload or a mis-decoded one.
+_CONTENT_TYPES = {
+    ".ogg": "audio/ogg", ".oga": "audio/ogg", ".opus": "audio/ogg",
+    ".wav": "audio/wav", ".flac": "audio/flac", ".mp3": "audio/mpeg",
+    ".m4a": "audio/mp4", ".aac": "audio/aac",
+}
+
+
+def _content_type(path: Path) -> str:
+    return _CONTENT_TYPES.get(path.suffix.lower(), "application/octet-stream")
 
 
 def align_vocals_remote(vocals: Path, text: str, server_url: str, *,
@@ -169,7 +242,7 @@ def align_vocals_remote(vocals: Path, text: str, server_url: str, *,
         with open(vocals, "rb") as f:
             resp = requests.post(
                 f"{server_url}/align",
-                files={"file": (vocals.name, f, "audio/ogg")},
+                files={"file": (vocals.name, f, _content_type(vocals))},
                 data=form,
                 headers=headers or None,
                 timeout=timeout,
@@ -262,7 +335,10 @@ def realign_pak(pak_path: Path, *, server_url: str | None = None, api_key: str |
         data = pak_io.read_member_bytes(pak_path, vocals_rel)
         if data is None:
             raise RuntimeError(f"vocals stem {vocals_rel!r} not found in pak")
-        vocals = work / "vocals.ogg"
+        # Keep the pak's own suffix. Writing a .wav out as "vocals.ogg" mislabels it to the
+        # server and to any proxy in between, and makes the content-type above a lie.
+        suffix = Path(str(vocals_rel)).suffix or ".ogg"
+        vocals = work / f"vocals{suffix}"
         vocals.write_bytes(data)
 
         if cancel_cb:
@@ -280,6 +356,11 @@ def realign_pak(pak_path: Path, *, server_url: str | None = None, api_key: str |
                 "the aligner produced no timings — the vocal stem may be silent, or the lyrics "
                 "may be in a different language than the audio"
             )
+
+        # The whole promise of this feature, checked rather than assumed. A server that hands
+        # back different words — normalized, re-tokenized, or simply misbehaving — must not be
+        # allowed to overwrite the user's lyrics with them.
+        _verify_words_survived(text, lyrics)
 
         if cancel_cb:
             cancel_cb()

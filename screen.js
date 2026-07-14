@@ -56,6 +56,17 @@
 
   function $(id) { return document.getElementById(id); }
 
+  // Job kinds, in the two places the user reads them. The old code asked "is it a split?" and
+  // called everything else a transcription — which, with re-align added, means telling someone
+  // their LYRICS ARE ABOUT TO BE REPLACED when they clicked the button that promises not to.
+  var KIND = {
+    split:      { noun: 'split',      pill: 'split' },
+    transcribe: { noun: 'transcription', pill: 'transcribe' },
+    realign:    { noun: 're-align',   pill: 'realign' },
+  };
+  function kindNoun(kind) { return (KIND[kind] || KIND.transcribe).noun; }
+  function kindPill(kind) { return (KIND[kind] || KIND.transcribe).pill; }
+
   function toast(title, message, accent) {
     try {
       if (window.fbNotify && window.fbNotify.show) {
@@ -295,7 +306,7 @@
 
       row.innerHTML =
         '<div class="ss-job-main">' +
-          '<span class="ss-pill ' + (j.kind === 'split' ? 'split' : 'transcribe') + '">' + j.kind + '</span>' +
+          '<span class="ss-pill ' + kindPill(j.kind) + '">' + esc(j.kind) + '</span>' +
           '<span class="name" title="' + esc(j.filename) + '">' + esc(label) +
           (failed ? '' : '<br><span class="msg">' + esc(j.message || '') + '</span>') + '</span>' +
           '<div class="ss-bar"><i style="width:' + pct + '%"></i></div>' +
