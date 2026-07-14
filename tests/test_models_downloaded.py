@@ -32,6 +32,11 @@ class Cache:
 
     BIG = b"x" * (60 * 1024 * 1024)      # over _MIN_WEIGHT_BYTES
     SMALL = b"x" * 1024                  # a partial download
+    # Distinguishable payloads. The never-clobber test compared SIZES of two files written
+    # with identical bytes — so it would have passed whether or not the destination was
+    # overwritten. A test that cannot fail on the bug it exists to catch is worse than none.
+    NEW = b"N" * (60 * 1024 * 1024)      # what is already at the destination
+    OLD = b"O" * (61 * 1024 * 1024)      # what sits in the old layout (different size AND byte)
 
     def __init__(self, td, roformer=False, whisper=False, aligner=False, old_aligner=False,
                  empty_new_hub=False, whisper_shell=False, whisper_incomplete=False,
@@ -59,11 +64,11 @@ class Cache:
         if aligner:
             d = c / "torch" / "hub" / "checkpoints"
             d.mkdir(parents=True, exist_ok=True)
-            (d / "wav2vec2_fairseq_base_ls960_asr_ls960.pth").write_bytes(self.BIG)
+            (d / "wav2vec2_fairseq_base_ls960_asr_ls960.pth").write_bytes(self.NEW)
         if old_aligner:                       # the pre-move layout
             d = c / "hub" / "checkpoints"
             d.mkdir(parents=True, exist_ok=True)
-            (d / "wav2vec2_fairseq_base_ls960_asr_ls960.pth").write_bytes(self.BIG)
+            (d / "wav2vec2_fairseq_base_ls960_asr_ls960.pth").write_bytes(self.OLD)
         if empty_new_hub:                     # torch/hub exists but is EMPTY
             (c / "torch" / "hub").mkdir(parents=True, exist_ok=True)
 
@@ -142,9 +147,9 @@ class TorchHomeMigration(unittest.TestCase):
 
 
 class PartialDownloadsAreNotWeights(unittest.TestCase):
-    """"The file is there" is not the same claim as "the weights are on disk", and this gate
+    '''"The file is there" is not the same claim as "the weights are on disk", and this gate
     promises the second one. A directory that exists because a download STARTED must not be
-    mistaken for one that exists because a download FINISHED."""
+    mistaken for one that exists because a download FINISHED.'''
 
     def test_whisper_directory_shell_is_not_enough(self):
         """huggingface_hub creates models--org--repo/{blobs,refs,snapshots} when the download
@@ -192,15 +197,26 @@ class MigrationWhenTheDestinationAlreadyExists(unittest.TestCase):
             self.assertTrue(ds._has_aligner(cache))
 
     def test_a_file_already_at_the_destination_is_never_clobbered(self):
+        """The two files must be DISTINGUISHABLE, or this test cannot fail.
+
+        It originally wrote identical bytes to both locations and compared sizes — so it would
+        have passed whether or not the destination was overwritten. Caught in review; a test
+        that cannot fail on the bug it exists to catch is worse than no test, because it
+        converts absent coverage into confidence.
+        """
         with tempfile.TemporaryDirectory() as td:
             c = Cache(td, aligner=True, old_aligner=True)      # both layouts hold a file
             cache = ds.cache_dir(c.cfg)
             dest = (cache / "torch" / "hub" / "checkpoints" /
                     "wav2vec2_fairseq_base_ls960_asr_ls960.pth")
-            before = dest.stat().st_size
             ds._migrate_torch_home(cache)
-            self.assertEqual(dest.stat().st_size, before,
-                             "the file torch will actually use must not be overwritten")
+
+            data = dest.read_bytes()
+            self.assertEqual(len(data), len(Cache.NEW),
+                             "the destination file must be the one that was already there")
+            self.assertEqual(data[:1], b"N",
+                             "the old-layout file must NOT have overwritten it — this is the "
+                             "file torch will actually use")
 
     def test_other_files_still_merge_across(self):
         with tempfile.TemporaryDirectory() as td:

@@ -1303,8 +1303,10 @@ def _server_env(config_dir: Path) -> dict:
     # users too, because every server version, old and new, preserves that name. It also
     # matches what the container's compose file already does.
     #
-    # Cost: a one-time re-download of the aligner as it moves. _has_aligner() still accepts
-    # the old location, so nothing reports "missing" in the meantime.
+    # No re-download: _migrate_torch_home() (called just above) MOVES the existing file into
+    # the new layout — a rename on the same volume, so nothing crosses the wire. Torch only
+    # re-fetches if that move fails, and it says so when it does. _has_aligner() also still
+    # accepts the old location, so nothing reports "missing" mid-migration.
     env["TORCH_HOME"] = str(cache / "torch")
     env["HF_HOME"] = str(cache / "huggingface")
     env["HUGGINGFACE_HUB_CACHE"] = str(cache / "huggingface" / "hub")
