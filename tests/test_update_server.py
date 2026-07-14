@@ -5,6 +5,7 @@ in my own live test of the button: I run on the default port, so a dropped port 
 a progress bar that jumps backwards for one frame is not something you notice while watching a
 server restart. They are exactly the bugs a test catches and a demo doesn't.
 """
+import json
 import os
 import sys
 import tempfile
@@ -14,7 +15,33 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from fastapi import FastAPI  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
+
 import demucs_server as ds  # noqa: E402
+import demucs_server as demucs_server_mod  # noqa: E402  (the module routes.py patches against)
+
+P = "/api/plugins/stem_splitter"
+
+# The lifecycle routes only read these four.
+SETTINGS = {
+    "remote_model": "bs_roformer_sw",
+    "local_server_port": 7865,
+    "local_server_device": "",
+    "local_server_ref": "",
+    "local_server_cuda_tag": "",
+    "local_server_gpu": None,
+    "local_server_autostart": False,
+}
+
+
+def _settle(seen, tries=50):
+    """run_server_op() runs the op on a daemon thread; give it a moment to land."""
+    import time
+    for _ in range(tries):
+        if seen:
+            return
+        time.sleep(0.05)
 
 
 class _Stubbed:
@@ -197,6 +224,56 @@ class TheStubsDoNotLeak(unittest.TestCase):
             s.run()
         self.assertIs(ds.download_source, real_download)
         self.assertIs(ds.verify_install, real_verify)
+
+
+class EveryLifecyclePathRunsTheSameServer(unittest.TestCase):
+    """The model was threaded through Update and nowhere else.
+
+    So a user who changed the split model got that model after an Update and DEFAULT_MODEL after
+    a plain Start — the same server warming a different model depending on which button they
+    pressed, and a split whose behaviour depends on how the server happened to come up. Start,
+    Update, Install, Prepare models and autostart now all take their (port, device, model) from
+    one place."""
+
+    def _routes(self, td, settings):
+        """A real JobManager over a real settings file — the routes read it per request, so a
+        mock that only spans setup() would be gone by the time the button is pressed."""
+        import routes
+        (Path(td) / "stem_splitter.json").write_text(json.dumps(settings), encoding="utf-8")
+        app = FastAPI()
+        # can_manage False keeps the autostart probe from doing anything on its own.
+        with mock.patch.object(demucs_server_mod, "can_manage", return_value=(False, "test")):
+            routes.setup(app, {"config_dir": td})
+        return TestClient(app)
+
+    def test_start_uses_the_configured_model_not_the_default(self):
+        seen = {}
+        settings = dict(SETTINGS, remote_model="htdemucs", local_server_port=9001,
+                        local_server_device="cuda")
+        with tempfile.TemporaryDirectory() as td:
+            client = self._routes(td, settings)
+            with mock.patch.object(demucs_server_mod, "start_server",
+                                   side_effect=lambda cfg, **kw: seen.update(kw) or {}):
+                client.post(f"{P}/server/start")
+                _settle(seen)
+
+        self.assertEqual(seen.get("model"), "htdemucs",
+                         "Start ignored the configured model, so the same server warmed a "
+                         "different model depending on which button started it")
+        self.assertEqual(seen.get("port"), 9001)
+        self.assertEqual(seen.get("device"), "cuda")
+
+    def test_prepare_models_downloads_the_configured_model(self):
+        # Otherwise the explicit ~2 GB fetch grabs the weights for a model the user isn't using.
+        seen = {}
+        settings = dict(SETTINGS, remote_model="htdemucs")
+        with tempfile.TemporaryDirectory() as td:
+            client = self._routes(td, settings)
+            with mock.patch.object(demucs_server_mod, "prepare_models",
+                                   side_effect=lambda cfg, **kw: seen.update(kw) or {}):
+                client.post(f"{P}/server/prepare_models")
+                _settle(seen)
+        self.assertEqual(seen.get("model"), "htdemucs")
 
 
 class CheckUpdateContract(unittest.TestCase):

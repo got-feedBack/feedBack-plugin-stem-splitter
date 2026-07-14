@@ -660,11 +660,19 @@ def setup(app: FastAPI, context: dict) -> None:
         return engine_install.uninstall_engine(mgr.config_dir)
 
     # ── managed demucs server ────────────────────────────────────────────────
-    def _server_opts() -> tuple[int, str]:
+    def _server_opts() -> tuple[int, str, str]:
+        """The (port, device, model) EVERY server lifecycle path runs with.
+
+        The model used to be threaded through Update only, so a user who changed the split model
+        got that model on a restart-after-update and DEFAULT_MODEL on a plain Start — the same
+        server warming a different model depending on which button they pressed. Returning the
+        whole triple from one place is what stops the next lifecycle path from forgetting one.
+        """
         s = mgr.read_settings()
         port = _as_port(s.get("local_server_port"))
         device = str(s.get("local_server_device") or "")
-        return port, device
+        model = str(s.get("remote_model") or demucs_server.DEFAULT_MODEL)
+        return port, device, model
 
     def _want_gpu(body: dict | None = None) -> bool:
         """Whether to install the CUDA torch build. An explicit request wins; the
@@ -694,7 +702,7 @@ def setup(app: FastAPI, context: dict) -> None:
     @app.get(f"{P}/server/health")
     def get_server_health():
         """Backend proxy for the 'Test status' button. /health needs no API key."""
-        port, _ = _server_opts()
+        port, _, _ = _server_opts()
         url = mgr.local_server_url() or demucs_server.url_for(port)
         ok, payload = demucs_server.server_health(url, timeout=4.0)
         return {"ok": ok, "url": url, "health": payload}
@@ -704,14 +712,14 @@ def setup(app: FastAPI, context: dict) -> None:
         # One click = a server that actually works: dependencies AND model weights.
         # Installing without the weights leaves a server that can't split until a
         # second action, which is a confusing half-state.
-        port, device = _server_opts()
+        port, device, model = _server_opts()
         gpu = _want_gpu(body)
         st = mgr.read_settings()
         # Advanced overrides; blank means "use the default".
         ref = str((body or {}).get("ref") or st.get("local_server_ref") or "") or None
         cuda_tag = str((body or {}).get("cuda_tag") or st.get("local_server_cuda_tag") or "") or None
         if not mgr.run_server_op("install", lambda cb: demucs_server.setup_server(
-                mgr.config_dir, port=port, device=device, gpu=gpu,
+                mgr.config_dir, port=port, device=device, model=model, gpu=gpu,
                 ref=ref, cuda_tag=cuda_tag, progress_cb=cb)):
             return _busy()
         return {"ok": True, "started": "install", "gpu": gpu,
@@ -720,11 +728,12 @@ def setup(app: FastAPI, context: dict) -> None:
 
     @app.post(f"{P}/server/start")
     def post_server_start():
-        port, device = _server_opts()
+        port, device, model = _server_opts()
         # warmup=None -> warm up only if the weights are already on disk, so a
         # start can never trigger the big download.
         if not mgr.run_server_op("start", lambda cb: demucs_server.start_server(
-                mgr.config_dir, port=port, device=device, warmup=None, progress_cb=cb)):
+                mgr.config_dir, port=port, device=device, model=model, warmup=None,
+                progress_cb=cb)):
             return _busy()
         return {"ok": True, "started": "start"}
 
@@ -754,10 +763,10 @@ def setup(app: FastAPI, context: dict) -> None:
         ref = s.get("local_server_ref") or None
         # The port/device the server is CONFIGURED for. Without these the restart would land on
         # DEFAULT_PORT, moving a server the user deliberately put elsewhere.
-        port, device = _server_opts()
+        port, device, model = _server_opts()
         if not mgr.run_server_op("update", lambda cb: demucs_server.update_server(
-                mgr.config_dir, ref=ref, port=port, device=device,
-                model=s.get("remote_model") or demucs_server.DEFAULT_MODEL, progress_cb=cb)):
+                mgr.config_dir, ref=ref, port=port, device=device, model=model,
+                progress_cb=cb)):
             return _busy()
         return {"ok": True}
 
@@ -834,9 +843,9 @@ def setup(app: FastAPI, context: dict) -> None:
 
     @app.post(f"{P}/server/prepare_models")
     def post_server_prepare_models():
-        port, device = _server_opts()
+        port, device, model = _server_opts()
         if not mgr.run_server_op("prepare_models", lambda cb: demucs_server.prepare_models(
-                mgr.config_dir, port=port, device=device, progress_cb=cb)):
+                mgr.config_dir, port=port, device=device, model=model, progress_cb=cb)):
             return _busy()
         return {"ok": True, "started": "prepare_models"}
 
@@ -1002,14 +1011,15 @@ def setup(app: FastAPI, context: dict) -> None:
                 return
             if not demucs_server.installed(mgr.config_dir):
                 return  # nothing installed -> nothing to start
-            port, device = _server_opts()
+            port, device, model = _server_opts()
             running, _ = demucs_server.is_running(mgr.config_dir, port)
             if running:
                 log.info("stem_splitter: demucs server already running on %s", port)
                 return
             log.info("stem_splitter: auto-starting demucs server on port %s", port)
             mgr.run_server_op("start", lambda cb: demucs_server.start_server(
-                mgr.config_dir, port=port, device=device, warmup=None, progress_cb=cb))
+                mgr.config_dir, port=port, device=device, model=model, warmup=None,
+                progress_cb=cb))
         except Exception as e:
             log.warning("stem_splitter: demucs server auto-start failed: %s", e)
 
