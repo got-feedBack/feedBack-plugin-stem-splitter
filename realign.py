@@ -170,13 +170,28 @@ def align_vocals_remote(vocals: Path, text: str, server_url: str, *,
     except OSError as e:
         raise RuntimeError(f"could not read the vocal stem {vocals.name}: {e}") from e
 
-    if resp.status_code != 200:
-        raise RuntimeError(f"WhisperX server error ({resp.status_code}): {_err_body(resp)}")
+    # Read the body, THEN hand the connection back to the pool. Raising with the response still
+    # open holds it out of the pool until GC, and a batch re-align does this once per song.
+    try:
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"WhisperX server error ({resp.status_code}): {_err_body(resp)}")
 
-    data = resp.json()
-    segments = data.get("segments")
-    if not isinstance(segments, list):
-        raise RuntimeError(f"the server returned no segments: {_err_body(resp)}")
+        try:
+            data = resp.json()
+        except ValueError as e:
+            # A proxy's HTML error page, or an empty body, with a 200 on it. `resp.json()` alone
+            # raises a decode error that names a byte offset and tells the user nothing; show
+            # them what the server actually said.
+            raise RuntimeError(
+                f"the server answered 200 but not JSON ({e}): {_err_body(resp)}") from e
+
+        segments = data.get("segments") if isinstance(data, dict) else None
+        if not isinstance(segments, list):
+            raise RuntimeError(f"the server returned no segments: {_err_body(resp)}")
+    finally:
+        resp.close()
+
     return segments_to_lyrics(segments)
 
 

@@ -191,6 +191,9 @@ class TheRequestIsTheContract(unittest.TestCase):
         def json():
             return {"segments": [{"start": 1.0, "end": 2.0, "text": "hi", "new_line": True}]}
 
+        def close(self):
+            pass
+
     def test_it_posts_the_text_and_asks_for_word_granularity(self, ):
         import tempfile
         from pathlib import Path
@@ -209,6 +212,58 @@ class TheRequestIsTheContract(unittest.TestCase):
         # Everything the server reads is Form(...); a query param is silently ignored. That
         # mistake, in the other direction, is what made transcription 422 for months (#17).
         self.assertFalse(post.call_args.kwargs.get("params"))
+
+
+class TheResponseIsHandledLikeAServerCanMisbehave(unittest.TestCase):
+    class _Resp:
+        def __init__(self, status=200, payload=None, text="", bad_json=False):
+            self.status_code, self._payload, self.text = status, payload, text
+            self._bad_json, self.closed = bad_json, False
+
+        def json(self):
+            if self._bad_json:
+                raise ValueError("Expecting value: line 1 column 1 (char 0)")
+            return self._payload
+
+        def close(self):
+            self.closed = True
+
+    def _call(self, resp):
+        import tempfile
+        from pathlib import Path as P
+        with tempfile.TemporaryDirectory() as td:
+            v = P(td) / "vocals.ogg"
+            v.write_bytes(b"a")
+            with mock.patch("requests.post", return_value=resp):
+                return realign.align_vocals_remote(v, "hi", "http://s")
+
+    def test_the_response_is_closed_even_when_it_fails(self):
+        # Raising with the response open holds a pooled connection until GC — once per song in a
+        # batch re-align.
+        resp = self._Resp(status=500, text="boom")
+        with self.assertRaises(RuntimeError):
+            self._call(resp)
+        self.assertTrue(resp.closed, "the connection must go back to the pool")
+
+    def test_the_response_is_closed_on_success(self):
+        resp = self._Resp(payload={"segments": [{"start": 0, "end": 1, "text": "hi"}]})
+        self._call(resp)
+        self.assertTrue(resp.closed)
+
+    def test_a_200_that_is_not_json_says_what_the_server_actually_sent(self):
+        """A proxy's HTML error page with a 200 on it. resp.json() alone raises a decode error
+        naming a byte offset, which tells the user precisely nothing."""
+        resp = self._Resp(bad_json=True, text="<html><body>502 Bad Gateway</body></html>")
+        with self.assertRaises(RuntimeError) as e:
+            self._call(resp)
+        self.assertIn("502 Bad Gateway", str(e.exception))
+        self.assertTrue(resp.closed)
+
+    def test_a_json_body_without_segments_is_an_error(self):
+        resp = self._Resp(payload={"error": "no aligner for 'xx'"})
+        with self.assertRaises(RuntimeError) as e:
+            self._call(resp)
+        self.assertIn("no segments", str(e.exception))
 
 
 if __name__ == "__main__":

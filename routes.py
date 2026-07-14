@@ -559,20 +559,41 @@ class JobManager:
         threading.Thread(target=_run, name=f"stem_splitter-server-{op}", daemon=True).start()
         return True
 
-    def needs_server_setup(self) -> dict | None:
-        """If the split would go to our managed local server but its weights aren't
-        downloaded yet, say so instead of letting the job silently stall on a ~2 GB
-        lazy fetch. The UI turns this into a 'download now?' prompt."""
-        # Only when the job would ACTUALLY go through the server. A user who forced
-        # a local engine (demucs / audio-separator) doesn't need the server's models
-        # at all, and must not be blocked just because the server happens to be
-        # running without them.
-        engine, _reason = self.resolve_split_engine()
-        if engine != "remote":
-            return None
-        if not self.local_server_url():
-            return None   # a real remote server: not ours to set up
-        missing = demucs_server.missing_models(self.config_dir)
+    # Re-align never separates anything: it hands the vocal stem it already has, plus the
+    # lyrics, to the server's aligner. So it needs whisperx and its wav2vec2 aligner — and NOT
+    # the 700 MB roformer separator. Demanding that one anyway would put a 700 MB download in
+    # front of a job that will never touch it.
+    _ALIGN_MODELS = ("whisperx", "whisperx aligner")
+
+    def needs_server_setup(self, kind: str = "split") -> dict | None:
+        """If the job would go to our managed local server but its weights aren't downloaded
+        yet, say so instead of letting it silently stall on a lazy multi-GB fetch. The UI turns
+        this into a 'download now?' prompt.
+
+        `kind` matters, because the jobs need DIFFERENT models and travel by different routes:
+        a split goes to the split engine and needs the separator; a re-align goes to the lyrics
+        server and needs the aligner. Asking the split question about a re-align — which is what
+        this used to do — gates it on the split engine (a user who forced local demucs would be
+        blocked from a job that never splits) and then offers them a 700 MB separator download
+        for an alignment that will never load it.
+        """
+        if kind == "realign":
+            url = self._lyrics_server_url()
+            if not url or url != self.local_server_url():
+                return None      # someone else's server: not ours to set up
+            missing = [m for m in demucs_server.missing_models(self.config_dir)
+                       if m in self._ALIGN_MODELS]
+        else:
+            # Only when the job would ACTUALLY go through the server. A user who forced
+            # a local engine (demucs / audio-separator) doesn't need the server's models
+            # at all, and must not be blocked just because the server happens to be
+            # running without them.
+            engine, _reason = self.resolve_split_engine()
+            if engine != "remote":
+                return None
+            if not self.local_server_url():
+                return None   # a real remote server: not ours to set up
+            missing = demucs_server.missing_models(self.config_dir)
         if not missing:
             return None
         # Name them. "Its models aren't downloaded" reads as "nothing is downloaded" to someone
@@ -590,8 +611,13 @@ class JobManager:
             # roformer checkpoint until the install picks up the upstream fix (Check for
             # update, 0.3.3), and a user who was promised "one time" and then watched it
             # re-download would be right to conclude we were lying to them.
-            "message": f"The local demucs server is running, but it still needs "
-                       f"{', '.join(missing)} ({size}). Download now?",
+            "message": (
+                f"Re-aligning runs on the local server, which still needs "
+                f"{', '.join(missing)} ({size}). Download now?"
+                if kind == "realign" else
+                f"The local demucs server is running, but it still needs "
+                f"{', '.join(missing)} ({size}). Download now?"
+            ),
         }
 
 
@@ -894,7 +920,7 @@ def setup(app: FastAPI, context: dict) -> None:
         # The client re-POSTs with skip_setup_check once the user has agreed (and the
         # models have been prepared).
         if not body.get("skip_setup_check"):
-            needs = mgr.needs_server_setup()
+            needs = mgr.needs_server_setup(kind)
             if needs:
                 return {**needs, "ok": False, "enqueued": 0}
         created = [mgr.enqueue(kind, n) for n in names]
