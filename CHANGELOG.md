@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.3.1
+
+### Fixes
+
+- **The managed demucs server no longer outlives the app.** ([#12](https://github.com/got-feedBack/feedBack-plugin-stem-splitter/issues/12))
+  It was found still listening **36 hours** after the app had been closed, holding its port,
+  ~1 GB of RAM once warm, and the GPU.
+
+  The server is spawned *detached* on purpose — so a crash or a Ctrl-C in the app can't kill
+  it mid-separation, and Stop can kill its process tree without signalling the app itself.
+  The cost of that was never paid for: nothing stopped it when the app exited normally
+  either. Electron kills the feedBack backend; the server is a *grandchild* in its own
+  session, so it simply stayed.
+
+  Now the server watches the app and exits when the app goes away — on a graceful quit, a
+  crash, a `taskkill /F`, an OOM kill, anything. A handler *inside* the app can't survive a
+  hard kill; a watcher on the other side can. It takes its worker grandchildren
+  (`run_demucs.py` / `run_roformer.py`) with it, so a split in flight doesn't just relocate
+  the leak. A shutdown hook handles the graceful path so a clean quit stops it at once.
+
+  The Docker sidecar is deliberately unaffected: it's a container with its own lifecycle,
+  and killing it on app exit would be wrong.
+
 ## 0.3.0
 
 ### Run the demucs server in Docker
