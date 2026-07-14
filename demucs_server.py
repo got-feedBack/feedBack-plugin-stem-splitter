@@ -513,7 +513,11 @@ _LAUNCHER_TEMPLATE = '''\
 # do nothing.
 import os
 import runpy
+import signal
+import subprocess
 import sys
+import threading
+import time
 
 PYLIBS = {pylibs!r}
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -521,6 +525,60 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PYLIBS)     # server's deps win over the app's site-packages
 sys.path.insert(0, HERE)       # so `import run_demucs` etc. resolve
 os.chdir(HERE)
+
+
+# ── Die with the app that started us ────────────────────────────────────────
+#
+# We are spawned DETACHED (own process group / session) so a crash or a Ctrl-C in the app
+# cannot take the server down mid-separation. The cost of that is real: nothing then stops
+# us when the app exits normally either, and we outlive it — holding the port, ~1 GB of RAM
+# once warm, and the GPU. Observed in the wild: a server still listening 36 hours after the
+# app was closed (got-feedBack/feedBack-plugin-stem-splitter#12).
+#
+# An in-process shutdown hook in the APP cannot be relied on: it is killed hard on Windows,
+# and a crash runs no handlers at all. So the responsibility is inverted — the server
+# watches its parent and exits when the parent goes away. That works for a graceful quit, a
+# crash, a task-kill, and a power-user's `taskkill /F` alike.
+def _die():
+    """Take the whole process tree with us: a separation in flight has grandchildren
+    (run_demucs.py / run_roformer.py), and orphaning THOSE just moves the leak."""
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/PID", str(os.getpid()), "/T", "/F"],
+                           capture_output=True, timeout=15)
+        else:
+            # We were started with start_new_session, so our group is ours alone — killing
+            # it cannot touch the app.
+            os.killpg(os.getpgid(0), signal.SIGTERM)
+    except Exception:
+        pass
+    os._exit(1)
+
+
+def _watch_parent(ppid):
+    if os.name == "nt":
+        import ctypes
+        SYNCHRONIZE = 0x00100000
+        h = ctypes.windll.kernel32.OpenProcess(SYNCHRONIZE, False, ppid)
+        if not h:
+            _die()                       # parent already gone before we got here
+        ctypes.windll.kernel32.WaitForSingleObject(h, 0xFFFFFFFF)
+    else:
+        # Reparented to init (or to a subreaper) once the parent dies.
+        while os.getppid() == ppid:
+            time.sleep(2)
+    _die()
+
+
+_ppid = os.environ.get("STEM_SPLITTER_PARENT_PID")
+try:
+    _ppid = int(_ppid) if _ppid else os.getppid()
+except (TypeError, ValueError):
+    _ppid = os.getppid()
+
+if _ppid and _ppid > 1:
+    threading.Thread(target=_watch_parent, args=(_ppid,), daemon=True).start()
+
 
 server = os.path.join(HERE, "server.py")
 sys.argv = [server] + sys.argv[1:]
@@ -1105,8 +1163,15 @@ def start_server(config_dir: Path, port: int = DEFAULT_PORT, device: str = "",
     else:
         popen_kwargs["start_new_session"] = True  # setsid -> own session + pgid
 
+    # The launcher watches THIS pid and exits when it dies (see _LAUNCHER_TEMPLATE). Pass it
+    # explicitly rather than letting the child call os.getppid(): if the interpreter is ever
+    # reached through a shim, the child's parent is the shim, and the server would sit
+    # watching a process that exits immediately - or worse, one that never does.
+    env = _server_env(config_dir)
+    env["STEM_SPLITTER_PARENT_PID"] = str(os.getpid())
+
     proc = subprocess.Popen(
-        cmd, cwd=str(src_dir(config_dir)), env=_server_env(config_dir),
+        cmd, cwd=str(src_dir(config_dir)), env=env,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, bufsize=1, **popen_kwargs,
     )
