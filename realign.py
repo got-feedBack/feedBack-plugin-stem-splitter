@@ -225,7 +225,13 @@ def retime_tokens(tokens: list[dict], aligned: list[dict]) -> list[dict]:
             tok["t"] = round(cursor, 3)
             tok["d"] = round(share, 3)
             cursor += share
-    return [tok for tok in out if tok is not None]
+
+    # A token with no word in it is not a lyric. lyrics_to_text() already ignores `{}` and
+    # `{"w": ""}`, so a pak can be carrying them — and passing them through here would write them
+    # back with no timing at all, i.e. re-emit invalid tokens as if we had produced them. Drop
+    # them: nothing is lost, because there was never a word there to lose.
+    return [tok for tok in out
+            if tok is not None and str(tok.get("w") or "").strip()]
 
 
 def _words(text: str) -> list[str]:

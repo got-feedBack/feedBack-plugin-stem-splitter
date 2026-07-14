@@ -136,6 +136,20 @@ class TheLyricsAreRebuiltFromTheUsersOwnTokens(unittest.TestCase):
         self.assertEqual([x["t"] for x in out], [10.0, 11.0, 12.0],
                          "and every word keeps ITS OWN timing — not its neighbour's")
 
+    def test_wordless_dict_tokens_are_not_written_back(self):
+        """`{}` and `{"w": ""}` are not lyrics. lyrics_to_text() already ignores them, so a pak
+        can be carrying them — and passing them through would re-emit invalid tokens, untimed, as
+        if we had produced them."""
+        tokens = [{"t": 0, "d": 1, "w": "hold"},
+                  {},                                   # dict junk
+                  {"w": ""},                            # ...and more of it
+                  {"t": 2, "d": 1, "w": "closer"}]
+        out = realign.retime_tokens(tokens, [{"t": 5.0, "d": 0.3, "w": "hold"},
+                                             {"t": 6.0, "d": 0.4, "w": "closer"}])
+        self.assertEqual([x["w"] for x in out], ["hold", "closer"])
+        self.assertTrue(all(str(x.get("w") or "").strip() for x in out),
+                        "no wordless token may reach the pak")
+
     def test_segments_to_words_drops_untimed_and_keeps_timings(self):
         out = realign.segments_to_words([
             {"text": "no times"},

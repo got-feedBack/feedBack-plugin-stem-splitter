@@ -563,6 +563,11 @@ class JobManager:
     # lyrics, to the server's aligner. So it needs whisperx and its wav2vec2 aligner — and NOT
     # the 700 MB roformer separator. Demanding that one anyway would put a 700 MB download in
     # front of a job that will never touch it.
+    # Which models each job actually loads. A split loads the separator; an alignment loads
+    # whisperx and its wav2vec2 aligner. Asking for the wrong ones puts a download in front of a
+    # job that will never open it — and NOT asking for the right ones lets the job stall on a
+    # lazy multi-GB fetch, which looks like a hang rather than a download.
+    _SEPARATOR_MODELS = ("bs_roformer_sw",)
     _ALIGN_MODELS = ("whisperx", "whisperx aligner")
 
     def needs_server_setup(self, kind: str = "split") -> dict | None:
@@ -570,30 +575,45 @@ class JobManager:
         yet, say so instead of letting it silently stall on a lazy multi-GB fetch. The UI turns
         this into a 'download now?' prompt.
 
-        `kind` matters, because the jobs need DIFFERENT models and travel by different routes:
-        a split goes to the split engine and needs the separator; a re-align goes to the lyrics
-        server and needs the aligner. Asking the split question about a re-align — which is what
-        this used to do — gates it on the split engine (a user who forced local demucs would be
-        blocked from a job that never splits) and then offers them a 700 MB separator download
-        for an alignment that will never load it.
+        The question is per-JOB, because the jobs travel by different routes and load different
+        models:
+
+        * a **split** goes to the split engine and loads the separator;
+        * a **re-align** goes to the lyrics server and loads the aligner — it never splits;
+        * a **transcribe** goes to the lyrics server AND, when the song has no vocal stem yet,
+          splits first. So it can need both — and it can need the lyrics server's models even
+          when the user splits locally, which the old split-only check missed entirely: the
+          prompt was skipped and the job stalled on the lazy fetch it exists to prevent.
+
+        Each route is only ours to set up if it points at OUR managed server. Someone else's
+        server is their business.
         """
+        missing_all = demucs_server.missing_models(self.config_dir)
+        if not missing_all:
+            return None
+
+        local = self.local_server_url()
+        lyrics_is_ours = bool(local) and self._lyrics_server_url() == local
+        split_engine, _reason = self.resolve_split_engine()
+        split_is_ours = split_engine == "remote" and bool(local)
+
+        wanted: list[str] = []
         if kind == "realign":
-            url = self._lyrics_server_url()
-            if not url or url != self.local_server_url():
-                return None      # someone else's server: not ours to set up
-            missing = [m for m in demucs_server.missing_models(self.config_dir)
-                       if m in self._ALIGN_MODELS]
-        else:
-            # Only when the job would ACTUALLY go through the server. A user who forced
-            # a local engine (demucs / audio-separator) doesn't need the server's models
-            # at all, and must not be blocked just because the server happens to be
-            # running without them.
-            engine, _reason = self.resolve_split_engine()
-            if engine != "remote":
-                return None
-            if not self.local_server_url():
-                return None   # a real remote server: not ours to set up
-            missing = demucs_server.missing_models(self.config_dir)
+            if lyrics_is_ours:
+                wanted = [m for m in missing_all if m in self._ALIGN_MODELS]
+        elif kind == "transcribe":
+            # Both routes, because a transcribe of a song with no vocal stem splits first.
+            if lyrics_is_ours:
+                wanted += [m for m in missing_all if m in self._ALIGN_MODELS]
+            if split_is_ours:
+                wanted += [m for m in missing_all if m in self._SEPARATOR_MODELS]
+        elif split_is_ours:
+            # A split. Ask about everything the server would warm — the separator is what it
+            # loads, and this is the path that has always prompted for the full set.
+            wanted = list(missing_all)
+
+        # Preserve missing_models()' order, and don't repeat a model both routes want.
+        missing = [m for m in missing_all if m in set(wanted)]
         if not missing:
             return None
         # Name them. "Its models aren't downloaded" reads as "nothing is downloaded" to someone
@@ -618,6 +638,7 @@ class JobManager:
                 f"The local demucs server is running, but it still needs "
                 f"{', '.join(missing)} ({size}). Download now?"
             ),
+            "kind": kind,
         }
 
 
