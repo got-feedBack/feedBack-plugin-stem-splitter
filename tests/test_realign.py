@@ -115,6 +115,27 @@ class TheLyricsAreRebuiltFromTheUsersOwnTokens(unittest.TestCase):
             realign.retime_tokens([{"t": 0, "d": 1, "w": "hello"}],
                                   [{"t": 1, "d": 1, "w": "goodbye"}])
 
+    def test_junk_in_the_lyrics_does_not_shift_the_timings_onto_the_wrong_words(self):
+        """lyrics_to_text() already tolerates junk entries, so a pak can contain them.
+
+        The token indices are recorded against the ORIGINAL list. Filter the junk out before
+        applying them and every index after it shifts by one — the timings land on the wrong
+        words, and the result is a corrupted chart that still LOOKS like a chart."""
+        tokens = [{"t": 0, "d": 1, "w": "hold"},
+                  "junk",                                  # not a dict
+                  {"t": 1, "d": 1, "w": "me"},
+                  None,
+                  {"t": 2, "d": 1, "w": "closer"}]
+        aligned = [{"t": 10.0, "d": 0.4, "w": "hold"},
+                   {"t": 11.0, "d": 0.3, "w": "me"},
+                   {"t": 12.0, "d": 0.6, "w": "closer"}]
+        out = realign.retime_tokens(tokens, aligned)
+
+        self.assertEqual([x["w"] for x in out], ["hold", "me", "closer"],
+                         "the junk is dropped from the output")
+        self.assertEqual([x["t"] for x in out], [10.0, 11.0, 12.0],
+                         "and every word keeps ITS OWN timing — not its neighbour's")
+
     def test_segments_to_words_drops_untimed_and_keeps_timings(self):
         out = realign.segments_to_words([
             {"text": "no times"},
@@ -182,9 +203,13 @@ class TheWordsAreVerifiedNotAssumed(unittest.TestCase):
         """A guard that fires after the write is not a guard."""
         manifest = {"lyrics": "lyrics.json",
                     "stems": [{"id": "vocals", "file": "stems/vocals.ogg"}]}
-        with mock.patch.object(realign.pak_io, "read_manifest", return_value=manifest),              mock.patch.object(realign.pak_io, "read_member_bytes",
-                               return_value=json.dumps([{"t": 0, "d": 1, "w": "hello"}]).encode()),              mock.patch.object(realign, "align_vocals_remote",
-                               return_value=[{"t": 0.0, "d": 1.0, "w": "goodbye"}]),              mock.patch.object(realign.pak_io, "repack") as repack:
+        lyrics = json.dumps([{"t": 0, "d": 1, "w": "hello"}]).encode()
+        with mock.patch.object(
+                realign.pak_io, "read_manifest", return_value=manifest),              mock.patch.object(
+                realign.pak_io, "read_member_bytes", return_value=lyrics),              mock.patch.object(
+                realign, "align_vocals_remote",
+                return_value=[{"t": 0.0, "d": 1.0, "w": "goodbye"}]),              mock.patch.object(
+                realign.pak_io, "repack") as repack:
             with self.assertRaises(RuntimeError):
                 realign.realign_pak("song.sloppak", server_url="http://s")
         repack.assert_not_called()

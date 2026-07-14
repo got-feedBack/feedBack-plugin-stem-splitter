@@ -12,6 +12,7 @@ import os
 import sys
 import tempfile
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from unittest import mock
 
@@ -87,12 +88,17 @@ class ReAlignAsksItsOwnQuestion(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             mgr = routes.JobManager.__new__(routes.JobManager)
             mgr.config_dir = Path(td)
-            with mock.patch.object(
-                    mgr, "_lyrics_server_url", return_value=lyrics_url),                  mock.patch.object(
-                    mgr, "local_server_url", return_value=local_url),                  mock.patch.object(
-                    mgr, "resolve_split_engine", return_value=(split_engine, "")),                  mock.patch.object(
-                    demucs_server, "missing_models", return_value=missing),                  mock.patch.object(
-                    demucs_server, "download_size", return_value="~1.9 GB"):
+            with ExitStack() as stack:
+                stack.enter_context(mock.patch.object(
+                    mgr, "_lyrics_server_url", return_value=lyrics_url))
+                stack.enter_context(mock.patch.object(
+                    mgr, "local_server_url", return_value=local_url))
+                stack.enter_context(mock.patch.object(
+                    mgr, "resolve_split_engine", return_value=(split_engine, "")))
+                stack.enter_context(mock.patch.object(
+                    demucs_server, "missing_models", return_value=missing))
+                stack.enter_context(mock.patch.object(
+                    demucs_server, "download_size", return_value="~1.9 GB"))
                 return mgr.needs_server_setup("realign")
 
     def test_it_does_not_ask_for_the_separator(self):
@@ -135,11 +141,15 @@ class TheSplitPathIsUnchanged(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             mgr = routes.JobManager.__new__(routes.JobManager)
             mgr.config_dir = Path(td)
-            with mock.patch.object(
-                    mgr, "resolve_split_engine", return_value=("remote", "")),                  mock.patch.object(
-                    mgr, "local_server_url", return_value="http://127.0.0.1:7865"),                  mock.patch.object(
-                    demucs_server, "missing_models", return_value=["bs_roformer_sw"]),                  mock.patch.object(
-                    demucs_server, "download_size", return_value="~700 MB"):
+            with ExitStack() as stack:
+                stack.enter_context(mock.patch.object(
+                    mgr, "resolve_split_engine", return_value=("remote", "")))
+                stack.enter_context(mock.patch.object(
+                    mgr, "local_server_url", return_value="http://127.0.0.1:7865"))
+                stack.enter_context(mock.patch.object(
+                    demucs_server, "missing_models", return_value=["bs_roformer_sw"]))
+                stack.enter_context(mock.patch.object(
+                    demucs_server, "download_size", return_value="~700 MB"))
                 out = mgr.needs_server_setup()      # default kind
         self.assertEqual(out["missing"], ["bs_roformer_sw"],
                          "a split DOES need the separator — don't filter it out here")

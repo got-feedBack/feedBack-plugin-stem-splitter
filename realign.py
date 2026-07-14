@@ -205,19 +205,27 @@ def retime_tokens(tokens: list[dict], aligned: list[dict]) -> list[dict]:
 
     # Split each word's span across its syllables, proportional to their length — a long syllable
     # gets a long slice, which is closer to how they are actually sung than an even split.
-    out = [dict(t) for t in tokens if isinstance(t, dict)]
+    # Index-for-index with `tokens`, because that is what _token_words() recorded. Filtering the
+    # junk out HERE would shift every index after it, and the retiming loop would then write the
+    # timings onto the wrong words — a corrupted chart that still looks like a chart. The junk is
+    # dropped at the end instead, once the indices have done their job.
+    out: list[dict | None] = [dict(t) if isinstance(t, dict) else None for t in tokens]
     for (_key, idxs), span in zip(groups, spans):
         start, end = span
         total = max(0.0, end - start)
-        sizes = [max(1, len(str(out[i].get("w") or "").rstrip("+").rstrip("-"))) for i in idxs]
+        sizes = [max(1, len(str((out[i] or {}).get("w") or "").rstrip("+").rstrip("-")))
+                 for i in idxs]
         span_total = sum(sizes)
         cursor = start
         for i, size in zip(idxs, sizes):
             share = total * (size / span_total) if span_total else 0.0
-            out[i]["t"] = round(cursor, 3)
-            out[i]["d"] = round(share, 3)
+            tok = out[i]
+            if tok is None:
+                continue
+            tok["t"] = round(cursor, 3)
+            tok["d"] = round(share, 3)
             cursor += share
-    return out
+    return [tok for tok in out if tok is not None]
 
 
 def _words(text: str) -> list[str]:
