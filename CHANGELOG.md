@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.2
+
+### Transcribe and Re-align follow the song too
+
+- **Removing a song's lyrics now offers Transcribe immediately.** 0.5.1 taught Split and
+  Re-split to read the song's own row instead of a startup snapshot; Transcribe and
+  Re-align still used the snapshots, so stripping lyrics from a pak while the app ran
+  left Transcribe greyed until a restart. All four actions now gate on the song itself
+  (lyrics present? vocal stem present?), with the snapshots kept only as a fallback for
+  library sources that don't report per-song fields.
+
 ## 0.5.1
 
 ### A fresh pak is not a split pak

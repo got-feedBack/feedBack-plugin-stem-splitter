@@ -276,6 +276,27 @@
     return false;
   }
 
+  // Per-song lyrics state, same rationale as hasInstrumentStems: the song row
+  // is always current, the batch missing-sets are snapshots that go stale the
+  // moment a pak is edited while the app runs (stripping lyrics.json from a
+  // directory-form pak left Transcribe greyed until a restart). Returns null
+  // when the provider doesn't send has_lyrics, so callers can fall back.
+  function songHasLyrics(song) {
+    if (!song) return null;
+    var v = song.has_lyrics;
+    // Core's built-in provider sends a real boolean, but plugin library
+    // providers aren't bound to that — accept the 0/1 int form too rather
+    // than silently falling back to the stale snapshot for those sources.
+    if (typeof v === 'boolean') return v;
+    if (v === 0 || v === 1) return v === 1;
+    return null;
+  }
+
+  function hasVocalStem(song) {
+    if (!song || !Array.isArray(song.stem_ids)) return null;
+    return song.stem_ids.indexOf('vocals') !== -1;
+  }
+
   // Fallback only: the authoritative list of ids a split engine can produce
   // comes from the backend (/pak_stems -> replaceable_ids, INSTRUMENT_STEM_IDS
   // in routes.py), so the two sides can't drift. This copy covers an older
@@ -387,7 +408,11 @@
       placement: 'menu',
       order: 31,
       applies: function (song) { return !!(song && song.filename); },
-      enabled: function (song) { return state.missingLyrics.has(song.filename); },
+      enabled: function (song) {
+        var hl = songHasLyrics(song);
+        if (hl !== null) return !hl;
+        return state.missingLyrics.has(song.filename);
+      },
       run: function (song) {
         if (!state.lyricsEngine) { toast('No lyrics engine', 'Open Stem Splitter settings to configure a server or download whisperx.', 'warn'); return; }
         enqueue('transcribe', song.filename).then(function (r) {
@@ -414,9 +439,17 @@
         // and no stem, and the user's click would travel all the way to the backend to be told
         // no. Split and Transcribe are gated on PRESENCE, so they default to disabled and never
         // had this problem; this one is the mirror image and needs the guard.
-        return state.missingReady &&
-               !state.missingLyrics.has(song.filename) &&
-               !state.missingVocals.has(song.filename);
+        // Each condition independently prefers the song row and falls back
+        // to its snapshot — a provider sending only ONE of the two fields
+        // still gets fresh data for that half. missingReady guards only the
+        // halves that actually use a snapshot (unknown is not "yes").
+        var hl = songHasLyrics(song);
+        var hv = hasVocalStem(song);
+        var lyricsOk = (hl !== null) ? hl
+            : (state.missingReady && !state.missingLyrics.has(song.filename));
+        var vocalsOk = (hv !== null) ? hv
+            : (state.missingReady && !state.missingVocals.has(song.filename));
+        return lyricsOk && vocalsOk;
       },
       run: function (song) {
         // Server-only: /align is "here are the words, when are they sung", and the local engine
