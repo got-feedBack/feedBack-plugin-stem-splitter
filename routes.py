@@ -956,9 +956,10 @@ def setup(app: FastAPI, context: dict) -> None:
             if needs:
                 return {**needs, "ok": False, "enqueued": 0}
         # Selective re-split (issue #11), split jobs only: a list of stem ids to
-        # replace. Absent/empty = replace all. Non-string entries are rejected
-        # rather than silently dropped — a typo'd list that quietly meant
-        # "replace everything" would clobber the stems the user tried to protect.
+        # replace. Absent = replace all. An explicit [] and non-string entries
+        # are rejected rather than reinterpreted — a malformed list that quietly
+        # meant "replace everything" would clobber the stems the user tried to
+        # protect.
         replace_stems = None
         if kind == "split" and body.get("replace_stems") is not None:
             rs = body.get("replace_stems")

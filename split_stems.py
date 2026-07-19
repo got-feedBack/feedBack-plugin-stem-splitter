@@ -573,8 +573,10 @@ def _merge_stem_entries(existing: list[dict], produced: list[dict],
     the produced set are preserved in both modes; the old wholesale replacement
     silently delisted them, which is exactly the clobbering issue #11 is about.
 
-    The ``full`` fallback entry is never dropped: if the existing list carries
-    one and the merge result doesn't, it is re-appended.
+    The ``full`` fallback entry is never dropped — not by special-case
+    re-appending, but by construction: the merge starts from every existing
+    entry and only ever overwrites ids that were selected, so an existing
+    ``full`` (like any other unselected entry) survives untouched.
     """
     by_id: dict[str, dict] = {}
     for e in existing:
