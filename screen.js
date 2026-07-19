@@ -282,8 +282,14 @@
   // directory-form pak left Transcribe greyed until a restart). Returns null
   // when the provider doesn't send has_lyrics, so callers can fall back.
   function songHasLyrics(song) {
-    if (!song || typeof song.has_lyrics !== 'boolean') return null;
-    return song.has_lyrics;
+    if (!song) return null;
+    var v = song.has_lyrics;
+    // Core's built-in provider sends a real boolean, but plugin library
+    // providers aren't bound to that — accept the 0/1 int form too rather
+    // than silently falling back to the stale snapshot for those sources.
+    if (typeof v === 'boolean') return v;
+    if (v === 0 || v === 1) return v === 1;
+    return null;
   }
 
   function hasVocalStem(song) {
@@ -433,12 +439,17 @@
         // and no stem, and the user's click would travel all the way to the backend to be told
         // no. Split and Transcribe are gated on PRESENCE, so they default to disabled and never
         // had this problem; this one is the mirror image and needs the guard.
+        // Each condition independently prefers the song row and falls back
+        // to its snapshot — a provider sending only ONE of the two fields
+        // still gets fresh data for that half. missingReady guards only the
+        // halves that actually use a snapshot (unknown is not "yes").
         var hl = songHasLyrics(song);
         var hv = hasVocalStem(song);
-        if (hl !== null && hv !== null) return hl && hv;
-        return state.missingReady &&
-               !state.missingLyrics.has(song.filename) &&
-               !state.missingVocals.has(song.filename);
+        var lyricsOk = (hl !== null) ? hl
+            : (state.missingReady && !state.missingLyrics.has(song.filename));
+        var vocalsOk = (hv !== null) ? hv
+            : (state.missingReady && !state.missingVocals.has(song.filename));
+        return lyricsOk && vocalsOk;
       },
       run: function (song) {
         // Server-only: /align is "here are the words, when are they sung", and the local engine
