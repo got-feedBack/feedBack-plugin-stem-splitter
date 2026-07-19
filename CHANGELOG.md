@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.2
+
+### No more restart after installing an engine
+
+- **Installing a local engine now works on the first try.** ([#23](https://github.com/got-feedBack/feedBack-plugin-stem-splitter/pull/23))
+  The natural first-run flow — try to split, get told to install the engine, install it,
+  try again — failed until the whole app was restarted: the pre-install attempt left a
+  stale negative entry in Python's import cache for the not-yet-existing engine directory,
+  and nothing refreshed it. The engine path helper now invalidates import caches, as
+  required when packages are installed at runtime.
+
 ## 0.4.1
 
 ### Getting to the queue
