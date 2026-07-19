@@ -276,6 +276,21 @@
     return false;
   }
 
+  // Per-song lyrics state, same rationale as hasInstrumentStems: the song row
+  // is always current, the batch missing-sets are snapshots that go stale the
+  // moment a pak is edited while the app runs (stripping lyrics.json from a
+  // directory-form pak left Transcribe greyed until a restart). Returns null
+  // when the provider doesn't send has_lyrics, so callers can fall back.
+  function songHasLyrics(song) {
+    if (!song || typeof song.has_lyrics !== 'boolean') return null;
+    return song.has_lyrics;
+  }
+
+  function hasVocalStem(song) {
+    if (!song || !Array.isArray(song.stem_ids)) return null;
+    return song.stem_ids.indexOf('vocals') !== -1;
+  }
+
   // Fallback only: the authoritative list of ids a split engine can produce
   // comes from the backend (/pak_stems -> replaceable_ids, INSTRUMENT_STEM_IDS
   // in routes.py), so the two sides can't drift. This copy covers an older
@@ -387,7 +402,11 @@
       placement: 'menu',
       order: 31,
       applies: function (song) { return !!(song && song.filename); },
-      enabled: function (song) { return state.missingLyrics.has(song.filename); },
+      enabled: function (song) {
+        var hl = songHasLyrics(song);
+        if (hl !== null) return !hl;
+        return state.missingLyrics.has(song.filename);
+      },
       run: function (song) {
         if (!state.lyricsEngine) { toast('No lyrics engine', 'Open Stem Splitter settings to configure a server or download whisperx.', 'warn'); return; }
         enqueue('transcribe', song.filename).then(function (r) {
@@ -414,6 +433,9 @@
         // and no stem, and the user's click would travel all the way to the backend to be told
         // no. Split and Transcribe are gated on PRESENCE, so they default to disabled and never
         // had this problem; this one is the mirror image and needs the guard.
+        var hl = songHasLyrics(song);
+        var hv = hasVocalStem(song);
+        if (hl !== null && hv !== null) return hl && hv;
         return state.missingReady &&
                !state.missingLyrics.has(song.filename) &&
                !state.missingVocals.has(song.filename);
