@@ -561,15 +561,54 @@ def _collect_stem_files(result_dir: Path) -> list[Path]:
     return files
 
 
+def _merge_stem_entries(existing: list[dict], produced: list[dict],
+                        replace_stems: set[str] | None) -> list[dict]:
+    """Merge freshly separated stem entries into a pak's existing stems list.
+
+    ``replace_stems=None`` replaces everything the engine produced (the original
+    behaviour). With a set, only those ids take the new entry; every other
+    existing entry — a stem the user deliberately replaced, or a custom stem the
+    engine knows nothing about ("click", "backing", …) — is preserved VERBATIM:
+    same file reference, same default flag, untouched bytes. Custom ids outside
+    the produced set are preserved in both modes; the old wholesale replacement
+    silently delisted them, which is exactly the clobbering issue #11 is about.
+
+    The ``full`` fallback entry is never dropped: if the existing list carries
+    one and the merge result doesn't, it is re-appended.
+    """
+    by_id: dict[str, dict] = {}
+    for e in existing:
+        sid = str(e.get("id") or "")
+        if sid:
+            by_id[sid] = dict(e)
+    for pe in produced:
+        sid = pe["id"]
+        if replace_stems is None or sid in replace_stems or sid not in by_id:
+            # New id (not previously in the pak) always lands — an unselected id
+            # only protects an EXISTING stem; there is nothing to protect when
+            # the pak never had one.
+            by_id[sid] = pe
+    merged = list(by_id.values())
+    merged.sort(key=lambda s: _STEM_ORDER.index(s["id"]) if s["id"] in _STEM_ORDER else 99)
+    return merged
+
+
 def split_pak(pak_path: Path, *, engine: str, model: str | None = None,
               server_url: str | None = None, api_key: str | None = None,
               engine_dir: str | None = None, models_dir: str | None = None,
               stems: tuple[str, ...] = DEFAULT_STEMS,
+              replace_stems: set[str] | None = None,
               progress_cb: ProgressCB = None, cancel_cb: CancelCB = None) -> list[str]:
     """Split ``pak_path`` into per-instrument stems, write them back into the pak,
-    and rewrite the manifest. Returns the list of produced stem ids.
+    and rewrite the manifest. Returns the list of stem ids written into the pak.
 
     ``engine`` is one of ``"remote"``, ``"audio-separator"``, ``"demucs"``.
+
+    ``replace_stems``: on a re-split, the ids whose existing stems may be
+    overwritten. ``None`` replaces all engine outputs. The engines always
+    separate the full set — selection is applied at write-back, so an
+    unselected stem's file and manifest entry are left untouched (issue #11:
+    users replace or add stems on purpose; a re-split must not clobber them).
     """
     import pak_io  # lazy — pulls in the core sloppak lib (see module docstring)
 
@@ -601,6 +640,9 @@ def split_pak(pak_path: Path, *, engine: str, model: str | None = None,
         if progress_cb:
             progress_cb(0.8, "Encoding stems")
 
+        existing_stems = [e for e in (manifest.get("stems") or []) if isinstance(e, dict)]
+        existing_ids = {str(e.get("id") or "") for e in existing_stems}
+
         add_files: dict[str, Path] = {}
         produced: list[dict] = []
         seen_ids: set[str] = set()
@@ -618,6 +660,11 @@ def split_pak(pak_path: Path, *, engine: str, model: str | None = None,
                 # instrumental collapsing onto "other"): keep the first.
                 continue
             seen_ids.add(stem_id)
+            if (replace_stems is not None and stem_id not in replace_stems
+                    and stem_id in existing_ids):
+                # Protected: the pak already has this stem and the user chose
+                # not to replace it. Don't encode, don't write the file.
+                continue
             rel = f"stems/{stem_id}.ogg"
             out_ogg = work / f"enc_{stem_id}.ogg"
             _encode_ogg(wav, out_ogg)
@@ -637,14 +684,15 @@ def split_pak(pak_path: Path, *, engine: str, model: str | None = None,
         # .ogg. The feedpak spec allows non-Ogg baseline stems (§5.3.2), so a pack
         # authored with a WAV/FLAC full mix stays WAV/FLAC after a split.
         mix_rel = pak_io.find_mix_relpath(manifest)
-        if mix_rel and not any(s["id"] == "full" for s in produced):
+        if (mix_rel and "full" not in existing_ids
+                and not any(s["id"] == "full" for s in produced)):
             produced.append(pak_io.stem_entry("full", mix_rel, default=False))
 
-        produced.sort(key=lambda s: _STEM_ORDER.index(s["id"]) if s["id"] in _STEM_ORDER else 99)
-
-        # Rewrite manifest: replace stems list, stamp provenance, keep the mix.
+        # Rewrite manifest: merge the new entries over the existing list (an
+        # unselected or custom stem keeps its entry verbatim), stamp provenance,
+        # keep the mix.
         new_manifest = dict(manifest)
-        new_manifest["stems"] = produced
+        new_manifest["stems"] = _merge_stem_entries(existing_stems, produced, replace_stems)
         if mix_rel:
             new_manifest["original_audio"] = mix_rel
         # stem_separation provenance (feedpak spec §5.3.1): `engine` is the stable
@@ -665,4 +713,4 @@ def split_pak(pak_path: Path, *, engine: str, model: str | None = None,
         # NB: no `remove=` — the full mix stays in the pak as the fallback.
         pak_io.repack(pak_path, add_files=add_files, manifest=new_manifest)
 
-    return [s["id"] for s in produced]
+    return [s["id"] for s in new_manifest["stems"]]

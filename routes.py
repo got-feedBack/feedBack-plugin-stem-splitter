@@ -316,12 +316,16 @@ class JobManager:
             pass
         return (None, None)
 
-    def enqueue(self, kind: str, filename: str) -> dict:
+    def enqueue(self, kind: str, filename: str,
+                replace_stems: list[str] | None = None) -> dict:
         title, artist = self._song_label(filename)
         job = {
             "id": uuid.uuid4().hex[:12],
             "kind": kind,
             "filename": filename,
+            # Selective re-split (issue #11): ids whose existing stems may be
+            # overwritten. None/absent = replace all (a plain first split).
+            "replace_stems": replace_stems,
             "title": title,
             "artist": artist,
             "status": "queued",
@@ -411,11 +415,14 @@ class JobManager:
             if not engine:
                 raise RuntimeError(reason)
             self._update(job["id"], message=f"Splitting via {reason}")
+            _rs = job.get("replace_stems")
             split_stems.split_pak(
                 pak_path, engine=engine,
                 model=settings.get("remote_model") if engine != "demucs" else None,
                 server_url=server_url, api_key=api_key,
-                engine_dir=edir, models_dir=mdir, progress_cb=cb, cancel_cb=cancel_cb,
+                engine_dir=edir, models_dir=mdir,
+                replace_stems=set(_rs) if _rs else None,
+                progress_cb=cb, cancel_cb=cancel_cb,
             )
         elif job["kind"] == "transcribe":
             lyr_engine, lyr_reason = self.resolve_lyrics_engine()
@@ -944,7 +951,18 @@ def setup(app: FastAPI, context: dict) -> None:
             needs = mgr.needs_server_setup(kind)
             if needs:
                 return {**needs, "ok": False, "enqueued": 0}
-        created = [mgr.enqueue(kind, n) for n in names]
+        # Selective re-split (issue #11), split jobs only: a list of stem ids to
+        # replace. Absent/empty = replace all. Non-string entries are rejected
+        # rather than silently dropped — a typo'd list that quietly meant
+        # "replace everything" would clobber the stems the user tried to protect.
+        replace_stems = None
+        if kind == "split" and body.get("replace_stems") is not None:
+            rs = body.get("replace_stems")
+            if (not isinstance(rs, list)
+                    or not all(isinstance(x, str) and x for x in rs)):
+                return {"error": "replace_stems must be a list of stem ids"}
+            replace_stems = rs or None
+        created = [mgr.enqueue(kind, n, replace_stems=replace_stems) for n in names]
         return {"ok": True, "enqueued": len(created), "jobs": created}
 
     @app.post(f"{P}/split")
@@ -983,6 +1001,24 @@ def setup(app: FastAPI, context: dict) -> None:
         except Exception as e:
             log.warning("stem_splitter: query_page failed: %s", e)
         return out
+
+    @app.get(f"{P}/pak_stems")
+    def pak_stems(filename: str):
+        """Current stems of one pak, for the re-split picker: every manifest
+        entry (including user-added custom ids the engines know nothing about),
+        plus the pack-level separation provenance so the UI can hint which
+        stems came from a machine split."""
+        import pak_io
+        try:
+            pak_path = mgr._resolve_pak(filename)
+            manifest = pak_io.read_manifest(pak_path)
+        except Exception as e:
+            return {"error": str(e)}
+        stems = [{"id": str(e.get("id") or ""), "file": e.get("file"),
+                  "default": e.get("default")}
+                 for e in (manifest.get("stems") or []) if isinstance(e, dict)]
+        return {"filename": filename, "stems": stems,
+                "stem_separation": manifest.get("stem_separation")}
 
     @app.get(f"{P}/missing_stems")
     def missing_stems():
