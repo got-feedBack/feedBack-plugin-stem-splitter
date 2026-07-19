@@ -261,6 +261,21 @@
   }
 
   // ── v3 song-card actions (the official API that replaced DOM injection) ────
+  // Does this song have at least one INSTRUMENT stem (i.e. is it actually
+  // split)? A fresh convert carries only the 'full' mixdown, which is not a
+  // split. Prefers the song row's own stem_ids — per-song, always current —
+  // over the batch missing-sets, which go stale the moment a pak is dropped
+  // into the DLC folder while the app is running (a fresh pak looked
+  // "already split" and offered only Re-split). Returns null when the
+  // provider doesn't send stem_ids, so callers can fall back.
+  function hasInstrumentStems(song) {
+    if (!song || !Array.isArray(song.stem_ids)) return null;
+    for (var i = 0; i < song.stem_ids.length; i++) {
+      if (REPLACEABLE_IDS_FALLBACK.indexOf(song.stem_ids[i]) !== -1) return true;
+    }
+    return false;
+  }
+
   // Fallback only: the authoritative list of ids a split engine can produce
   // comes from the backend (/pak_stems -> replaceable_ids, INSTRUMENT_STEM_IDS
   // in routes.py), so the two sides can't drift. This copy covers an older
@@ -332,7 +347,11 @@
       placement: 'menu',
       order: 30,
       applies: function (song) { return !!(song && song.filename); },
-      enabled: function (song) { return state.missingStems.has(song.filename); },
+      enabled: function (song) {
+        var h = hasInstrumentStems(song);
+        if (h !== null) return !h;
+        return state.missingStems.has(song.filename);
+      },
       run: function (song) {
         if (!state.splitEngine) { toast('No split engine', 'Open Stem Splitter settings to configure a server or download a local engine.', 'warn'); return; }
         enqueue('split', song.filename).then(function (r) {
@@ -347,9 +366,13 @@
       placement: 'menu',
       order: 30.5,
       applies: function (song) { return !!(song && song.filename); },
-      // The mirror image of Split: only for songs that already HAVE stems.
-      // Unknown is not "yes" (same rule as re-align below).
+      // The mirror image of Split: only for songs that already HAVE
+      // instrument stems. Unknown is not "yes" (same rule as re-align
+      // below) — and "not in the stale missing-set" is unknown, not yes,
+      // which is why the song row's own stem_ids is consulted first.
       enabled: function (song) {
+        var h = hasInstrumentStems(song);
+        if (h !== null) return h;
         return state.missingReady && !state.missingStems.has(song.filename);
       },
       run: function (song) {

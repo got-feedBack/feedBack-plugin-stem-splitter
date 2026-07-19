@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.1
+
+### A fresh pak is not a split pak
+
+- **Split/Re-split now read the song itself, not a stale snapshot.** A pak dropped into
+  the DLC folder while the app was running looked "already split" — it wasn't in the
+  missing-stems snapshot taken at startup — so it offered only Re-split. And a pak whose
+  only stem is the `full` mixdown was counted as split at all, when `full` is just the
+  un-separated original. Both actions now consult the song row's own stem list first
+  (always current, per song): Split appears when there are no instrument stems, Re-split
+  when there are. The old snapshot logic remains only as a fallback for library sources
+  that don't report per-song stems.
+
 ## 0.5.0
 
 ### Re-split, without clobbering what's yours
