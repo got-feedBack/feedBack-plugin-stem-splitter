@@ -416,12 +416,16 @@ class JobManager:
                 raise RuntimeError(reason)
             self._update(job["id"], message=f"Splitting via {reason}")
             _rs = job.get("replace_stems")
+            # None -> replace all; a non-None list -> exactly those ids. An
+            # empty list can't arrive via the API (rejected at enqueue), but a
+            # hand-edited persisted job must still mean "protect everything",
+            # never silently widen to "replace all".
             split_stems.split_pak(
                 pak_path, engine=engine,
                 model=settings.get("remote_model") if engine != "demucs" else None,
                 server_url=server_url, api_key=api_key,
+                replace_stems=None if _rs is None else set(_rs),
                 engine_dir=edir, models_dir=mdir,
-                replace_stems=set(_rs) if _rs else None,
                 progress_cb=cb, cancel_cb=cancel_cb,
             )
         elif job["kind"] == "transcribe":
@@ -961,7 +965,14 @@ def setup(app: FastAPI, context: dict) -> None:
             if (not isinstance(rs, list)
                     or not all(isinstance(x, str) and x for x in rs)):
                 return {"error": "replace_stems must be a list of stem ids"}
-            replace_stems = rs or None
+            if not rs:
+                # An explicit [] must NOT quietly mean "replace all" — that is
+                # the exact clobber this feature protects against. It also
+                # cannot mean a useful job (a full separation that writes
+                # nothing), so refuse it outright.
+                return {"error": "replace_stems must name at least one stem id "
+                                 "(omit it to replace all)"}
+            replace_stems = rs
         created = [mgr.enqueue(kind, n, replace_stems=replace_stems) for n in names]
         return {"ok": True, "enqueued": len(created), "jobs": created}
 
@@ -1012,8 +1023,10 @@ def setup(app: FastAPI, context: dict) -> None:
         try:
             pak_path = mgr._resolve_pak(filename)
             manifest = pak_io.read_manifest(pak_path)
-        except Exception as e:
-            return {"error": str(e)}
+        except Exception:
+            # Log the real reason; don't hand local paths / internals to the client.
+            log.exception("stem_splitter: pak_stems failed for %r", filename)
+            return {"error": "could not read that pak's manifest"}
         stems = [{"id": str(e.get("id") or ""), "file": e.get("file"),
                   "default": e.get("default")}
                  for e in (manifest.get("stems") or []) if isinstance(e, dict)]

@@ -600,7 +600,9 @@ def split_pak(pak_path: Path, *, engine: str, model: str | None = None,
               replace_stems: set[str] | None = None,
               progress_cb: ProgressCB = None, cancel_cb: CancelCB = None) -> list[str]:
     """Split ``pak_path`` into per-instrument stems, write them back into the pak,
-    and rewrite the manifest. Returns the list of stem ids written into the pak.
+    and rewrite the manifest. Returns the ids of every stem in the pak after
+    the merge — replaced AND preserved entries alike (the manifest's final
+    stems list), not just the files written this run.
 
     ``engine`` is one of ``"remote"``, ``"audio-separator"``, ``"demucs"``.
 
