@@ -17,6 +17,7 @@ it imports lazily and raises a clear error if a local engine isn't available.
 """
 from __future__ import annotations
 
+import importlib
 import logging
 import os
 import re
@@ -176,9 +177,21 @@ def _module_cmd(engine_dir: str | None, module: str, argv: list[str]) -> list[st
 
 
 def _prepend_engine_path(engine_dir: str | None) -> None:
-    """Make an opt-in-installed engine importable (pip --target dir)."""
+    """Make an opt-in-installed engine importable (pip --target dir).
+
+    Always invalidate import caches: if a split was attempted BEFORE the engine
+    was installed (the natural first-run flow — try to split, get told to
+    install, install, try again), the failed import poisons
+    ``sys.path_importer_cache`` with a negative finder for the then-nonexistent
+    engine dir, and every later in-process import fails until the app restarts.
+    ``importlib.invalidate_caches()`` is the documented requirement when
+    packages are installed at runtime; it is cheap and only runs on the split
+    path, never per frame.
+    """
     if engine_dir and engine_dir not in sys.path:
         sys.path.insert(0, engine_dir)
+    if engine_dir:
+        importlib.invalidate_caches()
 
 
 def demucs_available(engine_dir: str | None = None) -> bool:
