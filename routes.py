@@ -1028,10 +1028,17 @@ def setup(app: FastAPI, context: dict) -> None:
             # Log the real reason; don't hand local paths / internals to the client.
             log.exception("stem_splitter: pak_stems failed for %r", filename)
             return {"error": "could not read that pak's manifest"}
-        stems = [{"id": str(e.get("id") or ""), "file": e.get("file"),
+        # Skip entries with no id: _merge_stem_entries() ignores them too, and a
+        # blank checkbox/protected row in the picker helps nobody.
+        stems = [{"id": str(e.get("id")), "file": e.get("file"),
                   "default": e.get("default")}
-                 for e in (manifest.get("stems") or []) if isinstance(e, dict)]
+                 for e in (manifest.get("stems") or [])
+                 if isinstance(e, dict) and e.get("id")]
         return {"filename": filename, "stems": stems,
+                # The ids a split engine can produce — the single source of
+                # truth for what a re-split could overwrite. The picker reads
+                # this instead of hard-coding its own copy.
+                "replaceable_ids": INSTRUMENT_STEM_IDS,
                 "stem_separation": manifest.get("stem_separation")}
 
     @app.get(f"{P}/missing_stems")
@@ -1103,7 +1110,11 @@ def setup(app: FastAPI, context: dict) -> None:
         with mgr.lock:
             failed = [j for j in mgr.jobs.values() if j.get("status") == "failed"]
         for j in failed:
-            mgr.enqueue(j["kind"], j["filename"])
+            # Carry the stem selection through: retrying a failed re-split as a
+            # plain "replace all" would clobber exactly the stems the user
+            # chose to protect.
+            mgr.enqueue(j["kind"], j["filename"],
+                        replace_stems=j.get("replace_stems"))
         return {"ok": True, "retried": len(failed)}
 
     @app.post(f"{P}/clear_finished")

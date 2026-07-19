@@ -261,11 +261,11 @@
   }
 
   // ── v3 song-card actions (the official API that replaced DOM injection) ────
-  // Stems a split engine can actually produce, and therefore the only ids a
-  // re-split could overwrite. Anything else in the pak (a custom "click"
-  // stem, a user-added backing track) is never touched by the backend merge,
-  // so it is shown as protected rather than offered as a checkbox.
-  var REPLACEABLE_IDS = ['guitar', 'bass', 'drums', 'vocals', 'piano', 'other'];
+  // Fallback only: the authoritative list of ids a split engine can produce
+  // comes from the backend (/pak_stems -> replaceable_ids, INSTRUMENT_STEM_IDS
+  // in routes.py), so the two sides can't drift. This copy covers an older
+  // backend that doesn't send the field yet.
+  var REPLACEABLE_IDS_FALLBACK = ['guitar', 'bass', 'drums', 'vocals', 'piano', 'other'];
 
   // Checkbox picker for a re-split (issue #11): people replace stems on
   // purpose (a re-recorded guitar) and add stems the engines know nothing
@@ -274,10 +274,12 @@
   function openResplitPicker(filename) {
     api('/pak_stems?filename=' + encodeURIComponent(filename)).then(function (res) {
       if (!res || res.error) { toast('Could not read pak', (res && res.error) || 'unknown error', 'warn'); return; }
+      var replaceableSet = (Array.isArray(res.replaceable_ids) && res.replaceable_ids.length)
+        ? res.replaceable_ids : REPLACEABLE_IDS_FALLBACK;
       var existing = (res.stems || []).map(function (s) { return s.id; });
-      var replaceable = existing.filter(function (id) { return REPLACEABLE_IDS.indexOf(id) !== -1; });
+      var replaceable = existing.filter(function (id) { return replaceableSet.indexOf(id) !== -1; });
       var protectedIds = existing.filter(function (id) {
-        return REPLACEABLE_IDS.indexOf(id) === -1 && id !== 'full';
+        return replaceableSet.indexOf(id) === -1 && id !== 'full';
       });
 
       var old = document.getElementById('ss-resplit-overlay');
