@@ -122,8 +122,9 @@
   // Enqueue, but never let a job silently stall on a lazy multi-GB model fetch:
   // the backend answers `needs_setup` when the split would go to the managed local
   // server and its weights aren't downloaded. Ask, then set it up, then run.
-  function enqueue(kind, filenames) {
+  function enqueue(kind, filenames, extra) {
     var body = Array.isArray(filenames) ? { filenames: filenames } : { filename: filenames };
+    if (extra) for (var k in extra) { if (Object.prototype.hasOwnProperty.call(extra, k)) body[k] = extra[k]; }
     return post(kind, body).then(function (res) {
       if (!res || !res.needs_setup) return res;
       if (!window.confirm(res.message + '\n\nThe download runs in the background; your '
@@ -260,6 +261,67 @@
   }
 
   // ── v3 song-card actions (the official API that replaced DOM injection) ────
+  // Fallback only: the authoritative list of ids a split engine can produce
+  // comes from the backend (/pak_stems -> replaceable_ids, INSTRUMENT_STEM_IDS
+  // in routes.py), so the two sides can't drift. This copy covers an older
+  // backend that doesn't send the field yet.
+  var REPLACEABLE_IDS_FALLBACK = ['guitar', 'bass', 'drums', 'vocals', 'piano', 'other'];
+
+  // Checkbox picker for a re-split (issue #11): people replace stems on
+  // purpose (a re-recorded guitar) and add stems the engines know nothing
+  // about — a re-split must only overwrite what the user says it may.
+  // Defaults to everything replaceable checked.
+  function openResplitPicker(filename) {
+    api('/pak_stems?filename=' + encodeURIComponent(filename)).then(function (res) {
+      if (!res || res.error) { toast('Could not read pak', (res && res.error) || 'unknown error', 'warn'); return; }
+      var replaceableSet = (Array.isArray(res.replaceable_ids) && res.replaceable_ids.length)
+        ? res.replaceable_ids : REPLACEABLE_IDS_FALLBACK;
+      var existing = (res.stems || []).map(function (s) { return s.id; });
+      var replaceable = existing.filter(function (id) { return replaceableSet.indexOf(id) !== -1; });
+      var protectedIds = existing.filter(function (id) {
+        return replaceableSet.indexOf(id) === -1 && id !== 'full';
+      });
+
+      var old = document.getElementById('ss-resplit-overlay');
+      if (old) old.remove();
+      var ov = document.createElement('div');
+      ov.id = 'ss-resplit-overlay';
+      ov.style.cssText = 'position:fixed;inset:0;z-index:60;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;';
+      var boxes = replaceable.map(function (id) {
+        return '<label class="flex items-center gap-2 py-1 text-sm">'
+          + '<input type="checkbox" class="ss-rs-box" value="' + esc(id) + '" checked>'
+          + '<span>' + esc(id) + '</span></label>';
+      }).join('');
+      // New ids the engine produces that the pak does not have yet are always
+      // written (there is nothing to protect) — the backend guarantees that.
+      var protectedNote = protectedIds.length
+        ? '<div class="text-xs text-slate-400 mt-2">Never touched: ' + protectedIds.map(esc).join(', ') + ' (and the full mix).</div>'
+        : '<div class="text-xs text-slate-400 mt-2">The full mix is never touched.</div>';
+      ov.innerHTML =
+        '<div class="bg-slate-900 border border-slate-700 rounded-lg p-4 w-80 shadow-xl">'
+        + '<div class="font-semibold mb-1">Re-split stems</div>'
+        + '<div class="text-xs text-slate-400 mb-2">Checked stems are replaced by the new split. Uncheck any you have replaced yourself and want to keep.</div>'
+        + boxes + protectedNote
+        + '<div class="flex justify-end gap-2 mt-3">'
+        + '<button id="ss-rs-cancel" class="px-3 py-1 text-sm rounded bg-slate-700 hover:bg-slate-600">Cancel</button>'
+        + '<button id="ss-rs-go" class="px-3 py-1 text-sm rounded bg-teal-700 hover:bg-teal-600">Re-split</button>'
+        + '</div></div>';
+      document.body.appendChild(ov);
+      ov.addEventListener('click', function (e) { if (e.target === ov) ov.remove(); });
+      ov.querySelector('#ss-rs-cancel').addEventListener('click', function () { ov.remove(); });
+      ov.querySelector('#ss-rs-go').addEventListener('click', function () {
+        var picked = Array.prototype.slice.call(ov.querySelectorAll('.ss-rs-box'))
+          .filter(function (b) { return b.checked; })
+          .map(function (b) { return b.value; });
+        ov.remove();
+        if (!picked.length) { toast('Nothing selected', 'No stems were chosen to replace.', 'warn'); return; }
+        enqueue('split', filename, { replace_stems: picked }).then(function (r) {
+          if (r && r.enqueued) queuedToast('Re-split queued', filename + ' (' + picked.join(', ') + ')');
+        });
+      });
+    });
+  }
+
   function registerCardActions() {
     if (!fb || !fb.libraryCardActions) return;
     var reg = fb.libraryCardActions;
@@ -276,6 +338,23 @@
         enqueue('split', song.filename).then(function (r) {
           if (r && r.enqueued) queuedToast('Split queued', song.filename);
         });
+      },
+    });
+    reg.register({
+      id: 'stem_splitter.resplit',
+      pluginId: 'stem_splitter',
+      label: 'Re-split stems…',
+      placement: 'menu',
+      order: 30.5,
+      applies: function (song) { return !!(song && song.filename); },
+      // The mirror image of Split: only for songs that already HAVE stems.
+      // Unknown is not "yes" (same rule as re-align below).
+      enabled: function (song) {
+        return state.missingReady && !state.missingStems.has(song.filename);
+      },
+      run: function (song) {
+        if (!state.splitEngine) { toast('No split engine', 'Open Stem Splitter settings to configure a server or download a local engine.', 'warn'); return; }
+        openResplitPicker(song.filename);
       },
     });
     reg.register({

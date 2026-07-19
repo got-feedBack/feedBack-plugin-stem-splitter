@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.5.0
+
+### Re-split, without clobbering what's yours
+
+- **Re-split an already-split song, choosing which stems to replace.** ([#11](https://github.com/got-feedBack/feedBack-plugin-stem-splitter/issues/11))
+  A new "Re-split stems…" card action appears for songs that already have stems. It opens a
+  picker listing the pak's replaceable stems — all checked by default — and only the checked
+  ones are overwritten. Uncheck the guitar you re-recorded yourself and it keeps its file and
+  manifest entry, byte for byte. Stems the engines can't produce (a click track, a custom
+  backing stem) and the full-mix fallback are never touched, and are labelled as such in the
+  picker.
+- **A plain split no longer delists custom stems.** The old write-back replaced the whole
+  stems list, silently dropping any user-added entry the engine didn't produce. The manifest
+  is now merged, so custom stems survive every split.
+
 ## 0.4.2
 
 ### No more restart after installing an engine
