@@ -348,10 +348,19 @@ _MONOTONIC_TOLERANCE_SEC = 0.05
 
 
 def _quantile(sorted_vals: list[float], q: float) -> float:
+    """Linear-interpolated quantile. Index rounding would do here for big songs, but a
+    handful of anchors is exactly when the gate matters most (score filtering + coverage
+    can thin the list), and bankers' rounding at e.g. n=6 maps q=0.9 to index 4 — quietly
+    under-reporting the spread and letting scatter slip past the gate."""
     if not sorted_vals:
         return 0.0
-    idx = int(round(q * (len(sorted_vals) - 1)))
-    return sorted_vals[idx]
+    pos = q * (len(sorted_vals) - 1)
+    lo = math.floor(pos)
+    hi = math.ceil(pos)
+    if lo == hi:
+        return sorted_vals[lo]
+    frac = pos - lo
+    return sorted_vals[lo] * (1.0 - frac) + sorted_vals[hi] * frac
 
 
 def _verify_timings_sane(tokens: list[dict], aligned: list[dict], *,

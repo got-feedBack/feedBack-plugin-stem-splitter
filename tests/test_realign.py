@@ -523,6 +523,16 @@ class TheTimingsAreVerifiedNotAssumed(unittest.TestCase):
             realign._verify_timings_sane(tokens, aligned)
         self.assertIn("out-of-order", str(e.exception))
 
+    def test_a_wild_outlier_among_few_anchors_is_still_caught(self):
+        # Six anchors, one pinned 60s away. Index-rounded quantiles (bankers: round(4.5)=4)
+        # would report the P90 at the last sane word and a spread of ~0 — accepting it.
+        # Interpolated quantiles see the outlier.
+        tokens = [{"t": 10.0 + i, "d": 0.4, "w": f"word{i}"} for i in range(6)]
+        aligned = [{"t": 10.0 + i, "d": 0.4, "w": f"word{i}"} for i in range(5)]
+        aligned.append({"t": 75.0, "d": 0.4, "w": "word5"})   # delta +60 on the last word
+        with self.assertRaises(RuntimeError):
+            realign._verify_timings_sane(tokens, aligned)
+
     def test_the_threshold_is_tunable(self):
         tokens = self._tokens()
         aligned = self._aligned([10.0 + i * 1.0 + (0.5 * i) for i in range(10)])  # 4.5s spread
