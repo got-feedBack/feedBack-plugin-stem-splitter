@@ -624,6 +624,17 @@ class LowConfidencePlacementsAreNotTrusted(unittest.TestCase):
         ], min_score=0.35)
         self.assertEqual([w["w"] for w in words], ["hold"])
 
+    def test_a_non_finite_score_is_untrusted_not_trusted(self):
+        # NaN < min_score is False — without normalization a NaN-scored word would slip
+        # through the filter as if the aligner had vouched for it.
+        words = realign.segments_to_words([
+            {"start": 10.0, "end": 10.4, "text": "hold", "score": 0.9},
+            {"start": 55.0, "end": 55.4, "text": "me", "score": float("nan")},
+            {"start": 56.0, "end": 56.4, "text": "tiny", "score": float("inf")},
+            {"start": 11.0, "end": 11.4, "text": "closer", "score": 0.9},
+        ], min_score=0.35)
+        self.assertEqual([w["w"] for w in words], ["hold", "closer"])
+
     def test_no_threshold_means_no_filtering(self):
         words = realign.segments_to_words([
             {"start": 10.0, "end": 10.4, "text": "hold", "score": 0.01},

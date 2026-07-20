@@ -121,6 +121,11 @@ def segments_to_words(segments: list[dict], *, min_score: float | None = None) -
             score = float(score) if score is not None else None
         except (TypeError, ValueError):
             score = None
+        # NaN compares false against everything, so a NaN score would sail past the
+        # `score < min_score` drop below as if it were trusted. Non-finite means the
+        # aligner did NOT vouch for this word: same bucket as missing.
+        if score is not None and not math.isfinite(score):
+            score = None
         rows.append((text, float(start), float(end), score))
 
     scored = min_score is not None and any(s is not None for (_, _, _, s) in rows)
