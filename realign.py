@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import tempfile
 from pathlib import Path
 from typing import Callable, Optional
@@ -354,6 +355,17 @@ def _verify_timings_sane(tokens: list[dict], aligned: list[dict], *,
     `_verify_words_survived`, which judges the words. Returns the stats used for the job's
     result message; raises when the result is implausible, leaving the pak untouched.
     """
+    # This is the last line of defense before the write, so the threshold itself must be
+    # sound: NaN makes every `>` comparison false (the gate silently accepts anything),
+    # +inf accepts anything, and a negative rejects everything. A caller handing in a
+    # hand-edited/corrupted setting gets the shipped default, not a disabled guard.
+    try:
+        max_spread_sec = float(max_spread_sec)
+    except (TypeError, ValueError):
+        max_spread_sec = _DEFAULT_MAX_SPREAD_SEC
+    if not math.isfinite(max_spread_sec) or max_spread_sec < 0:
+        max_spread_sec = _DEFAULT_MAX_SPREAD_SEC
+
     groups, spans, anchored = _match_and_fill_spans(tokens, aligned)
 
     # Per-word delta (new start − original start), over the words the aligner actually

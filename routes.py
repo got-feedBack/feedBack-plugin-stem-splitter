@@ -34,14 +34,18 @@ INSTRUMENT_STEM_IDS = ["guitar", "bass", "drums", "vocals", "other", "piano"]
 _BROADCAST_MIN_INTERVAL = 0.15  # s — throttle progress spam
 
 
-def _settings_float(settings: dict, key: str, default: float) -> float:
-    """A tunable numeric setting, defaulting on absence or junk — a hand-edited settings
-    file must degrade to the shipped threshold, not crash the job worker."""
+def _settings_float(settings: dict, key: str, default: float,
+                    lo: float, hi: float) -> float:
+    """A tunable numeric setting, defaulting on absence or junk and clamped into [lo, hi] —
+    a hand-edited settings file must degrade to a sane threshold, not disable a guard (a
+    negative spread limit rejects every alignment; a min_score above 1 drops every word)."""
     try:
         v = float(settings.get(key))
     except (TypeError, ValueError):
         return default
-    return v if v == v else default  # NaN guard
+    if v != v or v in (float("inf"), float("-inf")):  # NaN/inf guard
+        return default
+    return min(hi, max(lo, v))
 
 
 def _as_port(value, default: int | None = None) -> int:
@@ -479,8 +483,9 @@ class JobManager:
                 pak_path, server_url=lyr_server, api_key=api_key,
                 language=settings.get("language") or None,
                 max_spread_sec=_settings_float(
-                    settings, "realign_max_spread_sec", realign._DEFAULT_MAX_SPREAD_SEC),
-                min_score=_settings_float(settings, "realign_min_score", 0.35),
+                    settings, "realign_max_spread_sec",
+                    realign._DEFAULT_MAX_SPREAD_SEC, 0.1, 60.0),
+                min_score=_settings_float(settings, "realign_min_score", 0.35, 0.0, 1.0),
                 cancel_cb=cancel_cb, progress_cb=cb,
             )
             done_message = (

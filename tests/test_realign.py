@@ -530,6 +530,22 @@ class TheTimingsAreVerifiedNotAssumed(unittest.TestCase):
             realign._verify_timings_sane(tokens, aligned)                # default 3.0
         realign._verify_timings_sane(tokens, aligned, max_spread_sec=6.0)  # loosened
 
+    def test_a_broken_threshold_cannot_disable_the_guard(self):
+        # NaN makes every `>` comparison false — the gate would silently accept anything.
+        # This is the last line of defense before the write, so a corrupted setting must
+        # fall back to the shipped default, not switch the guard off (or, for a negative
+        # value, reject every legitimate result).
+        tokens = self._tokens()
+        scattered = self._aligned([i * 8.0 for i in range(10)])
+        for bad in (float("nan"), float("inf"), -1.0, "junk", None):
+            with self.assertRaises(RuntimeError, msg=f"max_spread_sec={bad!r}"):
+                realign._verify_timings_sane(tokens, scattered, max_spread_sec=bad)
+        # ...and the default must still ACCEPT a sane result under the same bad inputs.
+        sane = self._aligned([10.0 + i * 1.0 + 5.0 for i in range(10)])
+        for bad in (float("nan"), -1.0):
+            stats = realign._verify_timings_sane(tokens, sane, max_spread_sec=bad)
+            self.assertEqual(stats["anchored"], 10)
+
     def test_the_timing_guard_runs_before_the_repack(self):
         """Same rule as the words guard: a guard that fires after the write is not a guard."""
         tokens = [{"t": 10.0 + i, "d": 0.4, "w": f"word{i}"} for i in range(10)]
@@ -666,6 +682,27 @@ class TheBackupSurvivesARealign(unittest.TestCase):
             new.write_text("[]", encoding="utf-8")
             pak_io.repack(pak, add_files={"lyrics.json": new})
             self.assertFalse(pak.with_name(pak.name + ".bak").exists())
+
+    def test_a_later_default_repack_does_not_delete_a_kept_backup(self):
+        # The undo a re-align deliberately left behind must survive a later
+        # split/transcribe on the same pak, whose repack cleans up ITS OWN backup only.
+        import tempfile
+        import pak_io
+        with tempfile.TemporaryDirectory() as td:
+            pak = self._zip_pak(td)
+            original = pak.read_bytes()
+            new = Path(td) / "new_lyrics.json"
+            new.write_text('[{"t":9,"d":1,"w":"new"}]', encoding="utf-8")
+            pak_io.repack(pak, add_files={"lyrics.json": new}, keep_backup=True)
+            bak = pak.with_name(pak.name + ".bak")
+            self.assertTrue(bak.exists())
+
+            newer = Path(td) / "newer.json"
+            newer.write_text('[{"t":5,"d":1,"w":"newer"}]', encoding="utf-8")
+            pak_io.repack(pak, add_files={"lyrics.json": newer})  # e.g. a split job
+            self.assertTrue(bak.exists(), "the realign undo must survive later repacks")
+            self.assertEqual(bak.read_bytes(), original,
+                             "…and still hold the pre-realign pak")
 
     def test_dir_form_backs_up_the_replaced_member(self):
         import tempfile

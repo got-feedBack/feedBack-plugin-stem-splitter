@@ -139,8 +139,10 @@ def repack(path: Path, *, add_files: dict[str, Path] | None = None,
 def _repack_zip(path: Path, add_files: dict[str, Path], remove: set[str], manifest: dict | None,
                 *, keep_backup: bool = False) -> None:
     backup = path.with_name(path.name + ".bak")
+    created_backup = False
     if not backup.exists():
         shutil.copy2(path, backup)
+        created_backup = True
     out_tmp = path.with_name(path.name + ".tmp")
 
     replaced = set(add_files.keys())
@@ -168,8 +170,10 @@ def _repack_zip(path: Path, add_files: dict[str, Path], remove: set[str], manife
     # `.feedpak.bak` per processed song on disk. (The backup only guards a crash
     # mid-repack, i.e. everything before this line.) A keep_backup caller wants
     # the opposite: the pre-rewrite copy IS the product — the undo for a
-    # plausible-but-wrong rewrite — so it stays.
-    if not keep_backup:
+    # plausible-but-wrong rewrite — so it stays. And only a backup THIS run
+    # created may be cleaned up: a later split/transcribe on the same pak must
+    # not delete the undo a re-align deliberately left behind.
+    if not keep_backup and created_backup:
         try:
             backup.unlink()
         except OSError:
