@@ -109,13 +109,18 @@ def dump_manifest(manifest: dict) -> str:
 
 
 def repack(path: Path, *, add_files: dict[str, Path] | None = None,
-           remove: set[str] | None = None, manifest: dict | None = None) -> None:
+           remove: set[str] | None = None, manifest: dict | None = None,
+           keep_backup: bool = False) -> None:
     """Rewrite a pak, adding/replacing members, removing members, and (optionally)
     replacing the manifest.
 
     ``add_files`` maps pak-relative path -> local source file to insert.
     ``remove`` is a set of pak-relative paths to drop.
     ``manifest`` (if given) is dumped to manifest.yaml.
+    ``keep_backup``: preserve a pre-rewrite copy even after success — the zip form's
+    ``.feedpak.bak`` survives instead of being cleaned up, and the directory form writes a
+    one-time ``<member>.bak`` beside each replaced file. For callers that overwrite data the
+    user cannot regenerate (re-align rewrites authored lyric timings).
 
     Zip form: backup ``.bak`` + build ``.tmp`` + atomic ``replace`` (mirrors
     songmeta). Directory form: write/remove files in place with a one-time
@@ -126,12 +131,13 @@ def repack(path: Path, *, add_files: dict[str, Path] | None = None,
     remove = {r.replace("\\", "/").lstrip("/") for r in (remove or set())}
 
     if is_zip_form(path):
-        _repack_zip(path, add_files, remove, manifest)
+        _repack_zip(path, add_files, remove, manifest, keep_backup=keep_backup)
     else:
-        _repack_dir(path, add_files, remove, manifest)
+        _repack_dir(path, add_files, remove, manifest, keep_backup=keep_backup)
 
 
-def _repack_zip(path: Path, add_files: dict[str, Path], remove: set[str], manifest: dict | None) -> None:
+def _repack_zip(path: Path, add_files: dict[str, Path], remove: set[str], manifest: dict | None,
+                *, keep_backup: bool = False) -> None:
     backup = path.with_name(path.name + ".bak")
     if not backup.exists():
         shutil.copy2(path, backup)
@@ -160,14 +166,18 @@ def _repack_zip(path: Path, add_files: dict[str, Path], remove: set[str], manife
     # The atomic replace succeeded, so the new pak is safely in place and the
     # backup is no longer needed. Removing it keeps a batch run from leaving one
     # `.feedpak.bak` per processed song on disk. (The backup only guards a crash
-    # mid-repack, i.e. everything before this line.)
-    try:
-        backup.unlink()
-    except OSError:
-        pass
+    # mid-repack, i.e. everything before this line.) A keep_backup caller wants
+    # the opposite: the pre-rewrite copy IS the product — the undo for a
+    # plausible-but-wrong rewrite — so it stays.
+    if not keep_backup:
+        try:
+            backup.unlink()
+        except OSError:
+            pass
 
 
-def _repack_dir(path: Path, add_files: dict[str, Path], remove: set[str], manifest: dict | None) -> None:
+def _repack_dir(path: Path, add_files: dict[str, Path], remove: set[str], manifest: dict | None,
+                *, keep_backup: bool = False) -> None:
     for rel in remove:
         target = path / rel
         if target.is_file():
@@ -176,6 +186,12 @@ def _repack_dir(path: Path, add_files: dict[str, Path], remove: set[str], manife
         target = path / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         if src.resolve() != target.resolve():
+            # Same one-time policy as manifest.yaml.bak below: the first rewrite
+            # preserves the user's original; later rewrites don't clobber it.
+            if keep_backup and target.is_file():
+                bak = target.with_name(target.name + ".bak")
+                if not bak.exists():
+                    shutil.copy2(target, bak)
             shutil.copy2(src, target)
     if manifest is not None:
         mf = path / "manifest.yaml"

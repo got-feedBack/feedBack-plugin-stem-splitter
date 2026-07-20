@@ -34,6 +34,16 @@ INSTRUMENT_STEM_IDS = ["guitar", "bass", "drums", "vocals", "other", "piano"]
 _BROADCAST_MIN_INTERVAL = 0.15  # s — throttle progress spam
 
 
+def _settings_float(settings: dict, key: str, default: float) -> float:
+    """A tunable numeric setting, defaulting on absence or junk — a hand-edited settings
+    file must degrade to the shipped threshold, not crash the job worker."""
+    try:
+        v = float(settings.get(key))
+    except (TypeError, ValueError):
+        return default
+    return v if v == v else default  # NaN guard
+
+
 def _as_port(value, default: int | None = None) -> int:
     """Port from settings, tolerant of a hand-edited or corrupted file.
 
@@ -385,8 +395,9 @@ class JobManager:
                 continue
             self._update(job_id, status="running", progress=0.0, message="Starting")
             try:
-                self._run_job(job)
-                self._update(job_id, status="done", progress=1.0, message="Done")
+                done_message = self._run_job(job)
+                self._update(job_id, status="done", progress=1.0,
+                             message=done_message or "Done")
             except JobCanceled:
                 self._update(job_id, status="canceled", progress=0.0, message="Canceled")
             except Exception as e:
@@ -396,7 +407,10 @@ class JobManager:
                 self._cancel.discard(job_id)
             self._save_jobs()
 
-    def _run_job(self, job: dict) -> None:
+    def _run_job(self, job: dict) -> str | None:
+        """Run one job. A truthy return becomes the done-status message (a job that can
+        say what it actually did — realign's timing stats — should; bare kinds fall back
+        to "Done" in the worker)."""
         import split_stems
         import transcribe
 
@@ -409,6 +423,7 @@ class JobManager:
         api_key = self._api_key()
         edir = str(engine_install.engine_dir(self.config_dir))
         mdir = str(engine_install.models_dir(self.config_dir))
+        done_message: str | None = None
 
         if job["kind"] == "split":
             engine, reason = self.resolve_split_engine()
@@ -460,15 +475,25 @@ class JobManager:
                     "settings (the local engine cannot re-align, only transcribe)"
                 )
             self._update(job["id"], message="Re-aligning existing lyrics")
-            realign.realign_pak(
+            stats = realign.realign_pak(
                 pak_path, server_url=lyr_server, api_key=api_key,
                 language=settings.get("language") or None,
+                max_spread_sec=_settings_float(
+                    settings, "realign_max_spread_sec", realign._DEFAULT_MAX_SPREAD_SEC),
+                min_score=_settings_float(settings, "realign_min_score", 0.35),
                 cancel_cb=cancel_cb, progress_cb=cb,
+            )
+            done_message = (
+                f"{stats['words']} words re-timed ({stats['anchored']} aligned, "
+                f"{stats['interpolated']} interpolated); "
+                f"shift {stats['median_shift_s']:+.2f}s, spread {stats['spread_s']:.2f}s; "
+                f"backup: {stats['backup']}"
             )
         else:
             raise RuntimeError(f"unknown job kind {job['kind']!r}")
 
         self._reindex(filename, pak_path)
+        return done_message
 
     def _resolve_pak(self, filename: str) -> Path:
         if not self.get_dlc_dir:

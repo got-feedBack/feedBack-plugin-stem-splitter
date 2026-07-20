@@ -470,5 +470,224 @@ class TheResponseIsHandledLikeAServerCanMisbehave(unittest.TestCase):
         self.assertIn("no segments", str(e.exception))
 
 
+class TheTimingsAreVerifiedNotAssumed(unittest.TestCase):
+    """#27: the words guard passes trivially under forced alignment (the server returns OUR
+    text), so the only thing realign changes — the timings — went entirely unguarded. A
+    chant intro / backing-vocal bleed pinned words onto the wrong vocal content, the result
+    scattered −72s..+3.9s, and it was written out as success. These defend the numbers the
+    way the tests above defend the words."""
+
+    def _tokens(self, n=10, start=10.0, step=1.0):
+        return [{"t": start + i * step, "d": 0.4, "w": f"word{i}"} for i in range(n)]
+
+    def _aligned(self, times):
+        return [{"t": float(t), "d": 0.4, "w": f"word{i}"} for i, t in enumerate(times)]
+
+    def test_a_scattered_alignment_is_refused(self):
+        # In-order words (subsequence guard passes) whose deltas scatter by tens of seconds —
+        # the #27 shape. A real fix is one shift plus sub-second drift; this is neither.
+        tokens = self._tokens()                            # 10..19s
+        aligned = self._aligned([i * 8.0 for i in range(10)])  # 0..72s, deltas -10..+53
+        with self.assertRaises(RuntimeError) as e:
+            realign._verify_timings_sane(tokens, aligned)
+        self.assertIn("implausible", str(e.exception))
+        self.assertIn("left unchanged", str(e.exception),
+                      "the message must say the pak was not touched")
+
+    def test_a_uniform_shift_is_allowed_at_any_size(self):
+        # A chart that is legitimately 10s off must be fixable in one click: gate the SPREAD,
+        # never the shift.
+        tokens = self._tokens()
+        aligned = self._aligned([10.0 + i * 1.0 + 10.0 for i in range(10)])  # exactly +10s
+        stats = realign._verify_timings_sane(tokens, aligned)
+        self.assertAlmostEqual(stats["median_shift_s"], 10.0, places=2)
+        self.assertLessEqual(stats["spread_s"], 0.01)
+        self.assertEqual(stats["anchored"], 10)
+
+    def test_sub_second_drift_around_a_shift_is_allowed(self):
+        tokens = self._tokens()
+        aligned = self._aligned([10.0 + i * 1.0 + 2.0 + (0.05 * (i % 3)) for i in range(10)])
+        stats = realign._verify_timings_sane(tokens, aligned)
+        self.assertLess(stats["spread_s"], 0.5)
+
+    def test_words_running_backwards_are_refused(self):
+        # Two words pinned to different occurrences of similar audio: starts go backwards even
+        # though every delta is individually modest.
+        tokens = [{"t": 10.0, "d": 0.4, "w": "hold"},
+                  {"t": 11.0, "d": 0.4, "w": "me"},
+                  {"t": 12.0, "d": 0.4, "w": "closer"}]
+        aligned = [{"t": 15.0, "d": 0.4, "w": "hold"},
+                   {"t": 16.0, "d": 0.4, "w": "me"},
+                   {"t": 14.9, "d": 0.4, "w": "closer"}]
+        with self.assertRaises(RuntimeError) as e:
+            realign._verify_timings_sane(tokens, aligned)
+        self.assertIn("out-of-order", str(e.exception))
+
+    def test_the_threshold_is_tunable(self):
+        tokens = self._tokens()
+        aligned = self._aligned([10.0 + i * 1.0 + (0.5 * i) for i in range(10)])  # 4.5s spread
+        with self.assertRaises(RuntimeError):
+            realign._verify_timings_sane(tokens, aligned)                # default 3.0
+        realign._verify_timings_sane(tokens, aligned, max_spread_sec=6.0)  # loosened
+
+    def test_the_timing_guard_runs_before_the_repack(self):
+        """Same rule as the words guard: a guard that fires after the write is not a guard."""
+        tokens = [{"t": 10.0 + i, "d": 0.4, "w": f"word{i}"} for i in range(10)]
+        manifest = {"lyrics": "lyrics.json",
+                    "stems": [{"id": "vocals", "file": "stems/vocals.ogg"}]}
+        scattered = [{"t": float(i * 8), "d": 0.4, "w": f"word{i}"} for i in range(10)]
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(
+                realign.pak_io, "read_manifest", return_value=manifest))
+            stack.enter_context(mock.patch.object(
+                realign.pak_io, "read_member_bytes",
+                side_effect=[json.dumps(tokens).encode(), b"audio"]))
+            stack.enter_context(mock.patch.object(
+                realign, "align_vocals_remote", return_value=scattered))
+            repack = stack.enter_context(mock.patch.object(realign.pak_io, "repack"))
+
+            with self.assertRaises(RuntimeError) as e:
+                realign.realign_pak("song.sloppak", server_url="http://s")
+        self.assertIn("implausible", str(e.exception))
+        repack.assert_not_called()
+
+    def test_a_sane_realign_reports_its_stats(self):
+        tokens = [{"t": 0.0, "d": 0.4, "w": "hold"},
+                  {"t": 1.0, "d": 0.4, "w": "me"},
+                  {"t": 2.0, "d": 0.4, "w": "closer"}]
+        manifest = {"lyrics": "lyrics.json",
+                    "stems": [{"id": "vocals", "file": "stems/vocals.ogg"}]}
+        aligned = [{"t": 10.0, "d": 0.4, "w": "hold"},
+                   {"t": 12.0, "d": 0.4, "w": "closer"}]   # "me" interpolated
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(
+                realign.pak_io, "read_manifest", return_value=manifest))
+            stack.enter_context(mock.patch.object(
+                realign.pak_io, "read_member_bytes",
+                side_effect=[json.dumps(tokens).encode(), b"audio"]))
+            stack.enter_context(mock.patch.object(
+                realign, "align_vocals_remote", return_value=aligned))
+            stack.enter_context(mock.patch.object(realign.pak_io, "repack"))
+
+            stats = realign.realign_pak("song.sloppak", server_url="http://s")
+        self.assertEqual(stats["words"], 3)
+        self.assertEqual(stats["anchored"], 2)
+        self.assertEqual(stats["interpolated"], 1)
+        self.assertAlmostEqual(stats["median_shift_s"], 10.0, places=2)
+        self.assertIn("backup", stats)
+
+
+class LowConfidencePlacementsAreNotTrusted(unittest.TestCase):
+    """WhisperX scores every placed word. A low score IS the poisoned anchor from #27 — the
+    word pinned to a chant instead of the sung line. The transcribe path already drops those
+    (lib/lyrics_transcribe.py); realign now does the same, and the dropped word gets
+    interpolated between anchors that were actually trusted."""
+
+    def test_low_score_words_are_dropped_when_scores_are_present(self):
+        words = realign.segments_to_words([
+            {"start": 10.0, "end": 10.4, "text": "hold", "score": 0.9},
+            {"start": 55.0, "end": 55.4, "text": "me", "score": 0.05},
+            {"start": 11.0, "end": 11.4, "text": "closer", "score": 0.9},
+        ], min_score=0.35)
+        self.assertEqual([w["w"] for w in words], ["hold", "closer"])
+
+    def test_a_scoreless_response_is_accepted_whole(self):
+        # An older server that doesn't send scores must keep working.
+        words = realign.segments_to_words([
+            {"start": 10.0, "end": 10.4, "text": "hold"},
+            {"start": 11.0, "end": 11.4, "text": "me"},
+        ], min_score=0.35)
+        self.assertEqual(len(words), 2)
+
+    def test_a_missing_score_in_a_scored_response_is_untrusted(self):
+        # Mirrors the transcribe path: when the server DOES score, an unscored word is the
+        # aligner declining to vouch for it.
+        words = realign.segments_to_words([
+            {"start": 10.0, "end": 10.4, "text": "hold", "score": 0.9},
+            {"start": 55.0, "end": 55.4, "text": "me"},
+        ], min_score=0.35)
+        self.assertEqual([w["w"] for w in words], ["hold"])
+
+    def test_no_threshold_means_no_filtering(self):
+        words = realign.segments_to_words([
+            {"start": 10.0, "end": 10.4, "text": "hold", "score": 0.01},
+        ])
+        self.assertEqual(len(words), 1)
+
+    def test_the_poisoned_anchor_lands_by_interpolation_not_by_its_bad_time(self):
+        tokens = [{"t": 0.0, "d": 0.4, "w": "hold"},
+                  {"t": 1.0, "d": 0.4, "w": "me"},
+                  {"t": 2.0, "d": 0.4, "w": "closer"}]
+        aligned = realign.segments_to_words([
+            {"start": 10.0, "end": 10.4, "text": "hold", "score": 0.9},
+            {"start": 55.0, "end": 55.4, "text": "me", "score": 0.05},   # pinned to a chant
+            {"start": 11.0, "end": 11.4, "text": "closer", "score": 0.9},
+        ], min_score=0.35)
+        out = realign.retime_tokens(tokens, aligned)
+        self.assertEqual([x["w"] for x in out], ["hold", "me", "closer"])
+        self.assertGreaterEqual(out[1]["t"], 10.0, "'me' must land between its neighbours")
+        self.assertLessEqual(out[1]["t"] + out[1]["d"], 11.0 + 0.01,
+                             "…not at the chant's 55s")
+
+
+class TheBackupSurvivesARealign(unittest.TestCase):
+    """#27's second failure: the pak was rewritten in place and the pre-realign copy deleted
+    on success, so a plausible-but-wrong result destroyed the only copy of the authored
+    timings. keep_backup preserves the pre-rewrite state past a successful repack."""
+
+    def _zip_pak(self, td):
+        import zipfile
+        pak = Path(td) / "song.feedpak"
+        with zipfile.ZipFile(pak, "w") as z:
+            z.writestr("manifest.yaml", "lyrics: lyrics.json\n")
+            z.writestr("lyrics.json", '[{"t":0,"d":1,"w":"orig"}]')
+        return pak
+
+    def test_zip_form_keeps_the_bak_when_asked(self):
+        import tempfile
+        import pak_io
+        with tempfile.TemporaryDirectory() as td:
+            pak = self._zip_pak(td)
+            original = pak.read_bytes()
+            new = Path(td) / "new_lyrics.json"
+            new.write_text('[{"t":9,"d":1,"w":"new"}]', encoding="utf-8")
+            pak_io.repack(pak, add_files={"lyrics.json": new}, keep_backup=True)
+            bak = pak.with_name(pak.name + ".bak")
+            self.assertTrue(bak.exists(), "the pre-realign pak is the undo — it must survive")
+            self.assertEqual(bak.read_bytes(), original)
+
+    def test_zip_form_still_cleans_up_by_default(self):
+        # Split/transcribe batches must not litter one .bak per processed song.
+        import tempfile
+        import pak_io
+        with tempfile.TemporaryDirectory() as td:
+            pak = self._zip_pak(td)
+            new = Path(td) / "new_lyrics.json"
+            new.write_text("[]", encoding="utf-8")
+            pak_io.repack(pak, add_files={"lyrics.json": new})
+            self.assertFalse(pak.with_name(pak.name + ".bak").exists())
+
+    def test_dir_form_backs_up_the_replaced_member(self):
+        import tempfile
+        import pak_io
+        with tempfile.TemporaryDirectory() as td:
+            pak = Path(td) / "song.feedpak"
+            pak.mkdir()
+            (pak / "manifest.yaml").write_text("lyrics: lyrics.json\n", encoding="utf-8")
+            (pak / "lyrics.json").write_text('[{"t":0,"d":1,"w":"orig"}]', encoding="utf-8")
+            new = Path(td) / "new_lyrics.json"
+            new.write_text('[{"t":9,"d":1,"w":"new"}]', encoding="utf-8")
+            pak_io.repack(pak, add_files={"lyrics.json": new}, keep_backup=True)
+            bak = pak / "lyrics.json.bak"
+            self.assertTrue(bak.exists())
+            self.assertIn("orig", bak.read_text(encoding="utf-8"))
+            self.assertIn("new", (pak / "lyrics.json").read_text(encoding="utf-8"))
+            # A second rewrite must not clobber the original backup.
+            newer = Path(td) / "newer.json"
+            newer.write_text('[{"t":5,"d":1,"w":"newer"}]', encoding="utf-8")
+            pak_io.repack(pak, add_files={"lyrics.json": newer}, keep_backup=True)
+            self.assertIn("orig", bak.read_text(encoding="utf-8"))
+
+
 if __name__ == "__main__":
     unittest.main()
