@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.6.0
+
+### Re-align guards its timings, not just its words ([#27](https://github.com/got-feedBack/feedBack-plugin-stem-splitter/issues/27))
+
+- **Implausible timings are refused, and the pak is left untouched.** Re-align's defenses
+  all protected the *words* — but forced alignment returns your own text, so the words
+  guard passes no matter how wrong the *times* are, and one song came back scattered
+  across −72s..+3.9s and was written out as success. A new timing guard runs before the
+  repack: the per-word deltas must cluster (a real fix is one constant shift plus
+  sub-second drift — the spread is gated at 3s, tunable via the `realign_max_spread_sec`
+  setting; the shift itself is deliberately unlimited, so a chart that is legitimately
+  10s off is still fixable in one click), and word starts must not run backwards. A
+  refusal fails the job with the stats and the likely cause instead of scrambling the
+  song.
+- **Low-confidence placements are interpolated, not trusted.** WhisperX scores every word
+  it places; a low score is exactly the word pinned to a chant, backing vocal, or bleed
+  instead of the sung line. Scored below `realign_min_score` (default 0.35, the same
+  threshold the transcribe path has always used) a word is treated as unplaced and
+  interpolated between the anchors that were trusted. Scoreless (older) servers keep
+  working unchanged.
+- **The pre-realign pak survives as `<song>.feedpak.bak`.** Re-align overwrites the one
+  thing that cannot be regenerated — the authored timings — so its repack now keeps the
+  backup instead of cleaning it up (directory-form paks keep `lyrics.json.bak`). A
+  plausible-but-wrong alignment is now an undo, not a loss. Split and transcribe batches
+  still clean up after themselves.
+- **The job result says what actually happened** — words re-timed, aligned vs
+  interpolated counts, median shift, spread, and the backup's name — instead of "Done".
+
 ## 0.5.2
 
 ### Transcribe and Re-align follow the song too

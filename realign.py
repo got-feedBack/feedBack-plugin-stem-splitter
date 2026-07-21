@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import tempfile
 from pathlib import Path
 from typing import Callable, Optional
@@ -95,9 +96,19 @@ def lyrics_to_text(tokens: list[dict]) -> str:
     return "\n".join(" ".join(ln) for ln in lines if ln)
 
 
-def segments_to_words(segments: list[dict]) -> list[dict]:
-    """/align word-granularity output -> a plain timed word list. Nothing sloppak-shaped yet."""
-    words: list[dict] = []
+def segments_to_words(segments: list[dict], *, min_score: float | None = None) -> list[dict]:
+    """/align word-granularity output -> a plain timed word list. Nothing sloppak-shaped yet.
+
+    ``min_score``: WhisperX attaches a per-word confidence score, and a low-confidence
+    placement is exactly the word the aligner pinned to a chant / backing vocal / bleed
+    instead of the sung line (#27). Dropping it here turns a poisoned anchor into an
+    unmatched word, which retime_tokens then interpolates between the anchors that WERE
+    trusted — the same policy the transcribe path applies in lib/lyrics_transcribe.py.
+    Only enforced when the response actually carries scores, so an older server that
+    doesn't send them keeps working; in a scored response a word MISSING its score is
+    treated as untrustworthy, matching the transcribe path.
+    """
+    rows: list[tuple[str, float, float, float | None]] = []
     for seg in segments or []:
         if not isinstance(seg, dict):
             continue
@@ -105,9 +116,26 @@ def segments_to_words(segments: list[dict]) -> list[dict]:
         start, end = seg.get("start"), seg.get("end")
         if not text or start is None or end is None:
             continue
+        score = seg.get("score")
+        try:
+            score = float(score) if score is not None else None
+        except (TypeError, ValueError):
+            score = None
+        # NaN compares false against everything, so a NaN score would sail past the
+        # `score < min_score` drop below as if it were trusted. Non-finite means the
+        # aligner did NOT vouch for this word: same bucket as missing.
+        if score is not None and not math.isfinite(score):
+            score = None
+        rows.append((text, float(start), float(end), score))
+
+    scored = min_score is not None and any(s is not None for (_, _, _, s) in rows)
+    words: list[dict] = []
+    for text, start, end, score in rows:
+        if scored and (score is None or score < min_score):
+            continue
         words.append({
-            "t": round(float(start), 3),
-            "d": round(max(0.0, float(end) - float(start)), 3),
+            "t": round(start, 3),
+            "d": round(max(0.0, end - start), 3),
             "w": text,
         })
     return words
@@ -139,23 +167,15 @@ def _token_words(tokens: list[dict]) -> list[tuple[str, list[int]]]:
     return words
 
 
-def retime_tokens(tokens: list[dict], aligned: list[dict]) -> list[dict]:
-    """Rebuild the pak's lyrics from ITS OWN tokens, changing only `t` and `d`.
+def _match_and_fill_spans(
+    tokens: list[dict], aligned: list[dict],
+) -> tuple[list[tuple[str, list[int]]], list[tuple[float, float]], list[int]]:
+    """Match the aligner's words onto the pak's word groups and fill the gaps.
 
-    This is the whole feature, and the earlier version got it subtly wrong: it built the new
-    lyrics out of the words the SERVER returned. Forced alignment legitimately drops a word it
-    can't place — so every dropped word was silently deleted from the user's song. A re-align
-    that quietly loses "dancer" from the chorus has not kept the promise; it has broken it in a
-    way nobody notices until they play the song.
-
-    So the output is the user's tokens, in the user's order, with the user's exact text —
-    including the `-` joins and `+` line breaks, which means the line structure they authored
-    survives too, rather than being replaced by wherever the aligner decided a line was. Only the
-    numbers move.
-
-    An unaligned word keeps its place and is given a plausible span, interpolated across the gap
-    between the neighbours that DID align. It is better to sing a word slightly early than to
-    lose it.
+    Returns ``(groups, spans, anchored)``: the word groups from `_token_words`, one
+    ``(start, end)`` span per group, and the indices of the groups whose span came from the
+    aligner (the rest are interpolated). Shared by `retime_tokens` (which writes the spans
+    onto syllables) and `_verify_timings_sane` (which judges them before anything is written).
     """
     groups = _token_words(tokens)
     got = [dict(w, _k=(_words(w["w"])[:1] or [""])[0]) for w in aligned]
@@ -202,6 +222,29 @@ def retime_tokens(tokens: list[dict], aligned: list[dict]) -> list[dict]:
             start = spans[prev][1]
             for k, j in enumerate(run):
                 spans[j] = (start + k * _AVG, start + (k + 1) * _AVG)
+
+    return groups, spans, anchored
+
+
+def retime_tokens(tokens: list[dict], aligned: list[dict]) -> list[dict]:
+    """Rebuild the pak's lyrics from ITS OWN tokens, changing only `t` and `d`.
+
+    This is the whole feature, and the earlier version got it subtly wrong: it built the new
+    lyrics out of the words the SERVER returned. Forced alignment legitimately drops a word it
+    can't place — so every dropped word was silently deleted from the user's song. A re-align
+    that quietly loses "dancer" from the chorus has not kept the promise; it has broken it in a
+    way nobody notices until they play the song.
+
+    So the output is the user's tokens, in the user's order, with the user's exact text —
+    including the `-` joins and `+` line breaks, which means the line structure they authored
+    survives too, rather than being replaced by wherever the aligner decided a line was. Only the
+    numbers move.
+
+    An unaligned word keeps its place and is given a plausible span, interpolated across the gap
+    between the neighbours that DID align. It is better to sing a word slightly early than to
+    lose it.
+    """
+    groups, spans, _ = _match_and_fill_spans(tokens, aligned)
 
     # Split each word's span across its syllables, proportional to their length — a long syllable
     # gets a long slice, which is closer to how they are actually sung than an even split.
@@ -293,6 +336,90 @@ def _verify_words_survived(original: str, aligned: list[dict]) -> None:
         )
 
 
+# A real re-align is one constant shift plus sub-second drift corrections, so the per-word
+# deltas cluster tightly around their median. When the aligner instead pins words onto the
+# wrong vocal content — a chant intro, backing-vocal bleed, a repeated phrase (#27: spread
+# ~76s) — the deltas scatter. Gate on the SPREAD, never the shift itself: a chart that is
+# legitimately 10s off must still be fixable in one click.
+_DEFAULT_MAX_SPREAD_SEC = 3.0
+# Word starts moving backwards means two words were pinned to different occurrences of
+# similar audio — physically impossible for a sung lyric read in order.
+_MONOTONIC_TOLERANCE_SEC = 0.05
+
+
+def _quantile(sorted_vals: list[float], q: float) -> float:
+    """Linear-interpolated quantile. Index rounding would do here for big songs, but a
+    handful of anchors is exactly when the gate matters most (score filtering + coverage
+    can thin the list), and bankers' rounding at e.g. n=6 maps q=0.9 to index 4 — quietly
+    under-reporting the spread and letting scatter slip past the gate."""
+    if not sorted_vals:
+        return 0.0
+    pos = q * (len(sorted_vals) - 1)
+    lo = math.floor(pos)
+    hi = math.ceil(pos)
+    if lo == hi:
+        return sorted_vals[lo]
+    frac = pos - lo
+    return sorted_vals[lo] * (1.0 - frac) + sorted_vals[hi] * frac
+
+
+def _verify_timings_sane(tokens: list[dict], aligned: list[dict], *,
+                         max_spread_sec: float = _DEFAULT_MAX_SPREAD_SEC) -> dict:
+    """Judge the aligner's TIMINGS before anything is written — the counterpart of
+    `_verify_words_survived`, which judges the words. Returns the stats used for the job's
+    result message; raises when the result is implausible, leaving the pak untouched.
+    """
+    # This is the last line of defense before the write, so the threshold itself must be
+    # sound: NaN makes every `>` comparison false (the gate silently accepts anything),
+    # +inf accepts anything, and a negative rejects everything. A caller handing in a
+    # hand-edited/corrupted setting gets the shipped default, not a disabled guard.
+    try:
+        max_spread_sec = float(max_spread_sec)
+    except (TypeError, ValueError):
+        max_spread_sec = _DEFAULT_MAX_SPREAD_SEC
+    if not math.isfinite(max_spread_sec) or max_spread_sec < 0:
+        max_spread_sec = _DEFAULT_MAX_SPREAD_SEC
+
+    groups, spans, anchored = _match_and_fill_spans(tokens, aligned)
+
+    # Per-word delta (new start − original start), over the words the aligner actually
+    # placed. Interpolated words are derived from these anchors, so they add no information.
+    deltas: list[float] = []
+    for i in anchored:
+        idxs = groups[i][1]
+        old_t = (tokens[idxs[0]] or {}).get("t") if idxs else None
+        if isinstance(old_t, (int, float)):
+            deltas.append(spans[i][0] - float(old_t))
+
+    stats = {
+        "words": len(groups),
+        "anchored": len(anchored),
+        "interpolated": len(groups) - len(anchored),
+        "median_shift_s": 0.0,
+        "spread_s": 0.0,
+    }
+    if deltas:
+        deltas.sort()
+        stats["median_shift_s"] = round(_quantile(deltas, 0.5), 3)
+        stats["spread_s"] = round(_quantile(deltas, 0.9) - _quantile(deltas, 0.1), 3)
+
+    out_of_order = sum(
+        1 for a, b in zip(spans, spans[1:])
+        if b[0] < a[0] - _MONOTONIC_TOLERANCE_SEC
+    )
+
+    if out_of_order or stats["spread_s"] > max_spread_sec:
+        raise RuntimeError(
+            "re-align produced implausible timings "
+            f"(median shift {stats['median_shift_s']:+.1f}s, "
+            f"spread {stats['spread_s']:.1f}s across {stats['anchored']} aligned words"
+            + (f", {out_of_order} out-of-order" if out_of_order else "")
+            + ") — the vocal stem likely contains chants, backing vocals, or bleed that "
+            "confused the aligner. Your lyrics were left unchanged."
+        )
+    return stats
+
+
 def _vocals_relpath(manifest: dict) -> str | None:
     """The vocal stem's path, matched exactly as transcribe.py matches it.
 
@@ -325,6 +452,7 @@ def _content_type(path: Path) -> str:
 
 def align_vocals_remote(vocals: Path, text: str, server_url: str, *,
                         language: str | None = None, api_key: str | None = None,
+                        min_score: float | None = None,
                         timeout: int = 300, progress_cb: ProgressCB = None) -> list[dict]:
     """POST the stem AND the lyrics to `/align`. Returns the server's TIMED WORDS.
 
@@ -384,18 +512,23 @@ def align_vocals_remote(vocals: Path, text: str, server_url: str, *,
     finally:
         resp.close()
 
-    return segments_to_words(segments)
+    return segments_to_words(segments, min_score=min_score)
 
 
 def realign_pak(pak_path: Path, *, server_url: str | None = None, api_key: str | None = None,
                 language: str | None = None,
+                max_spread_sec: float = _DEFAULT_MAX_SPREAD_SEC,
+                min_score: float | None = 0.35,
                 cancel_cb: Optional[Callable[[], None]] = None,
-                progress_cb: ProgressCB = None) -> bool:
+                progress_cb: ProgressCB = None) -> dict:
     """Re-time ``pak_path``'s existing lyrics against its vocal stem. Words are never changed.
 
-    Returns True if the lyrics were rewritten. Raises if there is nothing to re-align (no lyrics,
-    or no vocal stem) — those are user-visible mistakes, not silent no-ops: a button that
-    "succeeds" and does nothing is worse than one that says why it can't.
+    Returns the timing stats (truthy dict) if the lyrics were rewritten. Raises if there is
+    nothing to re-align (no lyrics, or no vocal stem) or if the aligner's result fails either
+    guard — the words one (`_verify_words_survived`) or the timings one
+    (`_verify_timings_sane`). Those are user-visible refusals, not silent no-ops: a button
+    that "succeeds" and does nothing — or worse, succeeds and scrambles (#27) — is worse than
+    one that says why it can't.
     """
     pak_path = Path(pak_path)
     manifest = pak_io.read_manifest(pak_path)
@@ -456,7 +589,7 @@ def realign_pak(pak_path: Path, *, server_url: str | None = None, api_key: str |
 
         aligned = align_vocals_remote(
             vocals, text, server_url, language=language, api_key=api_key,
-            progress_cb=progress_cb,
+            min_score=min_score, progress_cb=progress_cb,
         )
         if not aligned:
             # The words went in and nothing came back with a timestamp. Do NOT write that:
@@ -471,6 +604,11 @@ def realign_pak(pak_path: Path, *, server_url: str | None = None, api_key: str |
         # words — normalized, re-tokenized, or simply misbehaving — must not get anywhere near
         # the user's lyrics.
         _verify_words_survived(text, aligned)
+
+        # ...and the same for the TIMINGS, which are the only thing this feature changes. A
+        # result whose per-word deltas scatter (or run backwards) is the aligner pinned to the
+        # wrong vocal content, and writing it would scramble the song (#27).
+        stats = _verify_timings_sane(tokens, aligned, max_spread_sec=max_spread_sec)
 
         # Rebuild from the ORIGINAL tokens. The server's words are used for their timings and
         # nothing else, so a word the aligner failed to place keeps its text, its place in the
@@ -487,8 +625,15 @@ def realign_pak(pak_path: Path, *, server_url: str | None = None, api_key: str |
         out.write_text(json.dumps(lyrics, separators=(",", ":")), encoding="utf-8")
         # Write to the path the manifest already names, and pass no manifest: the words, their
         # source, and every other key are exactly as they were. Only the timings moved.
-        pak_io.repack(pak_path, add_files={str(lyrics_rel): out})
+        # keep_backup: this is the one job that overwrites data the user cannot regenerate
+        # (authored timings), so the pre-realign copy must survive a "successful" run — a
+        # plausible-but-wrong alignment is only recoverable if the original still exists.
+        pak_io.repack(pak_path, add_files={str(lyrics_rel): out}, keep_backup=True)
+        stats["backup"] = (
+            pak_path.name + ".bak" if pak_io.is_zip_form(pak_path)
+            else str(lyrics_rel) + ".bak"
+        )
 
     log.info("stem_splitter: re-aligned %d of %d syllables in %s (%d words timed by the aligner)",
              len(lyrics), len(tokens), pak_path.name, len(aligned))
-    return True
+    return stats
