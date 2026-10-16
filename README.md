@@ -6,7 +6,7 @@ detection driven by the library index.
 
 ## Engines
 
-Three ways to run, picked in the plugin's **Settings**:
+Four ways to run, picked in the plugin's **Settings**:
 
 - **Managed local server (easiest)** — the plugin can install and run
   [`got-feedBack/feedBack-demucs-server`](https://github.com/got-feedBack/feedBack-demucs-server)
@@ -163,6 +163,18 @@ otherwise it says why rather than ticking a box that silently runs on CPU.
   removal — stopping the server does not cost you a 1.5 GB re-download.
 - Memory: a `bs_roformer_sw` split peaks around **6 GB**. Docker Desktop's default VM may be
   smaller than that; if the container dies mid-split and restarts, raise its memory limit.
+
+## Environment variables
+
+Optional overrides, read when the plugin loads. Most installs never need them.
+
+| Variable | Default | What it changes |
+|---|---|---|
+| `STEM_SPLITTER_SERVER_REF` | `main` | Git ref of feedBack-demucs-server that the managed local server installs. It is resolved to a fixed commit before download. The **Advanced** settings can override it per install. |
+| `STEM_SPLITTER_CUDA_TAG` | `cu128` | PyTorch CUDA build for the GPU install of the managed server (for example `cu126` or `cu121` for older drivers). |
+| `STEM_SPLITTER_TORCH_VERSION` | `2.8.0` | PyTorch version pinned for that GPU install. |
+| `STEM_SPLITTER_PIP_STALL_TIMEOUT` | `3600` | Seconds a `pip install` may go without output before it is killed. Minimum `60`. Raise it on a very slow connection. |
+| `STEM_SPLITTER_SIDECAR_IMAGE` | `ghcr.io/got-feedback/feedback-demucs-server:latest` | Image for the one-click Docker container. A digest pin (`repo@sha256:...`) works. |
 
 ## Surfaces
 
